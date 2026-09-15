@@ -1,7 +1,7 @@
 """Authentication endpoints — login and refresh."""
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,7 +10,9 @@ from app.core.security import (
     ACCESS_TOKEN,
     REFRESH_TOKEN,
     JWTError,
+    clear_session_cookie,
     create_access_token,
+    set_session_cookie,
     create_refresh_token,
     decode_token,
     verify_password,
@@ -26,8 +28,12 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 async def login(
     form: Annotated[OAuth2PasswordRequestForm, Depends()],
     db: Annotated[AsyncSession, Depends(get_db)],
+    response: Response,
 ) -> TokenPair:
-    """Exchange email (as `username`) + password for an access/refresh token pair."""
+    """Exchange email (as `username`) + password for an access/refresh token pair.
+
+    The access token is also set as the httpOnly session cookie for the dashboard.
+    """
     result = await db.execute(
         select(User).where(User.email == form.username)
     )
@@ -45,12 +51,20 @@ async def login(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    access = create_access_token(
+        str(user.id), tenant_id=user.tenant_id, roles=[r.name for r in user.roles]
+    )
+    set_session_cookie(response, access)
     return TokenPair(
-        access_token=create_access_token(
-            str(user.id), tenant_id=user.tenant_id, roles=[r.name for r in user.roles]
-        ),
+        access_token=access,
         refresh_token=create_refresh_token(str(user.id), tenant_id=user.tenant_id),
     )
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout(response: Response) -> None:
+    """Clear the dashboard session cookie (JWTs themselves are stateless)."""
+    clear_session_cookie(response)
 
 
 @router.post("/refresh", response_model=AccessToken)

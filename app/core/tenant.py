@@ -1,17 +1,18 @@
 """Auth dependencies — the tenant-isolation backbone (spec §17)."""
-from typing import Annotated
+from typing import Annotated, Optional
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.security import ACCESS_TOKEN, JWTError, decode_token
 from app.db.session import get_db
 from app.models.tenant import Tenant
 from app.models.user import User
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+# auto_error=False: a missing Bearer header falls back to the dashboard session cookie.
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
 _CREDENTIALS_EXC = HTTPException(
     status_code=status.HTTP_401_UNAUTHORIZED,
@@ -21,10 +22,14 @@ _CREDENTIALS_EXC = HTTPException(
 
 
 async def get_current_user(
-    token: Annotated[str, Depends(oauth2_scheme)],
+    request: Request,
+    bearer: Annotated[Optional[str], Depends(oauth2_scheme)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> User:
-    """Decode the bearer access token and load the active User it identifies."""
+    """Decode the access token (Bearer header or session cookie) and load its active User."""
+    token = bearer or request.cookies.get(settings.session_cookie_name)
+    if not token:
+        raise _CREDENTIALS_EXC
     try:
         payload = decode_token(token)
     except JWTError:

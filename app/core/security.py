@@ -4,6 +4,7 @@ from typing import Any
 
 import bcrypt
 from cryptography.fernet import Fernet
+from fastapi import Response
 from jose import JWTError, jwt
 
 from app.core.config import settings
@@ -90,6 +91,23 @@ def decode_token(token: str) -> dict[str, Any]:
     return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
 
 
+def set_session_cookie(response: "Response", token: str) -> None:
+    """Hand an access token to the dashboard as the httpOnly session cookie."""
+    response.set_cookie(
+        key=settings.session_cookie_name,
+        value=token,
+        httponly=True,
+        secure=settings.cookie_secure,
+        samesite=settings.cookie_samesite,
+        max_age=settings.access_token_expire_minutes * 60,
+        path="/",
+    )
+
+
+def clear_session_cookie(response: "Response") -> None:
+    response.delete_cookie(key=settings.session_cookie_name, path="/")
+
+
 # ---- Token encryption at rest (Meta access tokens) ----
 _fernet = Fernet(settings.token_encryption_key.encode())
 
@@ -110,6 +128,8 @@ __all__ = [
     "create_oauth_state",
     "decode_oauth_state",
     "decode_token",
+    "set_session_cookie",
+    "clear_session_cookie",
     "encrypt_token",
     "decrypt_token",
     "JWTError",

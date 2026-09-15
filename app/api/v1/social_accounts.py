@@ -28,6 +28,7 @@ from app.core.security import (
     create_oauth_state,
     decode_oauth_state,
     encrypt_token,
+    set_session_cookie,
 )
 from app.db.session import get_db
 from app.models.role import Role
@@ -270,13 +271,5 @@ async def instagram_callback(
         str(owner.id), tenant_id=tenant.id, roles=[r.name for r in owner.roles]
     )
     response = _redirect_to_frontend(ig_connected="1")
-    response.set_cookie(
-        key=settings.session_cookie_name,
-        value=token,
-        httponly=True,
-        secure=settings.cookie_secure,
-        samesite=settings.cookie_samesite,
-        max_age=settings.access_token_expire_minutes * 60,
-        path="/",
-    )
+    set_session_cookie(response, token)
     return response
