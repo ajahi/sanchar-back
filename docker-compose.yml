@@ -48,8 +48,6 @@ volumes:
 
 # Named so the frontend compose (next-app) can join it as `external`.
 networks:
-  nepsocial-front:
-      driver: bridge
   nepsocial:
-    internal: true
+    external: true
   
