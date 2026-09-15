@@ -7,7 +7,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-nepsocial}:${POSTGRES_PASSWORD:-nepsocial}@postgres:5432/${POSTGRES_DB:-nepsocial}
     ports:
-      - "8000:8000"
+      - "8005:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -23,7 +23,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nepsocial}
       POSTGRES_DB: ${POSTGRES_DB:-nepsocial}
     ports:
-      - "5432:5432"
+      - "5435:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -39,7 +39,7 @@ services:
     container_name: adminer_ui
     restart: always
     ports:
-      - "8080:8080"
+      - "8085:8080"
     networks:
       - nepsocial
 
