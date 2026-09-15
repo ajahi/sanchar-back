@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: nepsocial-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nepsocial}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nepsocial}
+      POSTGRES_DB: ${POSTGRES_DB:-nepsocial}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nepsocial} -d ${POSTGRES_DB:-nepsocial}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+  
+  adminer:
+    image: adminer:latest
+    container_name: adminer_ui
+    restart: always
+    ports:
+      - "8080:8080"
+
+volumes:
+  postgres_data:

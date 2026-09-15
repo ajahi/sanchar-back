@@ -1,0 +1,4 @@
+Alembic migrations for nepsocial-backend.
+The DB URL is injected at runtime from app.core.config (env.py), not alembic.ini.
+Generate:  alembic revision --autogenerate -m "message"
+Apply:     alembic upgrade head
