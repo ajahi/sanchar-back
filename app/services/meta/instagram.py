@@ -1,114 +1,164 @@
-"""Instagram API with Instagram Login — OAuth client.
+"""Instagram Direct messaging, driven by a Facebook Page access token.
 
-Flow (see Meta docs: Business Login for Instagram):
-  1. Send the user to AUTHORIZE_URL.
-  2. Exchange the returned `code` for a short-lived token (TOKEN_URL).
-  3. Upgrade to a 60-day long-lived token (GRAPH /access_token).
-  4. Read the profile (GRAPH /me).
-Long-lived tokens are refreshed elsewhere via GRAPH /refresh_access_token.
+This is the channel client: reading threads (including the historical backfill), sending
+replies, and verifying inbound webhook signatures. All HTTP goes through
+`app.services.meta.graph`, so retries, throttling and Meta error decoding are shared.
+
+Endpoint shapes (Page-token / Facebook Login for Business):
+  GET  /{page-id}/conversations?platform=instagram   — every IG thread on the Page
+  GET  /{conversation-id}?fields=messages{...}       — messages within one thread
+  POST /{page-id}/messages                           — send as the business
+  GET  /{igsid}?fields=name,username                 — customer profile (best effort)
 """
-import hmac
-from hashlib import sha256
-from urllib.parse import urlencode
+from __future__ import annotations
 
-import httpx
+import hmac
+import logging
+from hashlib import sha256
+from typing import Any, AsyncIterator, Optional
 
 from app.core.config import settings
+from app.services.meta import graph
 
-AUTHORIZE_URL = "https://www.instagram.com/oauth/authorize"
-TOKEN_URL = "https://api.instagram.com/oauth/access_token"
-GRAPH_BASE = "https://graph.instagram.com"
+log = logging.getLogger(__name__)
 
-_TIMEOUT = httpx.Timeout(15.0)
+PLATFORM = "instagram"
 
+# Fields for the conversation list. `messages` is nested inline because that is what makes
+# a backfill a single paginated crawl instead of one request per thread — and because Meta
+# caps a thread at its 20 most recent messages either way, so the separate /messages edge
+# would buy nothing but extra rate-limit pressure.
+#
+# Only fields that provably exist are requested: a nonexistent field makes Graph fail the
+# whole call with error #100. The Message node has no `is_echo` (webhook-only) and no
+# `is_deleted`, so direction is inferred from `from.id` in the importer instead.
+_MESSAGE_FIELDS = "id,message,from,created_time,attachments"
+CONVERSATION_FIELDS = f"id,updated_time,participants,messages{{{_MESSAGE_FIELDS}}}"
 
-def build_authorize_url(state: str) -> str:
-    """Step 1 — the URL to redirect the browser to."""
-    params = {
-        "client_id": settings.instagram_app_id,
-        "redirect_uri": settings.instagram_redirect_uri,
-        "response_type": "code",
-        "scope": settings.instagram_scopes,
-        "state": state,
-    }
-    return f"{AUTHORIZE_URL}?{urlencode(params)}"
-
-
-async def exchange_code_for_token(code: str) -> dict:
-    """Step 2 — code -> short-lived token. Returns {access_token, user_id, permissions?}."""
-    data = {
-        "client_id": settings.instagram_app_id,
-        "client_secret": settings.instagram_app_secret,
-        "grant_type": "authorization_code",
-        "redirect_uri": settings.instagram_redirect_uri,
-        "code": code,
-    }
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.post(TOKEN_URL, data=data)
-        resp.raise_for_status()
-        return resp.json()
+# Message fields for walking a single thread's own edge.
+MESSAGE_FIELDS = _MESSAGE_FIELDS
 
 
-async def exchange_for_long_lived_token(short_lived_token: str) -> dict:
-    """Step 3 — short-lived -> 60-day token. Returns {access_token, token_type, expires_in}."""
-    params = {
-        "grant_type": "ig_exchange_token",
-        "client_secret": settings.instagram_app_secret,
-        "access_token": short_lived_token,
-    }
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.get(f"{GRAPH_BASE}/access_token", params=params)
-        resp.raise_for_status()
-        return resp.json()
+def attachment_media(attachment: dict) -> tuple[Optional[str], str]:
+    """Extract `(url, media_type)` from a webhook *or* a Graph attachment.
 
+    The two shapes differ: webhooks send `{"type": "image", "payload": {"url": ...}}`
+    while the Graph API sends `{"name": ..., "file_url": ..., "image_data": {...}}`.
+    Reading both keeps a backfilled attachment rendering exactly like a live one.
+    """
+    if not isinstance(attachment, dict):
+        return None, "file"
 
-async def fetch_profile(access_token: str) -> dict:
-    """Step 4 — the connected account's {user_id, username}."""
-    params = {"fields": "user_id,username", "access_token": access_token}
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.get(f"{GRAPH_BASE}/me", params=params)
-        resp.raise_for_status()
-        return resp.json()
+    payload = attachment.get("payload")
+    if isinstance(payload, dict) and payload.get("url"):
+        return str(payload["url"]), str(attachment.get("type") or "file")
 
+    for key, kind in (("image_data", "image"), ("video_data", "video")):
+        data = attachment.get(key)
+        if isinstance(data, dict):
+            url = data.get("url") or data.get("preview_url")
+            if url:
+                return str(url), kind
 
-async def refresh_long_lived_token(long_lived_token: str) -> dict:
-    """Refresh a 60-day token (must be >=24h old). Returns {access_token, token_type, expires_in}."""
-    params = {"grant_type": "ig_refresh_token", "access_token": long_lived_token}
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.get(f"{GRAPH_BASE}/refresh_access_token", params=params)
-        resp.raise_for_status()
-        return resp.json()
+    if attachment.get("file_url"):
+        return str(attachment["file_url"]), str(attachment.get("name") or "file")
 
-
-# ---- Messaging (instagram_business_manage_messages) ----
+    return None, str(attachment.get("type") or attachment.get("name") or "file")
 
 
 def verify_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
-    """Check Meta's X-Hub-Signature-256 ("sha256=<hex>") against the app secret."""
-    expected = hmac.new(settings.instagram_app_secret.encode(), raw_body, sha256).hexdigest()
-    return hmac.compare_digest(f"sha256={expected}", signature_header or "")
+    """Check Meta's `X-Hub-Signature-256` ("sha256=<hex>") against the app secret.
+
+    Compared in constant time so a wrong signature cannot be discovered byte by byte.
+    """
+    if not signature_header or not settings.meta_app_secret:
+        return False
+    expected = hmac.new(
+        settings.meta_app_secret.encode(), raw_body, sha256
+    ).hexdigest()
+    return hmac.compare_digest(f"sha256={expected}", signature_header)
 
 
-async def send_text(access_token: str, ig_account_id: str, recipient_igsid: str, text: str) -> dict:
-    """Send a text DM from the business account. Returns {recipient_id, message_id}."""
-    body = {"recipient": {"id": recipient_igsid}, "message": {"text": text}}
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.post(
-            f"{GRAPH_BASE}/v23.0/{ig_account_id}/messages",
-            json=body,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        resp.raise_for_status()
-        return resp.json()
+async def iter_conversations(
+    page_id: str,
+    token: str,
+    *,
+    page_size: Optional[int] = None,
+    fields: str = CONVERSATION_FIELDS,
+    max_conversations: Optional[int] = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield Instagram conversations for a Page, newest first, across all pages.
+
+    Meta returns most-recently-updated first; the importer relies on that ordering to
+    decide which thread is a customer's current open conversation.
+    """
+    params = {
+        "platform": PLATFORM,
+        "fields": fields,
+        "limit": page_size or settings.sync_page_size,
+    }
+    async for conversation in graph.paginate(
+        f"{page_id}/conversations",
+        token=token,
+        params=params,
+        max_items=max_conversations,
+    ):
+        yield conversation
 
 
-async def fetch_customer_profile(access_token: str, igsid: str) -> dict:
-    """Best-effort {name, username} of a messaging participant; {} on any failure."""
-    params = {"fields": "name,username", "access_token": access_token}
+async def fetch_conversation(
+    conversation_id: str, token: str, *, fields: str = CONVERSATION_FIELDS
+) -> dict[str, Any]:
+    """Read one conversation (used by resync to refresh a single thread)."""
+    return await graph.get(conversation_id, token=token, fields=fields)
+
+
+async def iter_messages(
+    conversation_id: str,
+    token: str,
+    *,
+    page_size: Optional[int] = None,
+    max_messages: Optional[int] = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield a thread's messages via its own edge, for when the inline list is truncated."""
+    async for message in graph.paginate(
+        f"{conversation_id}/messages",
+        token=token,
+        params={"fields": MESSAGE_FIELDS, "limit": page_size or settings.sync_page_size},
+        max_items=max_messages,
+    ):
+        yield message
+
+
+async def send_text(
+    page_id: str, token: str, recipient_igsid: str, text: str
+) -> dict[str, Any]:
+    """Send a text DM as the business. Returns {recipient_id, message_id}.
+
+    `messaging_type: RESPONSE` is a documented required component of the send payload.
+    Meta enforces a 24-hour Standard Messaging Window; outside it the call fails with
+    error 1545041, which callers translate into something a human can act on.
+    """
+    body = {
+        "recipient": {"id": recipient_igsid},
+        "messaging_type": "RESPONSE",
+        "message": {"text": text},
+    }
+    return await graph.request("POST", f"{page_id}/messages", token=token, json_body=body)
+
+
+async def fetch_customer_profile(
+    igsid: str, token: str, *, timeout: Optional[float] = None
+) -> dict[str, Any]:
+    """Best-effort {name, username} for a messaging participant; {} on any failure.
+
+    Profile lookup needs extra permissions and is frequently denied, so a failure here
+    must never break message ingest — the id is enough to keep the thread usable.
+    """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            resp = await client.get(f"{GRAPH_BASE}/v23.0/{igsid}", params=params)
-            resp.raise_for_status()
-            return resp.json()
-    except httpx.HTTPError:
+        return await graph.get(
+            igsid, token=token, fields="name,username", timeout=timeout
+        )
+    except graph.GraphError as exc:
+        log.debug("profile lookup failed for %s: %s", igsid, exc)
         return {}

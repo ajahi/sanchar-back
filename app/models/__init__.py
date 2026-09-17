@@ -11,6 +11,7 @@ from app.models.notification import Notification
 from app.models.permission import Permission, role_permissions
 from app.models.role import Role, user_roles
 from app.models.social_account import SocialAccount
+from app.models.sync_run import SYNC_STATUSES, SyncRun
 from app.models.tenant import Tenant
 from app.models.user import User
 
@@ -24,6 +25,8 @@ __all__ = [
     "role_permissions",
     "Customer",
     "SocialAccount",
+    "SyncRun",
+    "SYNC_STATUSES",
     "Conversation",
     "Message",
     "ConversationAssignment",

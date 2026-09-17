@@ -23,6 +23,15 @@ class Conversation(UUIDPKMixin, TimestampMixin, Base):
             unique=True,
             postgresql_where=text("status = 'open'"),
         ),
+        # Meta's conversation id — the dedup key that makes historical import idempotent
+        # and lets a resync find a thread a webhook created moments earlier.
+        Index(
+            "uq_conversation_external",
+            "social_account_id",
+            "external_conversation_id",
+            unique=True,
+            postgresql_where=text("external_conversation_id IS NOT NULL"),
+        ),
     )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(
