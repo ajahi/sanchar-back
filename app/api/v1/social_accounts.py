@@ -1,18 +1,19 @@
-"""Connecting Meta accounts (Facebook Login for Business) and importing their history.
+"""Connecting Instagram accounts and importing their history.
 
-Three hops:
-  GET /social-accounts/facebook/login     -> 302 to Facebook's consent screen
-  GET /social-accounts/facebook/callback  -> exchange the code, store one account per
-                                             Page that owns an Instagram account, set an
-                                             httpOnly session cookie, 302 to the dashboard
-  POST /social-accounts/{id}/sync         -> (re)import that account's history
+Two connect flows are supported, and they are not interchangeable:
 
-One consent covers every Page the user manages, so a business with several Pages ends up
-connected in a single pass rather than one login per account. If a Page is already linked
-to a different tenant it is skipped with a warning instead of failing the whole login.
+  Instagram Login (primary)   GET /instagram/login -> /instagram/callback
+      Instagram's own consent screen. Addresses the Instagram account directly via
+      graph.instagram.com. Needs no Page. Tokens last ~60 days and are refreshed.
 
-The legacy `/instagram/login` and `/instagram/callback` paths are kept as aliases so a
-deployment mid-migration — and any bookmark or Meta dashboard redirect URI — keeps working.
+  Facebook Login (secondary)  GET /facebook/login  -> /facebook/callback
+      Facebook's consent screen, Page token, graph.facebook.com. Required later for
+      Messenger/WhatsApp, and for Instagram accounts reachable only through a Page.
+
+Both finish the same way: persist one account per Instagram identity, subscribe it to
+messaging webhooks, set an httpOnly session cookie, and kick off a background history
+import. If the visitor already has a dashboard session (cookie or Bearer), the account is
+attached to *their* tenant instead of provisioning a new one ("connect" mode).
 
 Incoming traffic is tracked two ways (kept simple): the source/referrer uri is stored in
 social_accounts.metadata, and every attempt is logged to audit_logs (uri, ip, user-agent).
@@ -48,7 +49,13 @@ from app.models.user import User
 from app.schemas.social_account import SocialAccountOut, SyncRunOut
 from app.services import conversation_sync
 from app.services.audit import record_audit
-from app.services.meta import facebook_login, graph
+
+# Aliased: the route handlers below are themselves named `instagram_login`, which would
+# otherwise shadow the imported module inside this namespace.
+from app.services.meta import facebook_login as fb_login
+from app.services.meta import graph
+from app.services.meta import instagram_login as ig_login
+from app.services.meta.target import FACEBOOK_LOGIN, INSTAGRAM_LOGIN
 from app.services.rbac import get_roles_by_names
 
 router = APIRouter(prefix="/social-accounts", tags=["social-accounts"])
@@ -105,33 +112,54 @@ def _redirect_to_frontend(**query: str) -> RedirectResponse:
 # ------------------------------------------------------------------------------- login
 
 
-def _begin_login(request: Request) -> RedirectResponse:
-    if not facebook_login.configured():
+def _state_for(request: Request) -> str:
+    """Signed OAuth `state` (CSRF protection) carrying where the visitor came from."""
+    source = request.query_params.get("source") or request.headers.get("referer") or ""
+    return create_oauth_state(source=source[:500], user_id=_session_user_id(request))
+
+
+@router.get("/instagram/login")
+async def instagram_login(request: Request) -> RedirectResponse:
+    """Redirect the browser to Instagram's own consent screen.
+
+    This is the primary flow: Instagram-branded, needs no Page, and the frontend's
+    "Continue with Instagram" button already points here.
+    """
+    if not ig_login.configured():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "Facebook Login is not configured "
-                "(missing META_APP_ID/META_APP_SECRET/META_REDIRECT_URI)."
+                "Instagram Login is not configured. Set INSTAGRAM_APP_ID, "
+                "INSTAGRAM_APP_SECRET and INSTAGRAM_REDIRECT_URI — these come from "
+                "Instagram -> API setup with Instagram login, and are NOT the same "
+                "numbers as the Facebook app id/secret."
             ),
         )
-    # Track where this user came from: explicit ?source= wins, else the Referer header.
-    source = request.query_params.get("source") or request.headers.get("referer") or ""
-    state = create_oauth_state(source=source[:500], user_id=_session_user_id(request))
     return RedirectResponse(
-        facebook_login.build_authorize_url(state), status_code=status.HTTP_302_FOUND
+        ig_login.build_authorize_url(_state_for(request)),
+        status_code=status.HTTP_302_FOUND,
     )
 
 
 @router.get("/facebook/login")
 async def facebook_login_start(request: Request) -> RedirectResponse:
-    """Redirect the browser to Facebook's consent screen."""
-    return _begin_login(request)
+    """Redirect the browser to Facebook's consent screen (Facebook Login for Business).
 
-
-@router.get("/instagram/login", deprecated=True)
-async def instagram_login(request: Request) -> RedirectResponse:
-    """Deprecated alias for /facebook/login, kept so existing links keep working."""
-    return _begin_login(request)
+    Secondary flow. Needed for Messenger/WhatsApp later, and for Instagram accounts that
+    are only reachable through a Page.
+    """
+    if not fb_login.configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Facebook Login is not configured (missing "
+                "FACEBOOK_APP_ID/FACEBOOK_APP_SECRET/FACEBOOK_REDIRECT_URI)."
+            ),
+        )
+    return RedirectResponse(
+        fb_login.build_authorize_url(_state_for(request)),
+        status_code=status.HTTP_302_FOUND,
+    )
 
 
 # ---------------------------------------------------------------------------- callback
@@ -148,14 +176,16 @@ async def _get_or_create_account(
     user: Optional[User] = None,
     page_id: Optional[str] = None,
     page_name: Optional[str] = None,
+    auth_provider: str = INSTAGRAM_LOGIN,
 ) -> tuple[Tenant, User, SocialAccount]:
     """Find the account by Instagram id, or provision a tenant + owner + social_account.
 
     With `user` (connect mode) the account is attached to that user's tenant; a new tenant
     is never created and an account already linked to another tenant is refused.
 
-    `expires_in=None` stores no expiry: a Page token minted from a long-lived user token
-    does not expire, unlike the 60-day Instagram Login token this replaced.
+    `expires_in=None` stores no expiry (a Facebook Page token does not expire).
+    Instagram Login tokens last ~60 days, so `expires_in` is set and refreshed on a
+    schedule.
     """
     result = await db.execute(
         select(SocialAccount).where(
@@ -179,6 +209,7 @@ async def _get_or_create_account(
         account = SocialAccount(
             tenant_id=tenant.id,
             platform=PLATFORM,
+            auth_provider=auth_provider,
             external_account_id=ig_user_id,
             external_page_id=page_id,
             account_name=username,
@@ -212,6 +243,7 @@ async def _get_or_create_account(
         account = SocialAccount(
             tenant_id=tenant.id,
             platform=PLATFORM,
+            auth_provider=auth_provider,
             external_account_id=ig_user_id,
             external_page_id=page_id,
             account_name=username,
@@ -226,6 +258,7 @@ async def _get_or_create_account(
     # Returning account -> refresh token + tracking, reuse tenant/owner.
     account.access_token_encrypted = encrypt_token(long_lived_token)
     account.token_expires_at = expires_at
+    account.auth_provider = auth_provider
     account.account_name = username or account.account_name
     account.external_page_id = page_id or account.external_page_id
     account.meta = {
@@ -269,6 +302,105 @@ def _account_meta(
     return meta
 
 
+@router.get("/instagram/callback")
+async def instagram_callback(
+    request: Request,
+    background: BackgroundTasks,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+) -> RedirectResponse:
+    """Instagram redirects here. Exchange the code, store the account, start a session."""
+    if error:
+        return _redirect_to_frontend(
+            ig_error=error, ig_error_description=error_description or ""
+        )
+    if not code or not state:
+        return _redirect_to_frontend(ig_error="invalid_request")
+
+    try:
+        state_payload = decode_oauth_state(state)
+    except JWTError:
+        return _redirect_to_frontend(ig_error="invalid_state")
+    source_uri = state_payload.get("source", "")
+    user = await db.get(User, state_payload["user_id"]) if state_payload.get("user_id") else None
+    if user is not None and (user.status != "active" or user.tenant_id is None):
+        return _redirect_to_frontend(ig_error="invalid_session")
+
+    # Exchange: code -> short-lived -> long-lived, then read the profile.
+    try:
+        short = await ig_login.exchange_code_for_token(code)
+        long_lived = await ig_login.exchange_for_long_lived_token(short["access_token"])
+        profile = await ig_login.fetch_profile(long_lived["access_token"])
+    except graph.GraphError as exc:
+        log.warning("instagram login exchange failed: %s", exc)
+        return _redirect_to_frontend(ig_error="token_exchange_failed")
+    except KeyError:
+        return _redirect_to_frontend(ig_error="token_exchange_failed")
+
+    # Instagram Login returns `user_id`; the code exchange also carries it as a fallback.
+    ig_user_id = ig_login.account_id_from_profile(profile) or str(short.get("user_id") or "")
+    username = str(profile.get("username") or "")
+    if not ig_user_id:
+        return _redirect_to_frontend(ig_error="no_account_id")
+
+    try:
+        tenant, owner, account = await _get_or_create_account(
+            db,
+            ig_user_id=ig_user_id,
+            username=username,
+            long_lived_token=long_lived["access_token"],
+            expires_in=ig_login.expires_in_seconds(long_lived),
+            source_uri=source_uri,
+            user=user,
+            # No Page in this flow: Instagram Login addresses the account directly.
+            auth_provider=INSTAGRAM_LOGIN,
+        )
+    except PermissionError as exc:
+        return _redirect_to_frontend(ig_error=str(exc))
+
+    # Opt this account into messaging webhooks. Best-effort: a failure must not block login.
+    try:
+        account.meta = {
+            **account.meta,
+            "webhooks": await ig_login.subscribe_webhooks(long_lived["access_token"]),
+        }
+    except graph.GraphError as exc:
+        log.warning("subscribed_apps failed for %s: %s", ig_user_id, exc)
+        account.meta = {**account.meta, "webhooks": {"error": str(exc)}}
+
+    await record_audit(
+        db,
+        tenant_id=tenant.id,
+        actor_id=owner.id,
+        action="instagram_account_connected",
+        entity_type="social_account",
+        entity_id=account.id,
+        meta={
+            "auth_provider": INSTAGRAM_LOGIN,
+            "source_uri": source_uri,
+            "ip": _client_ip(request),
+            "user_agent": request.headers.get("user-agent"),
+            "username": username,
+        },
+    )
+    await db.commit()
+
+    if settings.auto_sync_on_connect:
+        background.add_task(
+            conversation_sync.sync_account_by_id, account.id, trigger_source="connect"
+        )
+
+    token = create_access_token(
+        str(owner.id), tenant_id=tenant.id, roles=[r.name for r in owner.roles]
+    )
+    response = _redirect_to_frontend(ig_connected="1", accounts="1")
+    set_session_cookie(response, token)
+    return response
+
+
 @router.get("/facebook/callback")
 async def facebook_callback(
     request: Request,
@@ -298,11 +430,11 @@ async def facebook_callback(
 
     # Exchange: code -> short-lived -> long-lived user token.
     try:
-        short = await facebook_login.exchange_code_for_user_token(code)
-        long_lived = await facebook_login.exchange_for_long_lived_user_token(
+        short = await fb_login.exchange_code_for_user_token(code)
+        long_lived = await fb_login.exchange_for_long_lived_user_token(
             short["access_token"]
         )
-        pages = await facebook_login.fetch_pages(long_lived["access_token"])
+        pages = await fb_login.fetch_pages(long_lived["access_token"])
     except graph.GraphError as exc:
         log.warning("facebook login exchange failed: %s", exc)
         return _redirect_to_frontend(ig_error="token_exchange_failed")
@@ -344,6 +476,7 @@ async def facebook_callback(
                 user=owner,
                 page_id=page_id,
                 page_name=page.get("name"),
+                auth_provider=FACEBOOK_LOGIN,
             )
         except PermissionError:
             skipped += 1
@@ -354,6 +487,7 @@ async def facebook_callback(
 
         account.meta = {
             **(account.meta or {}),
+            "auth_provider": FACEBOOK_LOGIN,
             "granted_scopes": granted,
             "missing_scopes": [s for s in REQUIRED_SCOPES if granted and s not in granted],
         }
@@ -368,7 +502,7 @@ async def facebook_callback(
         try:
             account.meta = {
                 **account.meta,
-                "webhooks": await facebook_login.subscribe_page_webhooks(page_id, page_token),
+                "webhooks": await fb_login.subscribe_page_webhooks(page_id, page_token),
             }
         except graph.GraphError as exc:
             log.warning("subscribed_apps failed for page %s: %s", page_id, exc)
@@ -418,34 +552,12 @@ async def facebook_callback(
     return response
 
 
-@router.get("/instagram/callback", deprecated=True)
-async def instagram_callback(
-    request: Request,
-    background: BackgroundTasks,
-    db: Annotated[AsyncSession, Depends(get_db)],
-    code: Optional[str] = None,
-    state: Optional[str] = None,
-    error: Optional[str] = None,
-    error_description: Optional[str] = None,
-) -> RedirectResponse:
-    """Deprecated alias for /facebook/callback, kept for registered redirect URIs."""
-    return await facebook_callback(
-        request=request,
-        background=background,
-        db=db,
-        code=code,
-        state=state,
-        error=error,
-        error_description=error_description,
-    )
-
-
 async def _granted_scopes(user_token: str) -> list[str]:
     """Read the granted permission list from the token itself; [] if unavailable."""
     if not user_token:
         return []
     try:
-        info = await facebook_login.debug_token(user_token)
+        info = await fb_login.debug_token(user_token)
     except graph.GraphError as exc:
         log.warning("debug_token failed: %s", exc)
         return []

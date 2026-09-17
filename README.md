@@ -10,7 +10,8 @@ FastAPI · SQLAlchemy 2.0 (async) · asyncpg · Alembic · PostgreSQL 16 · Pyda
 |------|--------|
 | Data model (16 tables) + Alembic migrations | done |
 | Tenant auth: JWT, RBAC, tenant isolation, audit log | done |
-| Facebook Login for Business (Page token) + linked Instagram account | done |
+| Facebook Login for Business (Page token) | done (secondary flow) |
+| Instagram Login (primary flow) + token refresh | done |
 | Webhook ingest (signature-verified, idempotent, per-event isolation) | done |
 | Inbox: list threads, read messages, reply as an agent | done |
 | **Historical conversation import / resync** | done |
@@ -18,47 +19,65 @@ FastAPI · SQLAlchemy 2.0 (async) · asyncpg · Alembic · PostgreSQL 16 · Pyda
 
 ## Meta auth model
 
-This backend uses **Facebook Login for Business**, not "Instagram API with Instagram Login".
-The reason is that a **Page** access token is what drives both Messenger and the Instagram
-conversations/messages edges, so one consent screen covers Instagram now and Messenger
-later. Instagram-Login tokens are scoped to `graph.instagram.com` and cannot be used
-against `graph.facebook.com`.
+Two flows are supported and they are **not interchangeable**. Which one applies to an
+account is stored in `social_accounts.auth_provider` and mapped to a host + path root in
+one place (`app/services/meta/target.py`).
 
-Flow (`app/services/meta/facebook_login.py`):
+| provider | consent screen | Graph host | path root | token lifetime |
+|---|---|---|---|---|
+| `instagram_login` **(primary)** | instagram.com | `graph.instagram.com` | Instagram account id | ~60 days, refreshed |
+| `facebook_login` (secondary) | facebook.com | `graph.facebook.com` | Page id | no expiry |
 
-1. `GET /v21.0/dialog/oauth` — consent, requesting the scopes in `META_SCOPES`.
-2. `code` → short-lived user token.
-3. short-lived → **long-lived** user token (~60 days).
-4. `GET /me/accounts` → each Page, its Page token, and its `instagram_business_account`.
+**Instagram Login** is the default. It is Instagram-branded, needs no Facebook Page, and is
+what the dashboard's "Continue with Instagram" button uses.
 
-**Step 3 must run before step 4.** A Page token minted from a *short-lived* user token
-expires in about an hour; minted from a long-lived user token it has no expiry, which is
-why `social_accounts.token_expires_at` stays `NULL` for accounts connected this way.
+**Facebook Login for Business** is kept for Messenger/WhatsApp later, and for Instagram
+accounts reachable only through a Page.
 
-One login connects **every** Page the user manages that has a linked Instagram account. A
-Page already linked to a different tenant is skipped with a warning rather than failing
-the whole login.
+> **The credential trap.** These are two different app identities with two different id and
+> secret pairs. The Instagram pair lives under *Instagram → API setup with Instagram login*;
+> the Facebook pair under *App Settings → Basic*. Mixing them is the single most confusing
+> failure here: an Instagram app id sent to Facebook's dialog returns *"Invalid app ID: The
+> provided app ID does not look like a valid app ID"*, and used as an app token it returns
+> code 190 *"Error validating application"*. The app logs both ids at startup so this is
+> visible immediately.
 
-### Meta setup checklist
+### Instagram Login setup
 
-- App products: **Facebook Login for Business**, **Messenger** (with Instagram settings),
-  and **Instagram → API setup with Facebook login**.
-- Valid OAuth redirect URI must match `META_REDIRECT_URI` exactly.
-- Webhook: subscribe the **`instagram`** object to `https://<host>/api/v1/webhooks/instagram`,
-  verify token = `META_WEBHOOK_VERIFY_TOKEN`. Instagram DM payloads arrive as
-  `{"object": "instagram"}` with `entry[].id` = the Instagram professional account id.
+- App product: **Instagram → API setup with Instagram login**.
+- Register the redirect URI (`INSTAGRAM_REDIRECT_URI`) under that product's
+  **Business login settings** — it must match exactly, including scheme and trailing slash.
+- On the Instagram account: *Settings → Messages and story replies → Message controls →
+  Connected Tools →* **Allow Access to Messages**. Without it, messaging silently fails.
+- Webhook: subscribe the **`instagram`** object to
+  `https://<host>/api/v1/webhooks/instagram`, verify token = `META_WEBHOOK_VERIFY_TOKEN`.
+  Instagram DM payloads arrive as `{"object": "instagram"}` with `entry[].id` = the
+  Instagram professional account id.
 - **The app must be published** (regardless of App Review status) to receive webhooks.
-- Under Standard Access the Conversations API only returns threads for users with a role on
-  the app; **Advanced Access (App Review) is required for real customers.**
-- On the Instagram account itself: *Settings → Messages and story replies → Message
-  controls → Connected Tools →* **Allow Access to Messages**. Without this, messaging
-  silently does not work.
+- Under Standard Access the Conversations API returns only threads belonging to users with
+  a role on the app; **Advanced Access (App Review) is required for real customers.**
+
+### Token refresh — Instagram Login only
+
+This is the maintenance the Facebook flow did not need. An Instagram long-lived token lasts
+roughly 60 days and then stops working, taking the inbox with it. Meta accepts a refresh
+only once the token is at least 24 hours old, and refuses it after expiry — at which point
+the account must be reconnected through the browser.
+
+Run this daily from cron:
+
+```bash
+docker exec nepsocial-api python3 -m scripts.refresh_tokens --within-days 10
+```
+
+`--status` reports every account's provider, expiry and resolved route without changing
+anything. The command exits non-zero if any refresh failed, so cron surfaces the problem.
 
 ## Historical import — and its hard limit
 
-Webhooks only deliver messages sent *after* a Page is subscribed, so a newly connected
+Webhooks only deliver messages sent *after* an account is subscribed, so a newly connected
 account would otherwise show an empty inbox. `app/services/conversation_sync.py` crawls
-`GET /{page-id}/conversations?platform=instagram` and persists the threads.
+`GET /{path-root}/conversations?platform=instagram` and persists the threads.
 
 > **Meta truncates a conversation to its 20 most recent messages.** This is documented
 > behaviour on both the Conversation and Message nodes, so **a complete DM archive cannot
@@ -90,6 +109,7 @@ python -m scripts.sync_conversations --account <uuid-or-ig-id>
 python -m scripts.sync_conversations --all
 python -m scripts.sync_conversations --account <id> --max-conversations 100 --fetch-profiles
 python -m scripts.sync_conversations --account <id> --subscribe-webhooks
+python -m scripts.refresh_tokens --status
 ```
 
 Or over HTTP (runs in the background, returns a pollable run):
@@ -140,10 +160,10 @@ python -m pytest tests/ -q
 | POST   | /api/v1/users | owner / admin |
 | PATCH  | /api/v1/users/{id} | owner / admin |
 | GET    | /api/v1/social-accounts | any active user |
-| GET    | /api/v1/social-accounts/facebook/login | public (redirect) |
+| GET    | /api/v1/social-accounts/instagram/login | public (redirect) — **primary** |
+| GET    | /api/v1/social-accounts/instagram/callback | public (redirect) |
+| GET    | /api/v1/social-accounts/facebook/login | public (redirect) — secondary |
 | GET    | /api/v1/social-accounts/facebook/callback | public (redirect) |
-| GET    | /api/v1/social-accounts/instagram/login | **deprecated alias** |
-| GET    | /api/v1/social-accounts/instagram/callback | **deprecated alias** |
 | POST   | /api/v1/social-accounts/{id}/sync | any active user |
 | GET    | /api/v1/social-accounts/{id}/sync-runs | any active user |
 | GET    | /api/v1/conversations | any active user |

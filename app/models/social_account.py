@@ -26,6 +26,13 @@ class SocialAccount(UUIDPKMixin, TimestampMixin, Base):
 
     platform: Mapped[str] = mapped_column(String(30), nullable=False)
 
+    # Which Meta auth flow issued this account's token. Decides the Graph host, the path
+    # root and the token semantics — see app/services/meta/target.py.
+    # `instagram_login` (default; also correct for pre-existing rows) or `facebook_login`.
+    auth_provider: Mapped[str] = mapped_column(
+        String(30), server_default="instagram_login", nullable=False
+    )
+
     # The id Meta uses for this identity in webhook `entry[].id` and in Graph paths.
     # Instagram: the professional account id. Facebook: the Page id.
     external_account_id: Mapped[str] = mapped_column(String(255), nullable=False)

@@ -39,7 +39,6 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.security import decrypt_token
 from app.db.session import async_session_factory
 from app.models.conversation import Conversation
 from app.models.customer import Customer
@@ -48,6 +47,7 @@ from app.models.social_account import SocialAccount
 from app.models.sync_run import SyncRun
 from app.services.meta import graph, instagram
 from app.services.meta.ids import normalize_message_id
+from app.services.meta.target import MetaTarget, resolve_target
 
 log = logging.getLogger(__name__)
 
@@ -133,9 +133,9 @@ async def _resolve_customer(
     db: AsyncSession,
     account: SocialAccount,
     payload: dict[str, Any],
+    target: MetaTarget,
     *,
     fetch_profiles: bool,
-    token: str,
 ) -> Optional[Customer]:
     """Find or create the customer in a thread.
 
@@ -172,7 +172,7 @@ async def _resolve_customer(
     if customer is None:
         name = None
         if fetch_profiles:
-            profile = await instagram.fetch_customer_profile(igsid, token)
+            profile = await instagram.fetch_customer_profile(igsid, target)
             name = profile.get("name")
             username = profile.get("username") or username
         customer = Customer(
@@ -267,7 +267,7 @@ async def _find_or_create_conversation(
 async def _collect_messages(
     payload: dict[str, Any],
     conversation_id: str,
-    token: str,
+    target: MetaTarget,
     *,
     max_messages: Optional[int],
 ) -> list[dict[str, Any]]:
@@ -286,7 +286,7 @@ async def _collect_messages(
         str(m["id"]): m for m in inline if m.get("id")
     }
     async for message in instagram.iter_messages(
-        conversation_id, token, max_messages=max_messages
+        conversation_id, target, max_messages=max_messages
     ):
         if message.get("id"):
             merged.setdefault(str(message["id"]), message)
@@ -400,7 +400,7 @@ async def _import_conversation(
     db: AsyncSession,
     account: SocialAccount,
     payload: dict[str, Any],
-    token: str,
+    target: MetaTarget,
     stats: SyncStats,
     *,
     max_messages: Optional[int],
@@ -412,7 +412,7 @@ async def _import_conversation(
         return False
 
     customer = await _resolve_customer(
-        db, account, payload, fetch_profiles=fetch_profiles, token=token
+        db, account, payload, target, fetch_profiles=fetch_profiles
     )
     if customer is None:
         log.warning(
@@ -425,7 +425,7 @@ async def _import_conversation(
         db, account, customer, external_id, updated_at
     )
     messages = await _collect_messages(
-        payload, external_id, token, max_messages=max_messages
+        payload, external_id, target, max_messages=max_messages
     )
     await _insert_messages(db, account, convo, customer, messages, stats)
     return created
@@ -508,15 +508,22 @@ async def sync_account(
             await db.commit()
         return run
 
-    # Instagram messaging is driven by the Page token, so the Page id is the right path
-    # root; fall back to the account id for rows created before Page login existed.
-    page_id = account.external_page_id or account.external_account_id
-    token = decrypt_token(account.access_token_encrypted)
+    # Resolve host, path root and token for this account's auth flow. Instagram Login and
+    # Facebook Login address different hosts with different identifiers.
+    try:
+        target = resolve_target(account)
+    except ValueError as exc:
+        run.status = "failed"
+        run.error = str(exc)
+        run.finished_at = datetime.now(timezone.utc)
+        if autocommit:
+            await db.commit()
+        return run
 
     failure: Optional[str] = None
     try:
         async for payload in instagram.iter_conversations(
-            page_id, token, max_conversations=ceiling
+            target, max_conversations=ceiling
         ):
             stats.conversations_seen += 1
             if stats.conversations_seen >= ceiling:
@@ -529,7 +536,7 @@ async def sync_account(
                         db,
                         account,
                         payload,
-                        token,
+                        target,
                         stats,
                         max_messages=message_ceiling,
                         fetch_profiles=fetch_profiles,

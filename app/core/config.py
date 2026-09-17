@@ -1,6 +1,5 @@
 """Application settings, loaded from environment / .env (see .env.example)."""
 import logging
-import os
 from functools import lru_cache
 from typing import Optional
 
@@ -33,36 +32,49 @@ class Settings(BaseSettings):
     # Encryption for Meta access tokens at rest (Fernet key)
     token_encryption_key: str
 
-    # ---- Meta app (one app serves both Facebook Login for Business and webhooks) ----
-    # The INSTAGRAM_* spellings are still accepted so an existing deployment's .env
-    # keeps working during the migration.
-    meta_app_id: str = Field(
-        "", validation_alias=AliasChoices("META_APP_ID", "INSTAGRAM_APP_ID")
+    # ---- Instagram Login (the primary flow) ----
+    # These are the *Instagram* app credentials from
+    # Instagram -> API setup with Instagram login. They are DIFFERENT NUMBERS from the
+    # Facebook app credentials below, and mixing them up is the single most confusing
+    # failure in this integration: feeding an Instagram app id to Facebook's OAuth dialog
+    # returns "Invalid app ID: The provided app ID does not look like a valid app ID",
+    # and using it as a `{id}|{secret}` app token returns code 190
+    # "Error validating application". Hence two clearly separated groups.
+    instagram_app_id: str = ""
+    instagram_app_secret: str = ""
+    # Must match the redirect URI registered under Instagram -> Business login settings.
+    instagram_redirect_uri: str = ""
+    instagram_scopes: str = (
+        "instagram_business_basic,instagram_business_manage_messages"
     )
-    meta_app_secret: str = Field(
-        "", validation_alias=AliasChoices("META_APP_SECRET", "INSTAGRAM_APP_SECRET")
+    instagram_dialog_url: str = "https://www.instagram.com"
+    instagram_oauth_base_url: str = "https://api.instagram.com"
+    instagram_graph_base_url: str = "https://graph.instagram.com"
+
+    # ---- Facebook Login for Business (optional second flow) ----
+    # Only needed for Messenger/WhatsApp later, or for Instagram accounts reached through a
+    # Page. The META_* spellings are accepted so an existing .env keeps working.
+    # `pages_read_engagement` is a required dependency for the Instagram User node and
+    # `business_management` is in Meta's Instagram-messaging setup list; omitting either
+    # gives a login that succeeds but reads nothing.
+    facebook_app_id: str = Field(
+        "", validation_alias=AliasChoices("FACEBOOK_APP_ID", "META_APP_ID")
     )
-    # Must match a redirect URI registered in the Meta app dashboard, e.g.
-    # https://<host>/api/v1/social-accounts/facebook/callback
-    meta_redirect_uri: str = Field(
-        "", validation_alias=AliasChoices("META_REDIRECT_URI", "INSTAGRAM_REDIRECT_URI")
+    facebook_app_secret: str = Field(
+        "", validation_alias=AliasChoices("FACEBOOK_APP_SECRET", "META_APP_SECRET")
     )
-    # Facebook Login for Business: Page + linked Instagram messaging permissions.
-    # `pages_read_engagement` is a required dependency for the Instagram User node, and
-    # `business_management` is required by Meta's Instagram-messaging setup steps — both
-    # are easy to omit and produce a login that succeeds but reads nothing.
-    # `pages_messaging` is Messenger-only and safe to drop if App Review pushes back.
-    #
-    # Deliberately NOT aliased to the legacy INSTAGRAM_SCOPES: those values
-    # (`instagram_business_basic`, `instagram_business_manage_messages`) only mean anything
-    # to an Instagram-Login dialog. Inheriting them would silently request permissions that
-    # Facebook Login does not recognise, so a stale value is reported rather than used.
-    meta_scopes: str = (
+    facebook_redirect_uri: str = Field(
+        "", validation_alias=AliasChoices("FACEBOOK_REDIRECT_URI", "META_REDIRECT_URI")
+    )
+    facebook_scopes: str = (
         "instagram_basic,instagram_manage_messages,pages_manage_metadata,"
         "pages_show_list,pages_read_engagement,business_management,pages_messaging"
     )
+    facebook_dialog_url: str = "https://www.facebook.com"
+    facebook_graph_base_url: str = "https://graph.facebook.com"
+
     oauth_state_expire_minutes: int = 10
-    # Any string you also paste into the Meta dashboard's webhook "Verify token" field
+    # Any string you also paste into the dashboard's webhook "Verify token" field
     meta_webhook_verify_token: str = Field(
         "",
         validation_alias=AliasChoices(
@@ -71,9 +83,11 @@ class Settings(BaseSettings):
     )
 
     # ---- Graph API transport ----
+    # The host and path root are chosen per account (see services/meta/target.py), because
+    # Instagram Login talks to graph.instagram.com while Facebook Login talks to
+    # graph.facebook.com. This is only the fallback.
     graph_api_version: str = "v21.0"
     graph_base_url: str = "https://graph.facebook.com"
-    graph_oauth_dialog_url: str = "https://www.facebook.com"
     graph_timeout_seconds: float = 20.0
     # Retries cover 429/5xx/transport blips and Meta's transient error codes.
     graph_max_attempts: int = 4
@@ -134,24 +148,10 @@ class Settings(BaseSettings):
         if self.log_level is None:
             self.log_level = "INFO" if self.is_production else "DEBUG"
 
-        # A leftover INSTAGRAM_SCOPES from the Instagram-Login era is now ignored. Say so
-        # loudly, because the failure it causes (a consent screen that grants nothing
-        # useful) is otherwise very hard to diagnose.
-        legacy_scopes = os.environ.get("INSTAGRAM_SCOPES", "").strip()
-        if legacy_scopes:
-            log.warning(
-                "INSTAGRAM_SCOPES=%r is ignored since the move to Facebook Login for "
-                "Business. Those permission names only apply to Instagram Login. Using "
-                "META_SCOPES instead: %s. Remove INSTAGRAM_SCOPES from the environment.",
-                legacy_scopes,
-                self.meta_scopes,
-            )
-
         if self.is_production:
             for name, value in (
                 ("JWT_SECRET", self.jwt_secret),
                 ("TOKEN_ENCRYPTION_KEY", self.token_encryption_key),
-                ("META_APP_SECRET", self.meta_app_secret),
             ):
                 lowered = (value or "").lower()
                 if not value or any(marker in lowered for marker in _PLACEHOLDER_MARKERS):
@@ -162,14 +162,46 @@ class Settings(BaseSettings):
                         self.environment,
                     )
 
+        # Log which flows are usable and under which app id. App ids are public (they appear
+        # in every OAuth URL), and printing them here turns a confusing browser-side
+        # "Invalid app ID" error into an immediately obvious misconfiguration.
+        log.info(
+            "meta config: instagram_login=%s (app_id=%s) | facebook_login=%s (app_id=%s) | "
+            "webhook_verify_token=%s",
+            "on" if self.instagram_login_configured else "off",
+            self.instagram_app_id or "-",
+            "on" if self.facebook_login_configured else "off",
+            self.facebook_app_id or "-",
+            "set" if self.meta_webhook_verify_token else "MISSING",
+        )
+        if self.instagram_app_id and self.instagram_app_id == self.facebook_app_id:
+            log.error(
+                "INSTAGRAM_APP_ID and FACEBOOK_APP_ID are the same value (%s). They are "
+                "different app identities; using one for the other breaks the login flow.",
+                self.instagram_app_id,
+            )
+        if self.instagram_app_id and not self.instagram_app_secret:
+            log.error(
+                "INSTAGRAM_APP_ID is set but INSTAGRAM_APP_SECRET is empty; Instagram "
+                "Login cannot exchange a code without it."
+            )
+
         return self
 
     @property
-    def meta_configured(self) -> bool:
+    def instagram_login_configured(self) -> bool:
         return bool(
-            self.meta_app_id
-            and self.meta_app_secret
-            and self.meta_redirect_uri
+            self.instagram_app_id
+            and self.instagram_app_secret
+            and self.instagram_redirect_uri
+        )
+
+    @property
+    def facebook_login_configured(self) -> bool:
+        return bool(
+            self.facebook_app_id
+            and self.facebook_app_secret
+            and self.facebook_redirect_uri
         )
 
 

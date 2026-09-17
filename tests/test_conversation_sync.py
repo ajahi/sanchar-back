@@ -22,7 +22,7 @@ from sqlalchemy import delete, func, select
 from app.api.v1 import webhooks as webhooks_module
 from app.api.v1.webhooks import ingest_event
 from app.core.config import settings
-from app.core.security import encrypt_token
+from app.core.security import decrypt_token, encrypt_token
 from app.db.session import async_session_factory
 from app.models.conversation import Conversation
 from app.models.customer import Customer
@@ -30,8 +30,10 @@ from app.models.message import Message
 from app.models.social_account import SocialAccount
 from app.models.sync_run import SyncRun
 from app.models.tenant import Tenant
-from app.services import conversation_sync
-from app.services.meta import instagram
+from app.services import conversation_sync, token_maintenance
+from app.services.meta import graph, instagram
+from app.services.meta import instagram_login as ig_login
+from app.services.meta.target import resolve_target
 
 # The business's own Instagram account, exactly as it appears in the real payload.
 BUSINESS_IG_ID = "17841431601921729"
@@ -45,8 +47,13 @@ TEST_APP_SECRET = "test-app-secret"
 
 @pytest.fixture(autouse=True)
 def _fixed_app_secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the app secret so signature assertions do not depend on a developer's .env."""
-    monkeypatch.setattr(settings, "meta_app_secret", TEST_APP_SECRET)
+    """Pin the app secrets so signature assertions do not depend on a developer's .env.
+
+    Only the Instagram secret is set: webhook verification accepts either app identity, and
+    leaving the Facebook one empty proves the single-secret case works.
+    """
+    monkeypatch.setattr(settings, "instagram_app_secret", TEST_APP_SECRET)
+    monkeypatch.setattr(settings, "facebook_app_secret", "")
 
 
 def _conversation(
@@ -138,8 +145,9 @@ async def _seed_account(db, *, token: str = "page-token") -> SocialAccount:
     account = SocialAccount(
         tenant_id=tenant.id,
         platform="instagram",
+        # Instagram Login is the primary flow: no Page, the account id is the path root.
+        auth_provider="instagram_login",
         external_account_id=BUSINESS_IG_ID,
-        external_page_id=PAGE_ID,
         account_name=BUSINESS_USERNAME,
         access_token_encrypted=encrypt_token(token),
     )
@@ -149,7 +157,9 @@ async def _seed_account(db, *, token: str = "page-token") -> SocialAccount:
 
 
 def _patch_conversations(payloads: list[dict]) -> None:
-    async def _iter(page_id, token, **kwargs):
+    """Stand in for the Graph crawl. Takes a MetaTarget like the real function does."""
+
+    async def _iter(target, **kwargs):
         for payload in payloads:
             yield payload
 
@@ -297,11 +307,11 @@ async def _run_hard_failure_isolation() -> None:
         original = conversation_sync._import_conversation
         calls = {"n": 0}
 
-        async def flaky(db_, account_, payload, token, stats, **kwargs):
+        async def flaky(db_, account_, payload, target, stats, **kwargs):
             calls["n"] += 1
             if calls["n"] == 2:
                 raise RuntimeError("boom")
-            return await original(db_, account_, payload, token, stats, **kwargs)
+            return await original(db_, account_, payload, target, stats, **kwargs)
 
         conversation_sync._import_conversation = flaky
         try:
@@ -390,7 +400,7 @@ async def _run_truncated_messages() -> None:
         )
         _patch_conversations([thread])
 
-        async def _extra_messages(conversation_id, token, **kwargs):
+        async def _extra_messages(conversation_id, target, **kwargs):
             yield _message("m_mid.101", "second", "2026-09-17T11:00:00+0000")
 
         instagram.iter_messages = _extra_messages
@@ -613,6 +623,161 @@ def test_route_rejects_forged_signature() -> None:
 
 
 # ------------------------------------------------------------------------- misc units
+
+
+def test_provider_routing_selects_host_and_path_root() -> None:
+    """The two auth flows must resolve to different hosts and different path roots.
+
+    This is the mapping that made the original failure so confusing: an Instagram account
+    id sent to graph.facebook.com is rejected outright, so getting this wrong produces an
+    auth error rather than a wrong answer.
+    """
+
+    async def _run() -> None:
+        async with async_session_factory() as db:
+            ig = await _seed_account(db)
+            target = resolve_target(ig)
+            assert target.provider == "instagram_login"
+            assert target.base_url == settings.instagram_graph_base_url
+            assert target.path_root == BUSINESS_IG_ID  # the account itself, no Page
+            assert target.token == "page-token"
+
+            # A distinct Instagram identity, since (platform, external_account_id) is unique.
+            fb = SocialAccount(
+                tenant_id=ig.tenant_id,
+                platform="instagram",
+                auth_provider="facebook_login",
+                external_account_id="17841400000000001",
+                external_page_id=PAGE_ID,
+                access_token_encrypted=encrypt_token("fb-token"),
+            )
+            db.add(fb)
+            await db.flush()
+
+            fb_target = resolve_target(fb)
+            assert fb_target.provider == "facebook_login"
+            assert fb_target.base_url == settings.facebook_graph_base_url
+            assert fb_target.path_root == PAGE_ID  # reached through the Page
+
+            await db.rollback()
+
+    asyncio.run(_run())
+
+
+def test_target_rejects_an_account_without_a_token() -> None:
+    """A missing token must be a clear ValueErrors, not an AttributeError deeper down."""
+
+    async def _run() -> None:
+        async with async_session_factory() as db:
+            account = await _seed_account(db)
+            account.access_token_encrypted = None
+            await db.flush()
+            try:
+                resolve_target(account)
+            except ValueError as exc:
+                assert "access token" in str(exc)
+            else:
+                raise AssertionError("a tokenless account must not resolve")
+            await db.rollback()
+
+    asyncio.run(_run())
+
+
+def test_webhook_signature_accepts_either_app_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Instagram Login and Facebook Login have separate secrets; both must verify."""
+    body = b'{"object":"instagram","entry":[]}'
+
+    def sign(secret: str) -> str:
+        return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+    # Only the Instagram secret configured (the autouse fixture's default).
+    assert instagram.verify_webhook_signature(body, sign(TEST_APP_SECRET))
+    assert not instagram.verify_webhook_signature(body, "sha256=deadbeef")
+    assert not instagram.verify_webhook_signature(body, "")
+    assert not instagram.verify_webhook_signature(body, sign("some-other-secret"))
+
+    # With a Facebook secret also present, a delivery signed by it is accepted too.
+    monkeypatch.setattr(settings, "facebook_app_secret", "fb-app-secret")
+    assert instagram.verify_webhook_signature(body, sign("fb-app-secret"))
+    assert instagram.verify_webhook_signature(body, sign(TEST_APP_SECRET))
+
+
+def test_token_refresh_skips_permanent_tokens_and_refreshes_expiring_ones() -> None:
+    """Instagram Login tokens expire; Facebook Page tokens do not. Only the former refresh.
+
+    An account with no recorded expiry is deliberately treated as expiring, because that is
+    the case that lapses silently.
+    """
+
+    async def _run() -> None:
+        async with async_session_factory() as db:
+            ig = await _seed_account(db)
+
+            fb = SocialAccount(
+                tenant_id=ig.tenant_id,
+                platform="instagram",
+                auth_provider="facebook_login",
+                external_account_id="17841400000000002",
+                external_page_id=PAGE_ID,
+                access_token_encrypted=encrypt_token("fb-token"),
+            )
+            db.add(fb)
+            await db.flush()
+
+            seen: dict[str, str] = {}
+
+            async def _fake_refresh(token: str) -> dict:
+                seen["token"] = token
+                return {"access_token": "fresh-token", "expires_in": 5_183_944}
+
+            real = ig_login.refresh_long_lived_token
+            ig_login.refresh_long_lived_token = _fake_refresh
+            try:
+                outcomes = await token_maintenance.refresh_expiring_tokens(
+                    db, within_days=10, autocommit=False
+                )
+            finally:
+                ig_login.refresh_long_lived_token = real
+
+            # The Facebook Login row is filtered out by the query, so only one outcome.
+            assert len(outcomes) == 1, [o.account_name for o in outcomes]
+            assert outcomes[0].status == "refreshed"
+            # The stored token really was replaced, not just reported.
+            assert seen["token"] == "page-token"
+            assert decrypt_token(ig.access_token_encrypted) == "fresh-token"
+            assert ig.token_expires_at is not None
+            # The permanent one is untouched.
+            assert decrypt_token(fb.access_token_encrypted) == "fb-token"
+
+            await db.rollback()
+
+    asyncio.run(_run())
+
+
+def test_token_refresh_reports_a_dead_token_without_raising() -> None:
+    """A sweep must not stop at the first dead token; an expired one needs a reconnect."""
+
+    async def _run() -> None:
+        async with async_session_factory() as db:
+            account = await _seed_account(db)
+
+            async def _dead_refresh(token: str) -> dict:
+                raise graph.GraphError("Session has expired", status=400, code=190)
+
+            real = ig_login.refresh_long_lived_token
+            ig_login.refresh_long_lived_token = _dead_refresh
+            try:
+                outcomes = await token_maintenance.refresh_expiring_tokens(
+                    db, within_days=10, autocommit=False
+                )
+            finally:
+                ig_login.refresh_long_lived_token = real
+
+            assert outcomes[0].status == "failed"
+            assert "reconnect" in outcomes[0].detail
+            await db.rollback()
+
+    asyncio.run(_run())
 
 
 async def _run_stale_runs() -> None:

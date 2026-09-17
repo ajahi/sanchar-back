@@ -29,7 +29,9 @@ from app.core.security import decrypt_token
 from app.db.session import async_session_factory
 from app.models.social_account import SocialAccount
 from app.services import conversation_sync
-from app.services.meta import facebook_login, graph
+from app.services.meta import facebook_login as fb_login
+from app.services.meta import graph
+from app.services.meta.target import describe
 
 
 async def _list_accounts() -> int:
@@ -41,13 +43,16 @@ async def _list_accounts() -> int:
         print("No connected accounts.")
         return 0
 
-    print(f"{'id':38} {'platform':10} {'account':24} {'page':18} last_synced")
+    print(f"{'id':38} {'provider':16} {'account':20} last_synced")
     for a in accounts:
         print(
-            f"{str(a.id):38} {a.platform:10} {(a.account_name or '-')[:24]:24} "
-            f"{(a.external_page_id or '-')[:18]:18} "
+            f"{str(a.id):38} {a.auth_provider:16} {(a.account_name or '-')[:20]:20} "
             f"{a.last_synced_at.isoformat() if a.last_synced_at else 'never'}"
         )
+        # Show the host and path root the sync will actually use, since the two auth flows
+        # differ and a wrong provider is invisible otherwise.
+        route = describe(a)
+        print(f"{'':38} -> {route or 'NO USABLE TOKEN'}")
     return 0
 
 
@@ -90,16 +95,23 @@ async def _sync_one(account, *, max_conversations, fetch_profiles) -> conversati
 
 
 async def _subscribe(account) -> int:
-    if not account.external_page_id:
-        print(f"{account.external_account_id}: no Page id stored; reconnect the account.")
-        return 1
+    """Re-register this account for messaging webhooks, on whichever flow it uses."""
+    from app.services.meta import instagram_login as ig_login
+    from app.services.meta.target import FACEBOOK_LOGIN, provider_of
+
     async with async_session_factory() as db:
         account = await db.get(SocialAccount, account.id)
+        token = decrypt_token(account.access_token_encrypted)
         try:
-            result = await facebook_login.subscribe_page_webhooks(
-                account.external_page_id,
-                decrypt_token(account.access_token_encrypted),
-            )
+            if provider_of(account) == FACEBOOK_LOGIN:
+                if not account.external_page_id:
+                    print(f"{account.external_account_id}: no Page id stored; reconnect.")
+                    return 1
+                result = await fb_login.subscribe_page_webhooks(
+                    account.external_page_id, token
+                )
+            else:
+                result = await ig_login.subscribe_webhooks(token)
         except graph.GraphError as exc:
             print(f"{account.external_account_id}: subscribe failed: {exc}", file=sys.stderr)
             return 1

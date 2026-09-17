@@ -65,29 +65,29 @@ _PAGE_FIELDS = "id,name,access_token,tasks,instagram_business_account{id,usernam
 
 def scopes() -> list[str]:
     """Configured permission list, split and de-blanked."""
-    return [s.strip() for s in settings.meta_scopes.split(",") if s.strip()]
+    return [s.strip() for s in settings.facebook_scopes.split(",") if s.strip()]
 
 
 def app_access_token() -> str:
     """`{app-id}|{app-secret}` — used for app-level calls like /debug_token."""
-    return f"{settings.meta_app_id}|{settings.meta_app_secret}"
+    return f"{settings.facebook_app_id}|{settings.facebook_app_secret}"
 
 
 def configured() -> bool:
-    return settings.meta_configured
+    return settings.facebook_login_configured
 
 
 def build_authorize_url(state: str) -> str:
     """Step 1 — the URL to bounce the browser to."""
     params = {
-        "client_id": settings.meta_app_id,
-        "redirect_uri": settings.meta_redirect_uri,
+        "client_id": settings.facebook_app_id,
+        "redirect_uri": settings.facebook_redirect_uri,
         "response_type": "code",
         "scope": ",".join(scopes()),
         "state": state,
     }
     version = settings.graph_api_version.strip("/")
-    base = settings.graph_oauth_dialog_url.rstrip("/")
+    base = settings.facebook_dialog_url.rstrip("/")
     return f"{base}/{version}/{_DIALOG_PATH}?{urlencode(params)}"
 
 
@@ -95,9 +95,9 @@ async def exchange_code_for_user_token(code: str) -> dict[str, Any]:
     """Step 2 — authorization code -> short-lived user token (valid ~1-2 hours)."""
     return await graph.get(
         "oauth/access_token",
-        client_id=settings.meta_app_id,
-        client_secret=settings.meta_app_secret,
-        redirect_uri=settings.meta_redirect_uri,
+        client_id=settings.facebook_app_id,
+        client_secret=settings.facebook_app_secret,
+        redirect_uri=settings.facebook_redirect_uri,
         code=code,
     )
 
@@ -107,8 +107,8 @@ async def exchange_for_long_lived_user_token(short_lived_token: str) -> dict[str
     return await graph.get(
         "oauth/access_token",
         grant_type="fb_exchange_token",
-        client_id=settings.meta_app_id,
-        client_secret=settings.meta_app_secret,
+        client_id=settings.facebook_app_id,
+        client_secret=settings.facebook_app_secret,
         fb_exchange_token=short_lived_token,
     )
 
@@ -179,7 +179,7 @@ async def subscribe_app_webhooks(
     """
     return await graph.request(
         "POST",
-        f"{settings.meta_app_id}/subscriptions",
+        f"{settings.facebook_app_id}/subscriptions",
         token=app_access_token(),
         params={
             "object": object_,
@@ -193,7 +193,7 @@ async def subscribe_app_webhooks(
 
 async def list_app_webhooks() -> dict[str, Any]:
     """Current app-level webhook subscriptions (diagnostics)."""
-    return await graph.get(f"{settings.meta_app_id}/subscriptions", token=app_access_token())
+    return await graph.get(f"{settings.facebook_app_id}/subscriptions", token=app_access_token())
 
 
 async def debug_token(input_token: str) -> dict[str, Any]:

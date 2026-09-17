@@ -155,12 +155,17 @@ def _backoff_delay(attempt: int, response: Optional[httpx.Response]) -> float:
     return random.uniform(ceiling / 2, ceiling)  # full jitter avoids retry stampedes
 
 
-def build_url(path: str) -> str:
-    """Absolute URL for a Graph `path`, or pass an absolute URL straight through."""
+def build_url(path: str, base_url: Optional[str] = None) -> str:
+    """Absolute URL for a Graph `path`, or pass an absolute URL straight through.
+
+    `base_url` overrides the configured host because the two auth flows live on different
+    hosts: graph.instagram.com for Instagram Login, graph.facebook.com for Facebook Login.
+    """
     if path.startswith("http://") or path.startswith("https://"):
         return path
     version = settings.graph_api_version.strip("/")
-    return f"{settings.graph_base_url.rstrip('/')}/{version}/{path.lstrip('/')}"
+    host = (base_url or settings.graph_base_url).rstrip("/")
+    return f"{host}/{version}/{path.lstrip('/')}"
 
 
 async def request(
@@ -168,6 +173,7 @@ async def request(
     path: str,
     *,
     token: Optional[str] = None,
+    base_url: Optional[str] = None,
     params: Optional[dict[str, Any]] = None,
     json_body: Optional[dict[str, Any]] = None,
     data: Optional[dict[str, Any]] = None,
@@ -179,7 +185,7 @@ async def request(
     Raises `GraphError` once the attempt budget is exhausted or on a non-retryable
     error. Returns the decoded JSON body (an empty dict for an empty 2xx body).
     """
-    url = build_url(path)
+    url = build_url(path, base_url)
     attempts = max_attempts or settings.graph_max_attempts
     request_timeout = httpx.Timeout(timeout or settings.graph_timeout_seconds)
 
@@ -289,6 +295,7 @@ async def get(
     path: str,
     *,
     token: Optional[str] = None,
+    base_url: Optional[str] = None,
     timeout: Optional[float] = None,
     **params: Any,
 ) -> dict[str, Any]:
@@ -297,6 +304,7 @@ async def get(
         "GET",
         path,
         token=token,
+        base_url=base_url,
         params={k: v for k, v in params.items() if v is not None},
         timeout=timeout,
     )
@@ -306,6 +314,7 @@ async def paginate(
     path: str,
     *,
     token: Optional[str] = None,
+    base_url: Optional[str] = None,
     params: Optional[dict[str, Any]] = None,
     max_items: Optional[int] = None,
 ) -> AsyncIterator[dict[str, Any]]:
@@ -330,12 +339,14 @@ async def paginate(
         first_page = False
 
         if next_url:
-            payload = await request("GET", next_url, token=token)
+            payload = await request("GET", next_url, token=token, base_url=base_url)
         else:
             query = dict(base_params)
             if after:
                 query["after"] = after
-            payload = await request("GET", path, token=token, params=query)
+            payload = await request(
+                "GET", path, token=token, base_url=base_url, params=query
+            )
 
         items = payload.get("data") or []
         if not isinstance(items, list):

@@ -17,11 +17,11 @@ from collections.abc import Iterable
 
 from sqlalchemy import select
 
-from app.core.security import decrypt_token
 from app.db.session import async_session_factory
 from app.models.customer import Customer
 from app.models.social_account import SocialAccount
 from app.services.meta import instagram
+from app.services.meta.target import resolve_target
 
 log = logging.getLogger(__name__)
 
@@ -45,12 +45,12 @@ async def enrich_customers(pending: Iterable[tuple[str, str]]) -> int:
         for igsid, account_id in unique:
             try:
                 account = await db.get(SocialAccount, uuid.UUID(account_id))
-                if account is None or not account.access_token_encrypted:
+                if account is None:
                     continue
+                # The profile lookup must hit the same host that issued the token.
+                target = resolve_target(account)
                 profile = await instagram.fetch_customer_profile(
-                    igsid,
-                    decrypt_token(account.access_token_encrypted),
-                    timeout=_ENRICH_TIMEOUT_SECONDS,
+                    igsid, target, timeout=_ENRICH_TIMEOUT_SECONDS
                 )
                 if not profile:
                     continue

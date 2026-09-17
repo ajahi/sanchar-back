@@ -7,7 +7,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import decrypt_token
 from app.core.tenant import CurrentTenant, CurrentUser
 from app.db.session import get_db
 from app.models.conversation import Conversation
@@ -16,6 +15,7 @@ from app.models.message import Message
 from app.models.social_account import SocialAccount
 from app.schemas.conversation import ConversationOut, MessageOut, ReplyIn
 from app.services.meta import graph, instagram
+from app.services.meta.target import resolve_target
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -124,16 +124,14 @@ async def reply(
             status_code=status.HTTP_409_CONFLICT, detail="Instagram account not connected"
         )
 
-    # Messaging is driven by the Page token, so the Page id is the path root. The account
-    # id is only a fallback for rows connected before Page login existed.
-    page_id = account.external_page_id or account.external_account_id
+    # Host, path root and token all depend on which auth flow connected this account.
     try:
-        sent = await instagram.send_text(
-            page_id,
-            decrypt_token(account.access_token_encrypted),
-            customer.external_user_id,
-            body.text,
-        )
+        target = resolve_target(account)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+    try:
+        sent = await instagram.send_text(target, customer.external_user_id, body.text)
     except graph.GraphError as exc:
         raise _send_error(exc)
 
