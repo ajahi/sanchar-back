@@ -7,6 +7,8 @@ Flow (see Meta docs: Business Login for Instagram):
   4. Read the profile (GRAPH /me).
 Long-lived tokens are refreshed elsewhere via GRAPH /refresh_access_token.
 """
+import hmac
+from hashlib import sha256
 from urllib.parse import urlencode
 
 import httpx
@@ -76,3 +78,37 @@ async def refresh_long_lived_token(long_lived_token: str) -> dict:
         resp = await client.get(f"{GRAPH_BASE}/refresh_access_token", params=params)
         resp.raise_for_status()
         return resp.json()
+
+
+# ---- Messaging (instagram_business_manage_messages) ----
+
+
+def verify_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
+    """Check Meta's X-Hub-Signature-256 ("sha256=<hex>") against the app secret."""
+    expected = hmac.new(settings.instagram_app_secret.encode(), raw_body, sha256).hexdigest()
+    return hmac.compare_digest(f"sha256={expected}", signature_header or "")
+
+
+async def send_text(access_token: str, ig_account_id: str, recipient_igsid: str, text: str) -> dict:
+    """Send a text DM from the business account. Returns {recipient_id, message_id}."""
+    body = {"recipient": {"id": recipient_igsid}, "message": {"text": text}}
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(
+            f"{GRAPH_BASE}/v23.0/{ig_account_id}/messages",
+            json=body,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def fetch_customer_profile(access_token: str, igsid: str) -> dict:
+    """Best-effort {name, username} of a messaging participant; {} on any failure."""
+    params = {"fields": "name,username", "access_token": access_token}
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(f"{GRAPH_BASE}/v23.0/{igsid}", params=params)
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPError:
+        return {}

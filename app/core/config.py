@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     instagram_redirect_uri: str = ""
     instagram_scopes: str = "instagram_business_basic,instagram_business_manage_messages"
     oauth_state_expire_minutes: int = 10
+    # Any string you also paste into the Meta dashboard's webhook "Verify token" field
+    instagram_webhook_verify_token: str = ""
 
     # Where the callback sends the browser after a successful connect/login
     frontend_url: str = "http://localhost:3000"
