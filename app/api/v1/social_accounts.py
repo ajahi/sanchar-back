@@ -274,8 +274,10 @@ async def instagram_callback(
     try:
         await sync_account(db, account)
     except httpx.HTTPError:
+        # sync_account only commits once at the end, so a failure never leaves
+        # anything committed to undo — no rollback needed, and a manual one here
+        # would expire `owner`/`tenant` before the roles/cookie code below runs.
         log.exception("initial conversation sync failed for account %s", account.id)
-        await db.rollback()
 
     # Mint our own session and hand it to the dashboard via an httpOnly cookie.
     token = create_access_token(
