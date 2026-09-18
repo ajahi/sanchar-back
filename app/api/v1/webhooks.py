@@ -19,11 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.security import decrypt_token
 from app.db.session import get_db
-from app.models.conversation import Conversation
-from app.models.customer import Customer
 from app.models.message import Message
 from app.models.social_account import SocialAccount
-from app.services.meta import instagram
+from app.services.meta.store import get_or_create_conversation
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 log = logging.getLogger(__name__)
@@ -38,50 +36,6 @@ async def verify(
     if hub_mode != "subscribe" or hub_token != settings.instagram_webhook_verify_token:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bad verify token")
     return hub_challenge
-
-
-async def _get_or_create_conversation(
-    db: AsyncSession, account: SocialAccount, igsid: str, token: str
-) -> tuple[Customer, Conversation]:
-    # ponytail: select-then-insert; the partial unique indexes catch the rare concurrent
-    # first-message race (this delivery fails -> Meta retries -> second attempt finds the rows).
-    customer = (
-        await db.execute(
-            select(Customer).where(
-                Customer.tenant_id == account.tenant_id, Customer.external_user_id == igsid
-            )
-        )
-    ).scalar_one_or_none()
-    if customer is None:
-        profile = await instagram.fetch_customer_profile(token, igsid)
-        customer = Customer(
-            tenant_id=account.tenant_id,
-            external_user_id=igsid,
-            name=profile.get("name"),
-            external_username=profile.get("username"),
-        )
-        db.add(customer)
-        await db.flush()
-
-    convo = (
-        await db.execute(
-            select(Conversation).where(
-                Conversation.customer_id == customer.id,
-                Conversation.social_account_id == account.id,
-                Conversation.status == "open",
-            )
-        )
-    ).scalar_one_or_none()
-    if convo is None:
-        convo = Conversation(
-            tenant_id=account.tenant_id,
-            customer_id=customer.id,
-            social_account_id=account.id,
-            channel="instagram",
-        )
-        db.add(convo)
-        await db.flush()
-    return customer, convo
 
 
 async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> None:
@@ -103,7 +57,7 @@ async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> Non
     is_echo = bool(msg.get("is_echo"))
     igsid = event["recipient"]["id"] if is_echo else event["sender"]["id"]
     token = decrypt_token(account.access_token_encrypted)
-    customer, convo = await _get_or_create_conversation(db, account, igsid, token)
+    customer, convo = await get_or_create_conversation(db, account, igsid, token)
 
     attachments = msg.get("attachments") or []
     first = attachments[0] if attachments else {}

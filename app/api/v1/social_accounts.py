@@ -9,6 +9,7 @@ to *their* tenant instead of provisioning a new one ("connect" mode).
 Incoming traffic is tracked two ways (kept simple): the source/referrer uri is stored in
 social_accounts.metadata, and every attempt is logged to audit_logs (uri, ip, user-agent).
 """
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
@@ -37,9 +38,11 @@ from app.models.tenant import Tenant
 from app.models.user import User
 from app.services.audit import record_audit
 from app.services.meta import instagram
+from app.services.meta.sync import sync_account
 from app.services.rbac import get_roles_by_names
 
 router = APIRouter(prefix="/social-accounts", tags=["social-accounts"])
+log = logging.getLogger(__name__)
 
 PLATFORM = "instagram"
 
@@ -265,6 +268,14 @@ async def instagram_callback(
         },
     )
     await db.commit()
+
+    # Best-effort backfill so the inbox isn't empty on first login; a Meta hiccup
+    # here must never break the login itself (retry via POST /conversations/sync).
+    try:
+        await sync_account(db, account)
+    except httpx.HTTPError:
+        log.exception("initial conversation sync failed for account %s", account.id)
+        await db.rollback()
 
     # Mint our own session and hand it to the dashboard via an httpOnly cookie.
     token = create_access_token(

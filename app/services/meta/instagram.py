@@ -102,6 +102,44 @@ async def send_text(access_token: str, ig_account_id: str, recipient_igsid: str,
         return resp.json()
 
 
+async def list_conversations(access_token: str, after: str | None = None) -> dict:
+    """One page of the account's threads: {id, updated_time}. Raw {data, paging}.
+
+    Per Meta's Conversations API (Instagram API with Instagram Login), this is
+    `/me/conversations` — the IG user access token already scopes it to your
+    account, there is no per-account path segment like the Page-based API.
+    """
+    params = {"fields": "id,updated_time", "access_token": access_token}
+    if after:
+        params["after"] = after
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(f"{GRAPH_BASE}/v23.0/me/conversations", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def fetch_conversation_message_stubs(access_token: str, conversation_id: str) -> list[dict]:
+    """{id, created_time} for messages in a thread (no text/sender — that's a second hop)."""
+    params = {"fields": "messages", "access_token": access_token}
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(f"{GRAPH_BASE}/v23.0/{conversation_id}", params=params)
+        resp.raise_for_status()
+        return resp.json().get("messages", {}).get("data", [])
+
+
+async def fetch_message_detail(access_token: str, message_id: str) -> dict:
+    """Full {id, created_time, from, to, message} for one message.
+
+    Meta only serves details for the 20 most recent messages in a conversation;
+    anything older 400s as if the message were deleted.
+    """
+    params = {"fields": "id,created_time,from,to,message", "access_token": access_token}
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(f"{GRAPH_BASE}/v23.0/{message_id}", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+
 async def fetch_customer_profile(access_token: str, igsid: str) -> dict:
     """Best-effort {name, username} of a messaging participant; {} on any failure."""
     params = {"fields": "name,username", "access_token": access_token}

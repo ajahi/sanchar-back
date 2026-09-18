@@ -17,8 +17,28 @@ from app.models.message import Message
 from app.models.social_account import SocialAccount
 from app.schemas.conversation import ConversationOut, MessageOut, ReplyIn
 from app.services.meta import instagram
+from app.services.meta.sync import sync_account
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
+
+
+@router.post("/sync")
+async def sync_conversations(
+    tenant: CurrentTenant,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict:
+    """Pull this tenant's connected accounts' threads/messages from Meta into the inbox."""
+    accounts = (
+        await db.execute(
+            select(SocialAccount).where(
+                SocialAccount.tenant_id == tenant.id, SocialAccount.status == "active"
+            )
+        )
+    ).scalars().all()
+    synced = 0
+    for account in accounts:
+        synced += await sync_account(db, account)
+    return {"accounts_synced": len(accounts), "threads_synced": synced}
 
 
 async def _own_conversation(
