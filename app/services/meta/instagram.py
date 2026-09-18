@@ -102,6 +102,16 @@ async def send_text(access_token: str, ig_account_id: str, recipient_igsid: str,
         return resp.json()
 
 
+def _raise_with_body(resp: httpx.Response) -> None:
+    """raise_for_status() drops the response body — Meta's actual error reason lives there."""
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise httpx.HTTPStatusError(
+            f"{exc}: {resp.text[:500]}", request=exc.request, response=exc.response
+        ) from None
+
+
 async def list_conversations(access_token: str, after: str | None = None) -> dict:
     """One page of the account's threads: {id, updated_time}. Raw {data, paging}.
 
@@ -114,7 +124,7 @@ async def list_conversations(access_token: str, after: str | None = None) -> dic
         params["after"] = after
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         resp = await client.get(f"{GRAPH_BASE}/v23.0/me/conversations", params=params)
-        resp.raise_for_status()
+        _raise_with_body(resp)
         return resp.json()
 
 
@@ -123,7 +133,7 @@ async def fetch_conversation_message_stubs(access_token: str, conversation_id: s
     params = {"fields": "messages", "access_token": access_token}
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         resp = await client.get(f"{GRAPH_BASE}/v23.0/{conversation_id}", params=params)
-        resp.raise_for_status()
+        _raise_with_body(resp)
         return resp.json().get("messages", {}).get("data", [])
 
 
@@ -136,7 +146,7 @@ async def fetch_message_detail(access_token: str, message_id: str) -> dict:
     params = {"fields": "id,created_time,from,to,message", "access_token": access_token}
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         resp = await client.get(f"{GRAPH_BASE}/v23.0/{message_id}", params=params)
-        resp.raise_for_status()
+        _raise_with_body(resp)
         return resp.json()
 
 
