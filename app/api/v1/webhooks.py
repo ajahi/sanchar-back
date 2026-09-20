@@ -6,6 +6,7 @@ Only `message` events are stored (text + attachments; is_echo = a reply the busi
 from the Instagram app). read/reaction/postback events are ignored. Always answers 200 so
 Meta does not retry forever on a payload we cannot handle.
 """
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Annotated
@@ -30,22 +31,6 @@ log = logging.getLogger(__name__)
 
 
 @router.get("/instagram", response_class=PlainTextResponse)
-async def receive_webhook(request: Request) -> str:
-    raw_body = await request.body()
-    headers = dict(request.headers)
-
-    logger.info("Instagram webhook POST received")
-    logger.info("Headers: %s", headers)
-    logger.info("Raw body: %s", raw_body.decode("utf-8", errors="replace"))
-
-    try:
-        payload = json.loads(raw_body)
-        logger.info("Parsed payload:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
-    except json.JSONDecodeError:
-        logger.warning("Body was not valid JSON")
-
-    return "EVENT_RECEIVED"
-
 async def verify(
     hub_mode: Annotated[str, Query(alias="hub.mode")] = "",
     hub_token: Annotated[str, Query(alias="hub.verify_token")] = "",
@@ -149,9 +134,18 @@ async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> Non
 @router.post("/instagram")
 async def receive(request: Request, db: Annotated[AsyncSession, Depends(get_db)]) -> dict:
     raw = await request.body()
+
+    log.info(">>> IG WEBHOOK HIT <<<")
+    log.info("Headers: %s", dict(request.headers))
+    log.info("Raw body: %s", raw.decode("utf-8", errors="replace"))
+
     if not instagram.verify_webhook_signature(raw, request.headers.get("x-hub-signature-256", "")):
+        log.warning("Bad signature")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bad signature")
-    payload = await request.json()
+
+    payload = json.loads(raw)
+    log.info("Parsed payload:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
+
     if payload.get("object") != "instagram":
         return {"status": "ignored"}
     try:
