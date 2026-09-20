@@ -30,6 +30,22 @@ log = logging.getLogger(__name__)
 
 
 @router.get("/instagram", response_class=PlainTextResponse)
+async def receive_webhook(request: Request) -> str:
+    raw_body = await request.body()
+    headers = dict(request.headers)
+
+    logger.info("Instagram webhook POST received")
+    logger.info("Headers: %s", headers)
+    logger.info("Raw body: %s", raw_body.decode("utf-8", errors="replace"))
+
+    try:
+        payload = json.loads(raw_body)
+        logger.info("Parsed payload:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
+    except json.JSONDecodeError:
+        logger.warning("Body was not valid JSON")
+
+    return "EVENT_RECEIVED"
+
 async def verify(
     hub_mode: Annotated[str, Query(alias="hub.mode")] = "",
     hub_token: Annotated[str, Query(alias="hub.verify_token")] = "",
