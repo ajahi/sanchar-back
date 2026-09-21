@@ -1,10 +1,14 @@
-"""Meta webhook receiver — Instagram DMs land here and become customers/conversations/messages.
+"""Meta webhook receiver — Instagram DMs become customers/conversations/messages.
 
   GET  /webhooks/instagram  -> subscription handshake (echo hub.challenge)
   POST /webhooks/instagram  -> events; signature-checked, idempotent on message id (mid)
-Only `message` events are stored (text + attachments; is_echo = a reply the business sent
-from the Instagram app). read/reaction/postback events are ignored. Always answers 200 so
-Meta does not retry forever on a payload we cannot handle.
+
+The flow for one inbound message (ingest_event):
+  1. is this a message we store?        skip unsends + non-message events
+  2. find or create the customer        by tenant_id + Instagram-scoped user id (igsid)
+  3. find or create the conversation     one open thread per customer per account
+  4. insert the message                 linked to the conversation, idempotent on mid
+  5. bump last_message_at (dashboard sort) + notify admins if the thread is brand new
 """
 import json
 import logging
@@ -25,6 +29,7 @@ from app.models.customer import Customer
 from app.models.message import Message
 from app.models.social_account import SocialAccount
 from app.services.meta import instagram
+from app.services.notifications import create_notification
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 log = logging.getLogger(__name__)
@@ -41,29 +46,39 @@ async def verify(
     return hub_challenge
 
 
-async def _get_or_create_conversation(
+# --- step 2: customer -------------------------------------------------------
+async def _get_or_create_customer(
     db: AsyncSession, account: SocialAccount, igsid: str, token: str
-) -> tuple[Customer, Conversation]:
-    # ponytail: select-then-insert; the partial unique indexes catch the rare concurrent
-    # first-message race (this delivery fails -> Meta retries -> second attempt finds the rows).
+) -> Customer:
     customer = (
         await db.execute(
             select(Customer).where(
-                Customer.tenant_id == account.tenant_id, Customer.external_user_id == igsid
+                Customer.tenant_id == account.tenant_id,
+                Customer.external_user_id == igsid,
             )
         )
     ).scalar_one_or_none()
-    if customer is None:
-        profile = await instagram.fetch_customer_profile(token, igsid)
-        customer = Customer(
-            tenant_id=account.tenant_id,
-            external_user_id=igsid,
-            name=profile.get("name"),
-            external_username=profile.get("username"),
-        )
-        db.add(customer)
-        await db.flush()
+    if customer is not None:
+        return customer
 
+    profile = await instagram.fetch_customer_profile(token, igsid)
+    customer = Customer(
+        tenant_id=account.tenant_id,
+        external_user_id=igsid,
+        name=profile.get("name"),
+        external_username=profile.get("username"),
+    )
+    db.add(customer)
+    await db.flush()
+    return customer
+
+
+# --- step 3: conversation ---------------------------------------------------
+async def _get_or_create_conversation(
+    db: AsyncSession, account: SocialAccount, customer: Customer
+) -> tuple[Conversation, bool]:
+    # ponytail: select-then-insert. The `uq_open_conversation` partial index catches the
+    # rare concurrent first-message race (this delivery fails -> Meta retries -> retry finds it).
     convo = (
         await db.execute(
             select(Conversation).where(
@@ -73,23 +88,31 @@ async def _get_or_create_conversation(
             )
         )
     ).scalar_one_or_none()
-    if convo is None:
-        convo = Conversation(
-            tenant_id=account.tenant_id,
-            customer_id=customer.id,
-            social_account_id=account.id,
-            channel="instagram",
-        )
-        db.add(convo)
-        await db.flush()
-    return customer, convo
+    if convo is not None:
+        return convo, False
+
+    convo = Conversation(
+        tenant_id=account.tenant_id,
+        customer_id=customer.id,
+        social_account_id=account.id,
+        channel="instagram",
+    )
+    db.add(convo)
+    await db.flush()
+    return convo, True
 
 
 async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> None:
-    """Store one `messaging` event; no-op for non-message events and unknown accounts."""
-    msg = event.get("message")
-    if not msg or not msg.get("mid") or msg.get("is_deleted"):
-        return
+    """Store one Instagram `messaging` event, following the 5-step flow above."""
+    # 1. keep only real messages (an unsend, or a read/reaction/postback, is not stored).
+    match event:
+        case {"message": {"is_deleted": True}}:
+            return
+        case {"message": {"mid": str()} as msg}:
+            pass
+        case _:
+            return
+
     account = (
         await db.execute(
             select(SocialAccount).where(
@@ -101,11 +124,16 @@ async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> Non
     if account is None or not account.access_token_encrypted:
         return
 
+    # is_echo -> a reply the business sent from the Instagram app; the customer is the
+    # *recipient* of that echo, and the *sender* of a normal inbound message.
     is_echo = bool(msg.get("is_echo"))
     igsid = event["recipient"]["id"] if is_echo else event["sender"]["id"]
     token = decrypt_token(account.access_token_encrypted)
-    customer, convo = await _get_or_create_conversation(db, account, igsid, token)
 
+    customer = await _get_or_create_customer(db, account, igsid, token)          # step 2
+    convo, convo_is_new = await _get_or_create_conversation(db, account, customer)  # step 3
+
+    # 4. the message row, linked to the conversation, idempotent on Meta's mid.
     attachments = msg.get("attachments") or []
     first = attachments[0] if attachments else {}
     await db.execute(
@@ -125,10 +153,23 @@ async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> Non
             index_where=Message.external_message_id.isnot(None),
         )
     )
+
+    # 5. dashboard sort key, + one notification when a brand-new customer thread opens.
     ts = event.get("timestamp")
     convo.last_message_at = (
         datetime.fromtimestamp(ts / 1000, tz=timezone.utc) if ts else datetime.now(timezone.utc)
     )
+    if convo_is_new and not is_echo:
+        await create_notification(
+            db,
+            event="message_received",
+            tenant_id=account.tenant_id,
+            source_table="conversations",
+            entity_id=convo.id,
+            subject=f"New Instagram chat from {customer.name or customer.external_username or 'a customer'}",
+            message=msg.get("text"),
+            payload={"conversation_id": str(convo.id), "customer_id": str(customer.id)},
+        )
 
 
 @router.post("/instagram")
@@ -157,3 +198,4 @@ async def receive(request: Request, db: Annotated[AsyncSession, Depends(get_db)]
         log.exception("instagram webhook ingest failed")
         await db.rollback()
     return {"status": "ok"}
+
