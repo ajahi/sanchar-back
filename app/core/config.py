@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # Instagram OAuth (Instagram API with Instagram Login)
     instagram_app_id: str = ""
     instagram_app_secret: str = ""
+    meta_app_secret: str=""
     # Must match a redirect URI registered in the Meta app dashboard, e.g.
     # https://<tunnel>/api/v1/social-accounts/instagram/callback
     instagram_redirect_uri: str = ""

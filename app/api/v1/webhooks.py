@@ -144,7 +144,9 @@ async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> Non
     """Store one Instagram `messaging` event, following the 5-step flow above."""
     # 1. keep only real messages (an unsend, or a read/reaction/postback, is not stored).
     match event:
-        case {"message": {"mid": str()} as msg} if not msg.get("is_deleted"):
+        case {"message": {"is_deleted": True}}:
+            return
+        case {"message": {"mid": str()} as msg}:
             pass
         case _:
             return
@@ -234,3 +236,4 @@ async def receive(request: Request, db: Annotated[AsyncSession, Depends(get_db)]
         log.exception("instagram webhook ingest failed")
         await db.rollback()
     return {"status": "ok"}
+
