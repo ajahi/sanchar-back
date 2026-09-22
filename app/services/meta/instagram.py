@@ -85,7 +85,7 @@ async def refresh_long_lived_token(long_lived_token: str) -> dict:
 
 def verify_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
     """Check Meta's X-Hub-Signature-256 ("sha256=<hex>") against the app secret."""
-    expected = hmac.new(settings.instagram_app_secret.encode(), raw_body, sha256).hexdigest()
+    expected = hmac.new(settings.meta_app_secret.encode(), raw_body, sha256).hexdigest()
     return hmac.compare_digest(f"sha256={expected}", signature_header or "")
 
 
