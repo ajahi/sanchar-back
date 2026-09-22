@@ -9,6 +9,7 @@ to *their* tenant instead of provisioning a new one ("connect" mode).
 Incoming traffic is tracked two ways (kept simple): the source/referrer uri is stored in
 social_accounts.metadata, and every attempt is logged to audit_logs (uri, ip, user-agent).
 """
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
@@ -36,6 +37,7 @@ from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.services.audit import record_audit
+from app.api.v1.webhooks import backfill_recent_conversations
 from app.services.meta import instagram
 from app.services.rbac import get_roles_by_names
 
@@ -228,8 +230,10 @@ async def instagram_callback(
         short = await instagram.exchange_code_for_token(code)
         long_lived = await instagram.exchange_for_long_lived_token(short["access_token"])
         profile = await instagram.fetch_profile(long_lived["access_token"])
-    except (httpx.HTTPError, KeyError):
-        return _redirect_to_frontend(ig_error="token_exchange_failed")
+    except (httpx.HTTPError, KeyError) as exc:
+        body = exc.response.text if isinstance(exc, httpx.HTTPStatusError) else ""
+        logging.getLogger(__name__).error("instagram token exchange failed: %r %s", exc, body)
+        return _redirect_to_frontend(ig_error="token_exchange_failed", ig_error_description=body[:300])
 
     ig_user_id = str(profile.get("user_id") or short.get("user_id") or "")
     username = profile.get("username") or ""
@@ -248,6 +252,13 @@ async def instagram_callback(
         )
     except PermissionError as exc:
         return _redirect_to_frontend(ig_error=str(exc))
+
+    # Best-effort inbox seed; webhooks keep it current from here on.
+    try:
+        async with db.begin_nested():
+            await backfill_recent_conversations(db, account, long_lived["access_token"])
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).exception("instagram conversation backfill failed")
 
     # Track this login event (uri + ip + user-agent) in the audit trail.
     await record_audit(

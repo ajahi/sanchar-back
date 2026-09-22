@@ -102,6 +102,44 @@ async def _get_or_create_conversation(
     return convo, True
 
 
+async def backfill_recent_conversations(
+    db: AsyncSession, account: SocialAccount, token: str, limit: int = 5
+) -> None:
+    """Seed the inbox from Graph on connect so the dashboard isn't empty until the next DM.
+
+    ponytail: Graph message ids and webhook mids are the same value for Instagram, so the
+    external_message_id unique index dedupes overlap; if they ever differ you get one duplicate
+    per message that arrives during the login window.
+    """
+    me = account.external_account_id
+    for conv in await instagram.fetch_recent_conversations(token, limit):
+        others = [p for p in (conv.get("participants") or {}).get("data", []) if p.get("id") != me]
+        if not others:
+            continue
+        customer = await _get_or_create_customer(db, account, others[0]["id"], token)
+        convo, _ = await _get_or_create_conversation(db, account, customer)
+        for msg in (conv.get("messages") or {}).get("data", []):
+            is_agent = (msg.get("from") or {}).get("id") == me
+            await db.execute(
+                pg_insert(Message)
+                .values(
+                    conversation_id=convo.id,
+                    external_message_id=msg["id"],
+                    sender_type="agent" if is_agent else "customer",
+                    sender_customer_id=None if is_agent else customer.id,
+                    content=msg.get("message"),
+                    created_at=datetime.fromisoformat(msg["created_time"]),
+                )
+                .on_conflict_do_nothing(
+                    index_elements=["external_message_id"],
+                    index_where=Message.external_message_id.isnot(None),
+                )
+            )
+        updated = datetime.fromisoformat(conv["updated_time"]) if conv.get("updated_time") else None
+        if updated and (convo.last_message_at is None or updated > convo.last_message_at):
+            convo.last_message_at = updated
+
+
 async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> None:
     """Store one Instagram `messaging` event, following the 5-step flow above."""
     # 1. keep only real messages (an unsend, or a read/reaction/postback, is not stored).

@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     oauth_state_expire_minutes: int = 10
     # Any string you also paste into the Meta dashboard's webhook "Verify token" field
     instagram_webhook_verify_token: str = ""
+    meta_app_secret: str=""
 
     # Where the callback sends the browser after a successful connect/login
     frontend_url: str = "http://localhost:3000"

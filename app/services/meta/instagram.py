@@ -85,7 +85,7 @@ async def refresh_long_lived_token(long_lived_token: str) -> dict:
 
 def verify_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
     """Check Meta's X-Hub-Signature-256 ("sha256=<hex>") against the app secret."""
-    expected = hmac.new(settings.instagram_app_secret.encode(), raw_body, sha256).hexdigest()
+    expected = hmac.new(settings.meta_app_secret.encode(), raw_body, sha256).hexdigest()
     return hmac.compare_digest(f"sha256={expected}", signature_header or "")
 
 
@@ -100,6 +100,20 @@ async def send_text(access_token: str, ig_account_id: str, recipient_igsid: str,
         )
         resp.raise_for_status()
         return resp.json()
+
+
+async def fetch_recent_conversations(access_token: str, limit: int = 5) -> list[dict]:
+    """Newest `limit` DM threads with their recent messages (Meta caps at 20 per thread)."""
+    params = {
+        "platform": "instagram",
+        "fields": "id,updated_time,participants,messages{id,created_time,from,message}",
+        "limit": limit,
+        "access_token": access_token,
+    }
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(f"{GRAPH_BASE}/v23.0/me/conversations", params=params)
+        resp.raise_for_status()
+        return resp.json().get("data", [])
 
 
 async def fetch_customer_profile(access_token: str, igsid: str) -> dict:
