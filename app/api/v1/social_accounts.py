@@ -1,9 +1,11 @@
 """Instagram OAuth: connect a business's Instagram account and start a dashboard session.
 
-Two hops (see the Meta business-login flow):
+Three hops (see the Meta business-login flow):
   GET /instagram/login     -> 302 to Instagram's authorize page (signed `state` carries the source uri)
-  GET /instagram/callback  -> Instagram returns here; we exchange the code, persist the
-                              account, set an httpOnly session cookie, and 302 to the dashboard.
+  GET /instagram/callback  -> Instagram returns here; we answer at once with a preloader page
+                              that forwards to /finish (so the user isn't staring at Instagram).
+  GET /instagram/finish    -> exchange the code, persist the account, set an httpOnly
+                              session cookie, and 302 to the dashboard.
 If the visitor already has a dashboard session (cookie or Bearer), the account is attached
 to *their* tenant instead of provisioning a new one ("connect" mode).
 Incoming traffic is tracked two ways (kept simple): the source/referrer uri is stored in
@@ -13,10 +15,11 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
+from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,7 +34,7 @@ from app.core.security import (
     encrypt_token,
     set_session_cookie,
 )
-from app.db.session import get_db
+from app.db.session import async_session_factory, get_db
 from app.models.role import Role
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
@@ -86,8 +89,6 @@ async def instagram_login(request: Request) -> RedirectResponse:
 
 
 def _redirect_to_frontend(**query: str) -> RedirectResponse:
-    from urllib.parse import urlencode
-
     url = settings.frontend_url
     if query:
         url = f"{url}?{urlencode(query)}"
@@ -199,19 +200,56 @@ async def _get_or_create_account(
     return tenant, owner, account
 
 
-@router.get("/instagram/callback")
+async def _backfill_in_background(account_id: uuid.UUID, token: str) -> None:
+    """Best-effort inbox seed after the redirect; own session since the request's is closed."""
+    try:
+        async with async_session_factory() as db:
+            account = await db.get(SocialAccount, account_id)
+            if account is not None:
+                await backfill_recent_conversations(db, account, token)
+                await db.commit()
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).exception("instagram conversation backfill failed")
+
+
+# Same look as the frontend's Loader. The browser keeps this page painted while /finish works.
+_FINISH_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Sanchar</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><style>
+body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;background:#FAF3E0;color:#1A1A1A}
+.ring{width:48px;height:48px;box-sizing:border-box;border:4px solid #000;border-top-color:#B8251B;border-radius:50%;animation:spin 1s linear infinite}
+p{font:bold 12px monospace;text-transform:uppercase;letter-spacing:.1em}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style></head><body><div class="ring" role="status"></div><p>Igniting Workstation...</p>
+<script>setTimeout(function(){location.replace("finish?__QS__")},50)</script></body></html>"""
+
+
+@router.get("/instagram/callback", response_model=None)
 async def instagram_callback(
-    request: Request,
-    db: Annotated[AsyncSession, Depends(get_db)],
     code: Optional[str] = None,
     state: Optional[str] = None,
     error: Optional[str] = None,
     error_description: Optional[str] = None,
-) -> RedirectResponse:
-    """Instagram redirects here. Exchange the code, persist, set session cookie, go to dashboard."""
+) -> RedirectResponse | HTMLResponse:
+    """Instagram redirects here. Paint the preloader at once, then hand off to /finish (slow part)."""
     # User denied consent (or Instagram returned an error).
     if error:
         return _redirect_to_frontend(ig_error=error, ig_error_description=error_description or "")
+    if not code or not state:
+        return _redirect_to_frontend(ig_error="invalid_request")
+    # urlencode leaves only [A-Za-z0-9_.~%+-], so nothing here can break out of the JS string.
+    # replace() (in the page) keeps this one-time code out of history, so Back can't replay it.
+    return HTMLResponse(_FINISH_PAGE.replace("__QS__", urlencode({"code": code, "state": state})))
+
+
+@router.get("/instagram/finish")
+async def instagram_finish(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+) -> RedirectResponse:
+    """Exchange the code, persist, set session cookie, go to dashboard."""
     if not code or not state:
         return _redirect_to_frontend(ig_error="invalid_request")
 
@@ -253,13 +291,6 @@ async def instagram_callback(
     except PermissionError as exc:
         return _redirect_to_frontend(ig_error=str(exc))
 
-    # Best-effort inbox seed; webhooks keep it current from here on.
-    try:
-        async with db.begin_nested():
-            await backfill_recent_conversations(db, account, long_lived["access_token"])
-    except Exception:  # noqa: BLE001
-        logging.getLogger(__name__).exception("instagram conversation backfill failed")
-
     # Track this login event (uri + ip + user-agent) in the audit trail.
     await record_audit(
         db,
@@ -276,6 +307,10 @@ async def instagram_callback(
         },
     )
     await db.commit()
+
+    # Inbox seed runs after the redirect is sent (Graph's conversations call takes ~5s);
+    # the dashboard's 5s poll picks it up. Webhooks keep it current from here on.
+    background_tasks.add_task(_backfill_in_background, account.id, long_lived["access_token"])
 
     # Mint our own session and hand it to the dashboard via an httpOnly cookie.
     token = create_access_token(
