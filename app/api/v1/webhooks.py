@@ -17,7 +17,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import PlainTextResponse
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -102,6 +102,23 @@ async def _get_or_create_conversation(
     return convo, True
 
 
+def graph_attachment(msg: dict) -> tuple[str, str | None]:
+    """(message_type, media_url) of a Graph conversation message's first attachment.
+
+    Graph shapes differ from the webhook's {type, payload.url}: image_data / video_data / file_url.
+    """
+    att = ((msg.get("attachments") or {}).get("data") or [{}])[0]
+    media = att.get("image_data") or att.get("video_data") or {}
+    url = media.get("url") or att.get("file_url")
+    if not url:
+        return "text", None
+    if "image_data" in att:
+        return "image", url
+    if "video_data" in att:
+        return "video", url
+    return (att.get("mime_type") or "").split("/")[0] or "file", url
+
+
 async def backfill_recent_conversations(
     db: AsyncSession, account: SocialAccount, token: str, limit: int = 5
 ) -> None:
@@ -120,19 +137,30 @@ async def backfill_recent_conversations(
         convo, _ = await _get_or_create_conversation(db, account, customer)
         for msg in (conv.get("messages") or {}).get("data", []):
             is_agent = (msg.get("from") or {}).get("id") == me
+            message_type, media_url = graph_attachment(msg)
+            stmt = pg_insert(Message).values(
+                conversation_id=convo.id,
+                external_message_id=msg["id"],
+                sender_type="agent" if is_agent else "customer",
+                sender_customer_id=None if is_agent else customer.id,
+                message_type=message_type,
+                content=msg.get("message") or None,
+                media_url=media_url,
+                created_at=datetime.fromisoformat(msg["created_time"]),
+            )
+            # Existing row: take a fresh media url when Graph has one (fills rows stored before
+            # attachments were fetched, and renews CDN urls that expire); otherwise keep what's there.
+            has_media = stmt.excluded.media_url.isnot(None)
             await db.execute(
-                pg_insert(Message)
-                .values(
-                    conversation_id=convo.id,
-                    external_message_id=msg["id"],
-                    sender_type="agent" if is_agent else "customer",
-                    sender_customer_id=None if is_agent else customer.id,
-                    content=msg.get("message"),
-                    created_at=datetime.fromisoformat(msg["created_time"]),
-                )
-                .on_conflict_do_nothing(
+                stmt.on_conflict_do_update(
                     index_elements=["external_message_id"],
                     index_where=Message.external_message_id.isnot(None),
+                    set_={
+                        "media_url": func.coalesce(stmt.excluded.media_url, Message.media_url),
+                        "message_type": case(
+                            (has_media, stmt.excluded.message_type), else_=Message.message_type
+                        ),
+                    },
                 )
             )
         updated = datetime.fromisoformat(conv["updated_time"]) if conv.get("updated_time") else None

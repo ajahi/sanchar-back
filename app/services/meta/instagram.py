@@ -84,9 +84,18 @@ async def refresh_long_lived_token(long_lived_token: str) -> dict:
 
 
 def verify_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
-    """Check Meta's X-Hub-Signature-256 ("sha256=<hex>") against the app secret."""
-    expected = hmac.new(settings.meta_app_secret.encode(), raw_body, sha256).hexdigest()
-    return hmac.compare_digest(f"sha256={expected}", signature_header or "")
+    """Check Meta's X-Hub-Signature-256 ("sha256=<hex>") against either of this app's secrets.
+
+    Instagram-Login webhooks are signed with the Instagram app secret, Page-routed ones with
+    the Meta app secret; both are ours, so either match proves the request came from Meta.
+    """
+    return any(
+        secret
+        and hmac.compare_digest(
+            f"sha256={hmac.new(secret.encode(), raw_body, sha256).hexdigest()}", signature_header or ""
+        )
+        for secret in (settings.instagram_app_secret, settings.meta_app_secret)
+    )
 
 
 async def send_text(access_token: str, ig_account_id: str, recipient_igsid: str, text: str) -> dict:
@@ -106,7 +115,7 @@ async def fetch_recent_conversations(access_token: str, limit: int = 5) -> list[
     """Newest `limit` DM threads with their recent messages (Meta caps at 20 per thread)."""
     params = {
         "platform": "instagram",
-        "fields": "id,updated_time,participants,messages{id,created_time,from,message}",
+        "fields": "id,updated_time,participants,messages{id,created_time,from,message,attachments}",
         "limit": limit,
         "access_token": access_token,
     }
