@@ -200,8 +200,15 @@ async def _get_or_create_account(
     return tenant, owner, account
 
 
-async def _backfill_in_background(account_id: uuid.UUID, token: str) -> None:
-    """Best-effort inbox seed after the redirect; own session since the request's is closed."""
+async def _after_login(account_id: uuid.UUID, token: str) -> None:
+    """Runs after the redirect is sent: webhook subscription, then inbox seed. Each step is
+    best-effort and independent; own DB session since the request's is closed."""
+    log = logging.getLogger(__name__)
+    try:
+        await instagram.subscribe_to_messages(token)
+    except httpx.HTTPError as exc:
+        body = exc.response.text if isinstance(exc, httpx.HTTPStatusError) else ""
+        log.error("instagram webhook subscription failed: %r %s", exc, body)
     try:
         async with async_session_factory() as db:
             account = await db.get(SocialAccount, account_id)
@@ -209,7 +216,7 @@ async def _backfill_in_background(account_id: uuid.UUID, token: str) -> None:
                 await backfill_recent_conversations(db, account, token)
                 await db.commit()
     except Exception:  # noqa: BLE001
-        logging.getLogger(__name__).exception("instagram conversation backfill failed")
+        log.exception("instagram conversation backfill failed")
 
 
 # Same look as the frontend's Loader. The browser keeps this page painted while /finish works.
@@ -308,9 +315,9 @@ async def instagram_finish(
     )
     await db.commit()
 
-    # Inbox seed runs after the redirect is sent (Graph's conversations call takes ~5s);
-    # the dashboard's 5s poll picks it up. Webhooks keep it current from here on.
-    background_tasks.add_task(_backfill_in_background, account.id, long_lived["access_token"])
+    # After the redirect is sent: subscribe the account to DM webhooks (without it, new DMs never
+    # arrive), then seed the inbox (Graph's conversations call takes ~5s; the 5s poll picks it up).
+    background_tasks.add_task(_after_login, account.id, long_lived["access_token"])
 
     # Mint our own session and hand it to the dashboard via an httpOnly cookie.
     token = create_access_token(

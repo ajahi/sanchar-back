@@ -98,6 +98,18 @@ def verify_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
     )
 
 
+async def subscribe_to_messages(access_token: str) -> None:
+    """Have Meta deliver this account's DM webhooks to us. Instagram Login needs this once per
+    account (the app-level webhook config alone sends nothing); repeating it is harmless."""
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(
+            f"{GRAPH_BASE}/v23.0/me/subscribed_apps",
+            params={"subscribed_fields": "messages"},
+            headers={"Authorization": f"Bearer {access_token}"},  # header, so the token isn't in logged URLs
+        )
+        resp.raise_for_status()
+
+
 async def send_text(access_token: str, ig_account_id: str, recipient_igsid: str, text: str) -> dict:
     """Send a text DM from the business account. Returns {recipient_id, message_id}."""
     body = {"recipient": {"id": recipient_igsid}, "message": {"text": text}}

@@ -2,8 +2,11 @@
 
     python -m pytest tests/test_ig_media.py
 """
+import asyncio
 import hmac
 from hashlib import sha256
+
+import httpx
 
 from app.api.v1.webhooks import graph_attachment
 from app.core.config import settings
@@ -20,6 +23,24 @@ def test_graph_attachment() -> None:
     assert graph_attachment({"attachments": {"data": [{"file_url": "https://x/f"}]}}) == ("file", "https://x/f")
     assert graph_attachment({"message": "hi"}) == ("text", None)
     assert graph_attachment({"attachments": {"data": []}}) == ("text", None)
+
+
+def test_subscribe_to_messages(monkeypatch) -> None:
+    seen = []
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        instagram.httpx,
+        "AsyncClient",
+        lambda **kw: real_client(
+            transport=httpx.MockTransport(lambda r: seen.append(r) or httpx.Response(200, json={"success": True})),
+            **kw,
+        ),
+    )
+    asyncio.run(instagram.subscribe_to_messages("TOK"))
+    (req,) = seen
+    assert req.method == "POST" and req.url.path == "/v23.0/me/subscribed_apps"
+    assert req.url.params["subscribed_fields"] == "messages"
+    assert req.headers["authorization"] == "Bearer TOK" and "TOK" not in str(req.url)
 
 
 def test_signature_either_secret(monkeypatch) -> None:
