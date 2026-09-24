@@ -31,14 +31,17 @@ from app.core.security import (
     decode_token,
     create_oauth_state,
     decode_oauth_state,
+    decrypt_token,
     encrypt_token,
     set_session_cookie,
 )
+from app.core.tenant import CurrentTenant
 from app.db.session import async_session_factory, get_db
 from app.models.role import Role
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
 from app.models.user import User
+from app.schemas.social_account import InstagramProfileOut
 from app.services.audit import record_audit
 from app.api.v1.webhooks import backfill_recent_conversations
 from app.services.meta import instagram
@@ -198,6 +201,52 @@ async def _get_or_create_account(
         db.add(owner)
         await db.flush()
     return tenant, owner, account
+
+
+@router.get("/instagram/profile", response_model=list[InstagramProfileOut])
+async def instagram_profiles(
+    tenant: CurrentTenant, db: Annotated[AsyncSession, Depends(get_db)]
+) -> list[InstagramProfileOut]:
+    """Live instagram_business_basic profile of each Instagram account connected to this tenant.
+    If Instagram doesn't answer for one (expired token…), that entry falls back to the stored
+    id/username with live=False instead of failing the whole page."""
+    accounts = (
+        await db.execute(
+            select(SocialAccount)
+            .where(SocialAccount.tenant_id == tenant.id, SocialAccount.platform == PLATFORM)
+            .order_by(SocialAccount.created_at)
+        )
+    ).scalars()
+    out = []
+    for acc in accounts:
+        live: dict = {}
+        if acc.access_token_encrypted:
+            try:
+                live = await instagram.fetch_profile(
+                    decrypt_token(acc.access_token_encrypted), instagram.PROFILE_FIELDS
+                )
+            except httpx.HTTPError as exc:
+                logging.getLogger(__name__).warning("instagram profile fetch failed: %r", exc)
+        out.append(
+            InstagramProfileOut(
+                id=acc.external_account_id,
+                username=live.get("username") or acc.account_name,
+                connected_at=acc.created_at,
+                live=bool(live),
+                **{
+                    k: live.get(k)
+                    for k in (
+                        "name",
+                        "account_type",
+                        "profile_picture_url",
+                        "followers_count",
+                        "follows_count",
+                        "media_count",
+                    )
+                },
+            )
+        )
+    return out
 
 
 async def _after_login(account_id: uuid.UUID, token: str) -> None:

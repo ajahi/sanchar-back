@@ -62,9 +62,15 @@ async def exchange_for_long_lived_token(short_lived_token: str) -> dict:
         return resp.json()
 
 
-async def fetch_profile(access_token: str) -> dict:
-    """Step 4 — the connected account's {user_id, username}."""
-    params = {"fields": "user_id,username", "access_token": access_token}
+PROFILE_FIELDS = (
+    "user_id,username,name,account_type,profile_picture_url,followers_count,follows_count,media_count"
+)
+
+
+async def fetch_profile(access_token: str, fields: str = "user_id,username") -> dict:
+    """Step 4 — the connected account's {user_id, username}; pass PROFILE_FIELDS for the full
+    instagram_business_basic profile (picture, name, counts)."""
+    params = {"fields": fields, "access_token": access_token}
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         resp = await client.get(f"{GRAPH_BASE}/me", params=params)
         resp.raise_for_status()
