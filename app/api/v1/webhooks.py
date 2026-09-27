@@ -59,6 +59,13 @@ async def _get_or_create_customer(
         )
     ).scalar_one_or_none()
     if customer is not None:
+        # Earlier lookup may have failed/returned empty (stale thread, transient error) — retry
+        # rather than leave the row nameless forever.
+        if customer.name is None and customer.external_username is None:
+            profile = await instagram.fetch_customer_profile(token, igsid)
+            if profile:
+                customer.name = profile.get("name")
+                customer.external_username = profile.get("username")
         return customer
 
     profile = await instagram.fetch_customer_profile(token, igsid)

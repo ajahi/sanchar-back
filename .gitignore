@@ -13,3 +13,6 @@ env/
 .DS_Store
 *.swp
 postgres_data/
+
+# codegraph index (local, rebuildable)
+.codegraph/

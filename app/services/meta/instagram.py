@@ -8,6 +8,7 @@ Flow (see Meta docs: Business Login for Instagram):
 Long-lived tokens are refreshed elsewhere via GRAPH /refresh_access_token.
 """
 import hmac
+import logging
 from hashlib import sha256
 from urllib.parse import urlencode
 
@@ -15,9 +16,12 @@ import httpx
 
 from app.core.config import settings
 
+log = logging.getLogger(__name__)
+
 AUTHORIZE_URL = "https://www.instagram.com/oauth/authorize"
 TOKEN_URL = "https://api.instagram.com/oauth/access_token"
 GRAPH_BASE = "https://graph.instagram.com"
+API_VERSION = "v25.0"  # matches what Meta sends in webhook headers (instagram-api-version)
 
 _TIMEOUT = httpx.Timeout(15.0)
 
@@ -109,7 +113,7 @@ async def subscribe_to_messages(access_token: str) -> None:
     account (the app-level webhook config alone sends nothing); repeating it is harmless."""
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         resp = await client.post(
-            f"{GRAPH_BASE}/v23.0/me/subscribed_apps",
+            f"{GRAPH_BASE}/{API_VERSION}/me/subscribed_apps",
             params={"subscribed_fields": "messages"},
             headers={"Authorization": f"Bearer {access_token}"},  # header, so the token isn't in logged URLs
         )
@@ -121,7 +125,7 @@ async def send_text(access_token: str, ig_account_id: str, recipient_igsid: str,
     body = {"recipient": {"id": recipient_igsid}, "message": {"text": text}}
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         resp = await client.post(
-            f"{GRAPH_BASE}/v23.0/{ig_account_id}/messages",
+            f"{GRAPH_BASE}/{API_VERSION}/{ig_account_id}/messages",
             json=body,
             headers={"Authorization": f"Bearer {access_token}"},
         )
@@ -138,7 +142,7 @@ async def fetch_recent_conversations(access_token: str, limit: int = 5) -> list[
         "access_token": access_token,
     }
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.get(f"{GRAPH_BASE}/v23.0/me/conversations", params=params)
+        resp = await client.get(f"{GRAPH_BASE}/{API_VERSION}/me/conversations", params=params)
         resp.raise_for_status()
         return resp.json().get("data", [])
 
@@ -148,8 +152,10 @@ async def fetch_customer_profile(access_token: str, igsid: str) -> dict:
     params = {"fields": "name,username", "access_token": access_token}
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            resp = await client.get(f"{GRAPH_BASE}/v23.0/{igsid}", params=params)
+            resp = await client.get(f"{GRAPH_BASE}/{API_VERSION}/{igsid}", params=params)
             resp.raise_for_status()
             return resp.json()
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        body = exc.response.text if isinstance(exc, httpx.HTTPStatusError) else str(exc)
+        log.warning("instagram profile fetch failed for igsid=%s: %s", igsid, body)
         return {}

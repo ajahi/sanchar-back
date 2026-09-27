@@ -1,5 +1,8 @@
 """FastAPI application entrypoint for the NepSocial backend."""
+
 import logging
+
+from app.utils import global_exception_handler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,6 +21,7 @@ from app.db.session import get_db
 
 app = FastAPI(title="NepSocial Backend", version="0.1.0")
 
+app.add_exception_handler(Exception, global_exception_handler)
 app.include_router(api_router)
 
 
