@@ -13,16 +13,36 @@ GRAPH_BASE = "https://graph.facebook.com"
 _TIMEOUT = httpx.Timeout(15.0)
 
 
-async def fetch_phone_number(access_token: str, phone_number_id: str) -> dict:
-    """{display_phone_number, verified_name} of the business number — also proves the token works."""
+# status is CONNECTED when the number can send; quality_rating GREEN/YELLOW/RED.
+PHONE_FIELDS = "display_phone_number,verified_name,status,quality_rating"
+
+
+async def fetch_phone_number(
+    access_token: str, phone_number_id: str, fields: str = "display_phone_number,verified_name"
+) -> dict:
+    """The business number's fields — also proves the token works. Pass PHONE_FIELDS for status."""
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         resp = await client.get(
             f"{GRAPH_BASE}/{API_VERSION}/{phone_number_id}",
-            params={"fields": "display_phone_number,verified_name"},
+            params={"fields": fields},
             headers={"Authorization": f"Bearer {access_token}"},
         )
         resp.raise_for_status()
         return resp.json()
+
+
+async def fetch_subscribed_apps(access_token: str, waba_id: str) -> list[str]:
+    """Names of the apps Meta delivers this WhatsApp account's webhooks to. Empty = no webhooks."""
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(
+            f"{GRAPH_BASE}/{API_VERSION}/{waba_id}/subscribed_apps",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        resp.raise_for_status()
+        return [
+            (row.get("whatsapp_business_api_data") or {}).get("name", "?")
+            for row in resp.json().get("data", [])
+        ]
 
 
 async def send_text(access_token: str, phone_number_id: str, to_wa_id: str, text: str) -> dict:

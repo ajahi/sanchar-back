@@ -248,6 +248,26 @@ async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> Non
         )
 
 
+async def stamp_whatsapp_event(db: AsyncSession, phone_number_id: str, waba_id: str) -> None:
+    """Note that Meta reached us for this number (any event: message or status). The Channels
+    page shows it as the live webhook check. entry.id on a WhatsApp event is the WhatsApp
+    Business Account id, which the page needs to look up the webhook subscription."""
+    account = (
+        await db.execute(
+            select(SocialAccount).where(
+                SocialAccount.platform == "whatsapp",
+                SocialAccount.external_account_id == phone_number_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if account is not None:
+        account.meta = {
+            **(account.meta or {}),
+            "waba_id": waba_id,
+            "last_webhook_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
 async def ingest_whatsapp_message(
     db: AsyncSession, phone_number_id: str, contacts: list[dict], msg: dict
 ) -> None:
@@ -364,6 +384,7 @@ async def receive(request: Request, db: Annotated[AsyncSession, Depends(get_db)]
             for change in entry.get("changes", []):
                 value = change.get("value") or {}
                 phone_number_id = (value.get("metadata") or {}).get("phone_number_id", "")
+                await stamp_whatsapp_event(db, phone_number_id, str(entry.get("id", "")))
                 for msg in value.get("messages", []):
                     await ingest_whatsapp_message(db, phone_number_id, value.get("contacts", []), msg)
         await db.commit()

@@ -41,10 +41,10 @@ from app.models.role import Role
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
 from app.models.user import User
-from app.schemas.social_account import InstagramProfileOut
+from app.schemas.social_account import InstagramProfileOut, WhatsAppAccountOut
 from app.services.audit import record_audit
 from app.api.v1.webhooks import backfill_recent_conversations
-from app.services.meta import instagram
+from app.services.meta import instagram, whatsapp
 from app.services.rbac import get_roles_by_names
 
 router = APIRouter(prefix="/social-accounts", tags=["social-accounts"])
@@ -244,6 +244,52 @@ async def instagram_profiles(
                         "media_count",
                     )
                 },
+            )
+        )
+    return out
+
+
+@router.get("/whatsapp", response_model=list[WhatsAppAccountOut])
+async def whatsapp_accounts(
+    tenant: CurrentTenant, db: Annotated[AsyncSession, Depends(get_db)]
+) -> list[WhatsAppAccountOut]:
+    """This tenant's WhatsApp numbers with live status from Meta. Also the Channels page's PING:
+    status CONNECTED = token + number work, subscribed_apps = Meta will deliver webhooks,
+    last_webhook_at = Meta actually did. If Meta doesn't answer, stored values with live=False."""
+    accounts = (
+        await db.execute(
+            select(SocialAccount)
+            .where(SocialAccount.tenant_id == tenant.id, SocialAccount.platform == "whatsapp")
+            .order_by(SocialAccount.created_at)
+        )
+    ).scalars()
+    out = []
+    for acc in accounts:
+        meta = acc.meta or {}
+        live: dict = {}
+        apps: Optional[list[str]] = None
+        if acc.access_token_encrypted:
+            token = decrypt_token(acc.access_token_encrypted)
+            try:
+                live = await whatsapp.fetch_phone_number(
+                    token, acc.external_account_id, whatsapp.PHONE_FIELDS
+                )
+                if meta.get("waba_id"):
+                    apps = await whatsapp.fetch_subscribed_apps(token, meta["waba_id"])
+            except httpx.HTTPError as exc:
+                logging.getLogger(__name__).warning("whatsapp status fetch failed: %r", exc)
+        out.append(
+            WhatsAppAccountOut(
+                phone_number_id=acc.external_account_id,
+                display_phone_number=live.get("display_phone_number") or meta.get("display_phone_number"),
+                verified_name=live.get("verified_name") or acc.account_name,
+                status=live.get("status"),
+                quality_rating=live.get("quality_rating"),
+                waba_id=meta.get("waba_id"),
+                subscribed_apps=apps,
+                last_webhook_at=meta.get("last_webhook_at"),
+                connected_at=acc.created_at,
+                live=bool(live),
             )
         )
     return out
