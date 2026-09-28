@@ -1,7 +1,10 @@
-"""Meta webhook receiver — Instagram DMs become customers/conversations/messages.
+"""Meta webhook receiver — Instagram DMs and WhatsApp messages become customers/conversations/messages.
 
   GET  /webhooks/instagram  -> subscription handshake (echo hub.challenge)
-  POST /webhooks/instagram  -> events; signature-checked, idempotent on message id (mid)
+  POST /webhooks/instagram  -> events; signature-checked, idempotent on message id (mid / wamid)
+
+WhatsApp (object "whatsapp_business_account") posts to the same URL — it's the callback set on
+the Meta app — and goes through ingest_whatsapp_message, which follows the same 5 steps.
 
 The flow for one inbound message (ingest_event):
   1. is this a message we store?        skip unsends + non-message events
@@ -102,7 +105,7 @@ async def _get_or_create_conversation(
         tenant_id=account.tenant_id,
         customer_id=customer.id,
         social_account_id=account.id,
-        channel="instagram",
+        channel=account.platform,
     )
     db.add(convo)
     await db.flush()
@@ -245,6 +248,92 @@ async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> Non
         )
 
 
+async def ingest_whatsapp_message(
+    db: AsyncSession, phone_number_id: str, contacts: list[dict], msg: dict
+) -> None:
+    """Store one WhatsApp `messages[]` item — same steps as ingest_event.
+
+    The customer is keyed by wa_id (their phone number, digits only). WhatsApp puts the display
+    name in the same payload (contacts[].profile.name), so there is no profile fetch.
+    """
+    account = (
+        await db.execute(
+            select(SocialAccount).where(
+                SocialAccount.platform == "whatsapp",
+                SocialAccount.external_account_id == phone_number_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if account is None:
+        return
+
+    # 2. customer
+    wa_id = msg["from"]
+    name = next(
+        ((c.get("profile") or {}).get("name") for c in contacts if c.get("wa_id") == wa_id), None
+    )
+    customer = (
+        await db.execute(
+            select(Customer).where(
+                Customer.tenant_id == account.tenant_id, Customer.external_user_id == wa_id
+            )
+        )
+    ).scalar_one_or_none()
+    if customer is None:
+        customer = Customer(
+            tenant_id=account.tenant_id,
+            external_user_id=wa_id,
+            external_username=f"+{wa_id}",
+            phone=f"+{wa_id}",
+            name=name,
+        )
+        db.add(customer)
+        await db.flush()
+    elif name and not customer.name:
+        customer.name = name
+
+    convo, convo_is_new = await _get_or_create_conversation(db, account, customer)  # step 3
+
+    # 4. message. Media comes as an id, not a url (needs a Graph fetch) — keep the raw item in
+    # meta and show the caption for now.
+    kind = msg.get("type", "text")
+    part = msg.get(kind) or {}
+    content = part.get("body") if kind == "text" else part.get("caption")
+    await db.execute(
+        pg_insert(Message)
+        .values(
+            conversation_id=convo.id,
+            external_message_id=msg["id"],
+            sender_type="customer",
+            sender_customer_id=customer.id,
+            message_type=kind,
+            content=content,
+            meta={"whatsapp": msg},
+        )
+        .on_conflict_do_nothing(
+            index_elements=["external_message_id"],
+            index_where=Message.external_message_id.isnot(None),
+        )
+    )
+
+    # 5. dashboard sort key + notification on a brand-new thread
+    ts = msg.get("timestamp")
+    convo.last_message_at = (
+        datetime.fromtimestamp(int(ts), tz=timezone.utc) if ts else datetime.now(timezone.utc)
+    )
+    if convo_is_new:
+        await create_notification(
+            db,
+            event="message_received",
+            tenant_id=account.tenant_id,
+            source_table="conversations",
+            entity_id=convo.id,
+            subject=f"New WhatsApp chat from {customer.name or customer.phone}",
+            message=content,
+            payload={"conversation_id": str(convo.id), "customer_id": str(customer.id)},
+        )
+
+
 @router.post("/instagram")
 async def receive(request: Request, db: Annotated[AsyncSession, Depends(get_db)]) -> dict:
     raw = await request.body()
@@ -260,15 +349,26 @@ async def receive(request: Request, db: Annotated[AsyncSession, Depends(get_db)]
     payload = json.loads(raw)
     log.info("Parsed payload:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
 
-    if payload.get("object") != "instagram":
+    obj = payload.get("object")
+    if obj not in ("instagram", "whatsapp_business_account"):
         return {"status": "ignored"}
     try:
         for entry in payload.get("entry", []):
-            for event in entry.get("messaging", []):
-                await ingest_event(db, str(entry.get("id", "")), event)
+            if obj == "instagram":
+                for event in entry.get("messaging", []):
+                    await ingest_event(db, str(entry.get("id", "")), event)
+                continue
+            # WhatsApp: entry.changes[].value holds messages[] (inbound) and statuses[] (delivery
+            # reports on our sends). ponytail: statuses are only logged above; store them on the
+            # message when the UI needs sent/delivered/failed.
+            for change in entry.get("changes", []):
+                value = change.get("value") or {}
+                phone_number_id = (value.get("metadata") or {}).get("phone_number_id", "")
+                for msg in value.get("messages", []):
+                    await ingest_whatsapp_message(db, phone_number_id, value.get("contacts", []), msg)
         await db.commit()
     except Exception:  # noqa: BLE001 — log it, never make Meta retry forever
-        log.exception("instagram webhook ingest failed")
+        log.exception("%s webhook ingest failed", obj)
         await db.rollback()
     return {"status": "ok"}
 

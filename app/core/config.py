@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     instagram_webhook_verify_token: str = ""
     meta_app_secret: str=""
 
+    # WhatsApp Cloud API — read only by scripts/connect_whatsapp.py, which stores the token
+    # (encrypted) on the tenant's social_accounts row. System User token, doesn't expire.
+    waba_token: str = ""
+    waba_phone_number_id: str = ""
+
     # Where the callback sends the browser after a successful connect/login
     frontend_url: str = "http://localhost:3000"
 

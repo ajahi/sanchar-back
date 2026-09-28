@@ -1,4 +1,4 @@
-"""Inbox — list a tenant's conversations, read a thread, reply as an agent over Instagram."""
+"""Inbox — list a tenant's conversations, read a thread, reply as an agent over Instagram or WhatsApp."""
 import uuid
 from datetime import datetime, timezone
 from typing import Annotated
@@ -16,7 +16,7 @@ from app.models.customer import Customer
 from app.models.message import Message
 from app.models.social_account import SocialAccount
 from app.schemas.conversation import ConversationOut, MessageOut, ReplyIn
-from app.services.meta import instagram
+from app.services.meta import instagram, whatsapp
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -97,10 +97,12 @@ async def reply(
     )
     if account is None or not account.access_token_encrypted:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Instagram account not connected"
+            status_code=status.HTTP_409_CONFLICT, detail=f"{convo.channel} account not connected"
         )
+    # Both senders take (token, business account id, customer id, text) and return {message_id}.
+    send_text = whatsapp.send_text if account.platform == "whatsapp" else instagram.send_text
     try:
-        sent = await instagram.send_text(
+        sent = await send_text(
             decrypt_token(account.access_token_encrypted),
             account.external_account_id,
             customer.external_user_id,
@@ -109,7 +111,9 @@ async def reply(
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.response.text[:500])
     except httpx.HTTPError:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Instagram unreachable")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=f"{account.platform} unreachable"
+        )
 
     msg = Message(
         conversation_id=convo.id,
