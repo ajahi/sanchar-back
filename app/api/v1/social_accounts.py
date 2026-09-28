@@ -35,13 +35,13 @@ from app.core.security import (
     encrypt_token,
     set_session_cookie,
 )
-from app.core.tenant import CurrentTenant
+from app.core.tenant import CurrentTenant, CurrentUser
 from app.db.session import async_session_factory, get_db
 from app.models.role import Role
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
 from app.models.user import User
-from app.schemas.social_account import InstagramProfileOut, WhatsAppAccountOut
+from app.schemas.social_account import InstagramProfileOut, WhatsAppAccountOut, WhatsAppLinkIn
 from app.services.audit import record_audit
 from app.api.v1.webhooks import backfill_recent_conversations
 from app.services.meta import instagram, whatsapp
@@ -293,6 +293,104 @@ async def whatsapp_accounts(
             )
         )
     return out
+
+
+@router.post("/whatsapp", response_model=WhatsAppAccountOut, status_code=status.HTTP_201_CREATED)
+async def link_whatsapp(
+    body: WhatsAppLinkIn,
+    tenant: CurrentTenant,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> WhatsAppAccountOut:
+    """Link a WhatsApp number to the logged-in tenant (Channels page → Connect) — the
+    scripts/connect_whatsapp.py steps, for whoever is logged in.
+
+    The business first shares its WhatsApp account with ours as a partner, so our platform token
+    (WABA_TOKEN) can reach it. Then: the number must be on that account, the account gets
+    subscribed to our app's webhooks, and the number is saved for this tenant.
+    ponytail: anyone who knows a shared account's two ids can claim a number nobody linked yet;
+    a linked number is never moved. Embedded Signup (Meta's own login) replaces this form.
+    """
+    log = logging.getLogger(__name__)
+    token = settings.waba_token
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="WhatsApp is not configured (WABA_TOKEN)."
+        )
+    try:
+        numbers = await whatsapp.fetch_waba_phone_numbers(token, body.waba_id)
+    except httpx.HTTPStatusError as exc:
+        log.warning("whatsapp link: no access to %s: %s", body.waba_id, exc.response.text[:300])
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Sanchar can't access WhatsApp account {body.waba_id}. "
+            "Share it with Sanchar as a partner first, then try again.",
+        )
+    except httpx.HTTPError:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Meta unreachable")
+    number = next((n for n in numbers if n.get("id") == body.phone_number_id), None)
+    if number is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Phone number ID {body.phone_number_id} is not on WhatsApp account {body.waba_id}.",
+        )
+
+    account = (
+        await db.execute(
+            select(SocialAccount).where(
+                SocialAccount.platform == "whatsapp",
+                SocialAccount.external_account_id == body.phone_number_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if account is not None and account.tenant_id != tenant.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This WhatsApp number is already linked to another workspace.",
+        )
+
+    try:
+        await whatsapp.subscribe_app(token, body.waba_id)
+    except httpx.HTTPError as exc:
+        body_text = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
+        log.error("whatsapp webhook subscription failed: %r %s", exc, body_text)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Couldn't subscribe the account to Sanchar's webhooks; try again.",
+        )
+
+    if account is None:
+        account = SocialAccount(
+            tenant_id=tenant.id, platform="whatsapp", external_account_id=body.phone_number_id
+        )
+        db.add(account)
+    account.access_token_encrypted = encrypt_token(token)
+    account.account_name = number.get("verified_name") or number.get("display_phone_number")
+    account.meta = {
+        **(account.meta or {}),
+        "waba_id": body.waba_id,
+        "display_phone_number": number.get("display_phone_number"),
+    }
+    await db.flush()
+    await record_audit(
+        db,
+        tenant_id=tenant.id,
+        actor_id=user.id,
+        action="whatsapp_account_connected",
+        entity_type="social_account",
+        entity_id=account.id,
+        meta={"phone_number_id": body.phone_number_id, "waba_id": body.waba_id},
+    )
+    await db.commit()
+    await db.refresh(account)
+    return WhatsAppAccountOut(
+        phone_number_id=account.external_account_id,
+        display_phone_number=number.get("display_phone_number"),
+        verified_name=number.get("verified_name"),
+        waba_id=body.waba_id,
+        connected_at=account.created_at,
+        live=True,
+    )
 
 
 async def _after_login(account_id: uuid.UUID, token: str) -> None:

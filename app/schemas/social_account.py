@@ -2,7 +2,7 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class InstagramProfileOut(BaseModel):
@@ -31,3 +31,10 @@ class WhatsAppAccountOut(BaseModel):
     last_webhook_at: Optional[datetime] = None  # when Meta last reached us for this number
     connected_at: datetime
     live: bool  # False = Meta didn't answer; only stored values shown
+
+
+class WhatsAppLinkIn(BaseModel):
+    """Channels page Connect form. Digits only: both ids go straight into Graph URLs."""
+
+    phone_number_id: str = Field(pattern=r"^\d{5,30}$")
+    waba_id: str = Field(pattern=r"^\d{5,30}$")

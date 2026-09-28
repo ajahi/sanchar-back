@@ -1,8 +1,9 @@
 """WhatsApp Cloud API — send from a registered business number.
 
-No OAuth hop like Instagram: auth is a System User token, stored encrypted on the
-social_accounts row (platform="whatsapp", external_account_id=phone_number_id) by
-scripts/connect_whatsapp.py. Inbound messages arrive on the shared Meta webhook (webhooks.py).
+No OAuth hop like Instagram: auth is our platform System User token (WABA_TOKEN), stored
+encrypted on the social_accounts row (platform="whatsapp", external_account_id=phone_number_id)
+by the Channels Connect form (POST /social-accounts/whatsapp) or scripts/connect_whatsapp.py.
+Inbound messages arrive on the shared Meta webhook (webhooks.py).
 """
 import httpx
 
@@ -29,6 +30,31 @@ async def fetch_phone_number(
         )
         resp.raise_for_status()
         return resp.json()
+
+
+async def fetch_waba_phone_numbers(access_token: str, waba_id: str) -> list[dict]:
+    """[{id, display_phone_number, verified_name}] on a WhatsApp Business Account. Meta answers
+    400 (code 100) when the token's business has no access to that account."""
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(
+            f"{GRAPH_BASE}/{API_VERSION}/{waba_id}/phone_numbers",
+            params={"fields": "id,display_phone_number,verified_name"},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+
+
+async def subscribe_app(access_token: str, waba_id: str) -> None:
+    """Have Meta deliver this WhatsApp account's webhooks to our app (the token's app).
+    Without it a linked number sends fine but its customers' messages never reach us.
+    Repeating it is harmless."""
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(
+            f"{GRAPH_BASE}/{API_VERSION}/{waba_id}/subscribed_apps",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        resp.raise_for_status()
 
 
 async def fetch_subscribed_apps(access_token: str, waba_id: str) -> list[str]:
