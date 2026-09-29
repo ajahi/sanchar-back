@@ -86,6 +86,15 @@ def decode_oauth_state(token: str) -> dict[str, Any]:
     return payload
 
 
+EMAIL_VERIFY = "email_verify"
+
+
+def create_email_verify_token(user_id: str) -> str:
+    return _create_token(
+        user_id, EMAIL_VERIFY, timedelta(hours=settings.email_verify_expire_hours)
+    )
+
+
 def decode_token(token: str) -> dict[str, Any]:
     """Decode and validate a JWT. Raises JWTError on invalid/expired tokens."""
     return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
@@ -126,6 +135,8 @@ __all__ = [
     "create_access_token",
     "create_refresh_token",
     "create_oauth_state",
+    "create_email_verify_token",
+    "EMAIL_VERIFY",
     "decode_oauth_state",
     "decode_token",
     "set_session_cookie",

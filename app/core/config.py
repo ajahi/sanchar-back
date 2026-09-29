@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     cookie_secure: bool = False  # True in production (HTTPS); needed with SameSite=None
     cookie_samesite: str = "lax"  # "none" for cross-site frontend<->backend over HTTPS
 
+    # Outgoing mail (SMTP). Port 465 -> implicit TLS, anything else -> STARTTLS.
+    # Empty mail_host = dev mode: the link is logged instead of sent.
+    mail_host: str = ""
+    mail_port: int = 587
+    mail_username: str = ""
+    mail_password: str = ""
+    mail_from_address: str = ""
+    mail_from_name: str = "Sanchar"
+    email_verify_expire_hours: int = 24
+
     # App
     environment: str = "development"
 

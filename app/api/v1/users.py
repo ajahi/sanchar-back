@@ -58,6 +58,7 @@ async def create_user(
         phone_number=body.phone_number,
         username=body.username,
         password_hash=hash_password(body.password),
+        verified=True,  # created by an admin, who vouches for the address
         roles=roles,
     )
     db.add(new_user)
