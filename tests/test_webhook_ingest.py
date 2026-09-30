@@ -42,7 +42,23 @@ async def _run() -> None:
         echo = {"sender": {"id": "biz-1"}, "recipient": {"id": "cust-1"},
                 "message": {"mid": "m2", "text": "yo", "is_echo": True}}
         read = {"sender": {"id": "cust-1"}, "recipient": {"id": "biz-1"}, "read": {"mid": "m2"}}
-        for ev in (cust, cust, echo, read):  # second `cust` = Meta redelivery
+        # a NEW customer message returns a reply job; the redelivery must not (else Meta retries double-reply)
+        first = await ingest_event(db, "biz-1", cust)
+        assert first is not None and await ingest_event(db, "biz-1", cust) is None
+        convo = (await db.execute(select(Conversation).where(Conversation.tenant_id == t.id))).scalar_one()
+        assert first[0] == convo.id and convo.mode == "ai"
+
+        # our own reply echoes back under the id we stored: not a takeover
+        db.add(Message(conversation_id=convo.id, external_message_id="ours", sender_type="ai", content="bot"))
+        await db.flush()
+        own_echo = {"sender": {"id": "biz-1"}, "recipient": {"id": "cust-1"},
+                    "message": {"mid": "ours", "text": "bot", "is_echo": True}}
+        assert await ingest_event(db, "biz-1", own_echo) is None and convo.mode == "ai"
+
+        # a person answering from the Instagram app is: chat flips to human, audited
+        assert await ingest_event(db, "biz-1", echo) is None
+        assert convo.mode == "human"
+        for ev in (echo, read):  # redelivered echo + read receipt change nothing
             await ingest_event(db, "biz-1", ev)
 
         convos = (await db.execute(select(Conversation).where(Conversation.tenant_id == t.id))).scalars().all()
@@ -52,7 +68,9 @@ async def _run() -> None:
                 select(Message).where(Message.conversation_id == convos[0].id).order_by(Message.external_message_id)
             )
         ).scalars().all()
-        assert [(m.external_message_id, m.sender_type) for m in msgs] == [("m1", "customer"), ("m2", "agent")]
+        assert [(m.external_message_id, m.sender_type) for m in msgs] == [
+            ("m1", "customer"), ("m2", "agent"), ("ours", "ai"),
+        ]
         await db.rollback()
 
 

@@ -18,3 +18,12 @@ def test_human_request_hands_over_offline():
 def test_prompt_carries_tenant_knowledge_and_language():
     p = build_system_prompt("Shop A", "PRODUCT: X Rs 10", language="english", contact="+977")
     assert "Shop A" in p and "PRODUCT: X Rs 10" in p and "English" in p
+
+
+def test_amount_guard_regexes():
+    from app.services.auto_reply import AMOUNT_RE, NUMBER_RE
+
+    known = {n.replace(",", "") for n in NUMBER_RE.findall("Shawl Rs 4,500. Topi Rs 800")}
+    assert AMOUNT_RE.findall("Price Rs 4500 ya NPR 800") == ["4500", "800"]
+    assert all(a.replace(",", "") in known for a in AMOUNT_RE.findall("Rs 4,500"))
+    assert not all(a.replace(",", "") in known for a in AMOUNT_RE.findall("Total Rs 1,775"))

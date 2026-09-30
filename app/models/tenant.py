@@ -1,7 +1,7 @@
 """tenants — the business using the SaaS platform (the tenancy boundary)."""
 from typing import Optional
 
-from sqlalchemy import String, Text
+from sqlalchemy import Boolean, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPKMixin
@@ -19,3 +19,8 @@ class Tenant(UUIDPKMixin, TimestampMixin, Base):
     owner_phone: Mapped[Optional[str]] = mapped_column(String(50))
 
     status: Mapped[str] = mapped_column(String(30), server_default="active", nullable=False)
+
+    # Opt-in: the bot only answers customers once the owner has added knowledge and switched this on.
+    ai_auto_reply: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), nullable=False
+    )

@@ -18,7 +18,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -33,6 +33,7 @@ from app.models.message import Message
 from app.models.social_account import SocialAccount
 from app.services.meta import instagram
 from app.services.notifications import create_notification
+from app.services.reply_pipeline import hand_over, run_auto_reply
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 log = logging.getLogger(__name__)
@@ -178,8 +179,13 @@ async def backfill_recent_conversations(
             convo.last_message_at = updated
 
 
-async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> None:
-    """Store one Instagram `messaging` event, following the 5-step flow above."""
+async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> tuple | None:
+    """Store one Instagram `messaging` event, following the 5-step flow above.
+
+    Returns (conversation_id, message_id) when a NEW customer message was stored (the caller queues
+    an auto-reply for it), else None. A NEW echo (a person answered from the Instagram app) also
+    takes the chat over from the AI; our own replies echo back under the id we stored, so they don't.
+    """
     # 1. keep only real messages (an unsend, or a read/reaction/postback, is not stored).
     match event:
         case {"message": {"is_deleted": True}}:
@@ -212,7 +218,7 @@ async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> Non
     # 4. the message row, linked to the conversation, idempotent on Meta's mid.
     attachments = msg.get("attachments") or []
     first = attachments[0] if attachments else {}
-    await db.execute(
+    inserted = await db.scalar(
         pg_insert(Message)
         .values(
             conversation_id=convo.id,
@@ -228,7 +234,10 @@ async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> Non
             index_elements=["external_message_id"],
             index_where=Message.external_message_id.isnot(None),
         )
+        .returning(Message.id)
     )
+    if is_echo and inserted:
+        await hand_over(db, convo, reason="agent_manual_takeover", triggered_by="agent")
 
     # 5. dashboard sort key, + one notification when a brand-new customer thread opens.
     ts = event.get("timestamp")
@@ -246,6 +255,7 @@ async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> Non
             message=msg.get("text"),
             payload={"conversation_id": str(convo.id), "customer_id": str(customer.id)},
         )
+    return (convo.id, inserted) if inserted and not is_echo else None
 
 
 async def stamp_whatsapp_event(db: AsyncSession, phone_number_id: str, waba_id: str) -> None:
@@ -270,8 +280,8 @@ async def stamp_whatsapp_event(db: AsyncSession, phone_number_id: str, waba_id: 
 
 async def ingest_whatsapp_message(
     db: AsyncSession, phone_number_id: str, contacts: list[dict], msg: dict
-) -> None:
-    """Store one WhatsApp `messages[]` item — same steps as ingest_event.
+) -> tuple | None:
+    """Store one WhatsApp `messages[]` item — same steps and return value as ingest_event.
 
     The customer is keyed by wa_id (their phone number, digits only). WhatsApp puts the display
     name in the same payload (contacts[].profile.name), so there is no profile fetch.
@@ -285,7 +295,7 @@ async def ingest_whatsapp_message(
         )
     ).scalar_one_or_none()
     if account is None:
-        return
+        return None
 
     # 2. customer
     wa_id = msg["from"]
@@ -319,7 +329,7 @@ async def ingest_whatsapp_message(
     kind = msg.get("type", "text")
     part = msg.get(kind) or {}
     content = part.get("body") if kind == "text" else part.get("caption")
-    await db.execute(
+    inserted = await db.scalar(
         pg_insert(Message)
         .values(
             conversation_id=convo.id,
@@ -334,6 +344,7 @@ async def ingest_whatsapp_message(
             index_elements=["external_message_id"],
             index_where=Message.external_message_id.isnot(None),
         )
+        .returning(Message.id)
     )
 
     # 5. dashboard sort key + notification on a brand-new thread
@@ -352,10 +363,13 @@ async def ingest_whatsapp_message(
             message=content,
             payload={"conversation_id": str(convo.id), "customer_id": str(customer.id)},
         )
+    return (convo.id, inserted) if inserted else None
 
 
 @router.post("/instagram")
-async def receive(request: Request, db: Annotated[AsyncSession, Depends(get_db)]) -> dict:
+async def receive(
+    request: Request, db: Annotated[AsyncSession, Depends(get_db)], bg: BackgroundTasks
+) -> dict:
     raw = await request.body()
 
     log.info(">>> IG WEBHOOK HIT <<<")
@@ -372,11 +386,13 @@ async def receive(request: Request, db: Annotated[AsyncSession, Depends(get_db)]
     obj = payload.get("object")
     if obj not in ("instagram", "whatsapp_business_account"):
         return {"status": "ignored"}
+    to_reply: dict = {}  # conversation_id -> its newest new message (one reply per chat per batch)
     try:
         for entry in payload.get("entry", []):
             if obj == "instagram":
                 for event in entry.get("messaging", []):
-                    await ingest_event(db, str(entry.get("id", "")), event)
+                    if job := await ingest_event(db, str(entry.get("id", "")), event):
+                        to_reply[job[0]] = job[1]
                 continue
             # WhatsApp: entry.changes[].value holds messages[] (inbound) and statuses[] (delivery
             # reports on our sends). ponytail: statuses are only logged above; store them on the
@@ -386,10 +402,14 @@ async def receive(request: Request, db: Annotated[AsyncSession, Depends(get_db)]
                 phone_number_id = (value.get("metadata") or {}).get("phone_number_id", "")
                 await stamp_whatsapp_event(db, phone_number_id, str(entry.get("id", "")))
                 for msg in value.get("messages", []):
-                    await ingest_whatsapp_message(db, phone_number_id, value.get("contacts", []), msg)
+                    if job := await ingest_whatsapp_message(db, phone_number_id, value.get("contacts", []), msg):
+                        to_reply[job[0]] = job[1]
         await db.commit()
     except Exception:  # noqa: BLE001 — log it, never make Meta retry forever
         log.exception("%s webhook ingest failed", obj)
         await db.rollback()
+        return {"status": "ok"}
+    for message_id in to_reply.values():  # after the commit: the task reads the stored rows
+        bg.add_task(run_auto_reply, message_id)
     return {"status": "ok"}
 
