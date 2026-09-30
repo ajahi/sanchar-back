@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     cookie_secure: bool = False  # True in production (HTTPS); needed with SameSite=None
     cookie_samesite: str = "lax"  # "none" for cross-site frontend<->backend over HTTPS
 
+    # LLM for auto-replies (Groq's OpenAI-compatible API)
+    groq_api_key: str = ""
+    llm_model: str = "openai/gpt-oss-120b"
+
     # Outgoing mail (SMTP). Port 465 -> implicit TLS, anything else -> STARTTLS.
     # Empty mail_host = dev mode: the link is logged instead of sent.
     mail_host: str = ""
