@@ -5,6 +5,7 @@ from app.api.v1 import (
     auth,
     conversations,
     dashboard,
+    knowledge,
     notifications,
     social_accounts,
     tenants,
@@ -20,4 +21,5 @@ api_router.include_router(social_accounts.router)
 api_router.include_router(notifications.router)
 api_router.include_router(conversations.router)
 api_router.include_router(dashboard.router)
+api_router.include_router(knowledge.router)
 api_router.include_router(webhooks.router)
