@@ -33,7 +33,7 @@ from app.models.message import Message
 from app.models.social_account import SocialAccount
 from app.services.meta import instagram
 from app.services.notifications import create_notification
-from app.services.reply_pipeline import hand_over, run_auto_reply
+from app.services.reply_pipeline import run_auto_reply
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 log = logging.getLogger(__name__)
@@ -183,8 +183,9 @@ async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> tup
     """Store one Instagram `messaging` event, following the 5-step flow above.
 
     Returns (conversation_id, message_id) when a NEW customer message was stored (the caller queues
-    an auto-reply for it), else None. A NEW echo (a person answered from the Instagram app) also
-    takes the chat over from the AI; our own replies echo back under the id we stored, so they don't.
+    an auto-reply for it), else None. A NEW echo (a person answered from the Instagram app) is stored
+    as an 'agent' message, which pauses the bot for a while (see reply_pipeline.human_active); our own
+    replies echo back under the id we stored, so they are not stored twice and do not pause it.
     """
     # 1. keep only real messages (an unsend, or a read/reaction/postback, is not stored).
     match event:
@@ -236,9 +237,6 @@ async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> tup
         )
         .returning(Message.id)
     )
-    if is_echo and inserted:
-        await hand_over(db, convo, reason="agent_manual_takeover", triggered_by="agent")
-
     # 5. dashboard sort key, + one notification when a brand-new customer thread opens.
     ts = event.get("timestamp")
     convo.last_message_at = (

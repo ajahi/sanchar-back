@@ -1,18 +1,19 @@
 """Auto-reply pipeline: one stored customer message in -> (maybe) one AI reply out.
 
 The webhook stores the message and commits, then queues run_auto_reply(message_id) as a background
-task, so Meta gets its 200 right away. auto_reply() decides, generates (services/auto_reply.py),
-sends on the channel, stores the reply, and hands over to a human when the model or an error says so.
+task, so Meta gets its 200 right away.
 
-Stays silent (leaves the chat to the team) when: the tenant hasn't switched AI on, the chat is already
-with a human, the tenant has no knowledge yet, the message has no text, or a newer customer message
-exists (that one gets the reply, and its history includes this one).
+Human takeover is a timer, as in the Messenger MVP: while a person has replied in this chat within
+the last HUMAN_PAUSE_MINUTES (from the Instagram app via an echo, or from the dashboard), the bot
+stays quiet; every human reply refreshes the window, and once they go idle the bot takes over again.
+"Human replied recently" is read from the stored messages (sender_type = 'agent'), so there is no
+mode to flip back and nothing to lose on a restart.
 
 ponytail: FastAPI BackgroundTasks, so a server restart loses in-flight replies; move to a jobs table
-+ worker if that ever matters. A human echo can race our own reply's echo (see webhooks.ingest_event).
++ worker if that ever matters.
 """
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from sqlalchemy import select
@@ -24,47 +25,35 @@ from app.core.security import decrypt_token
 from app.db.session import async_session_factory
 from app.models.conversation import Conversation
 from app.models.customer import Customer
-from app.models.handover import HandoverEvent
 from app.models.knowledge import KnowledgeDocument
 from app.models.message import Message
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
 from app.services.auto_reply import build_system_prompt, generate_reply
 from app.services.meta import instagram, whatsapp
-from app.services.notifications import create_notification
 
 log = logging.getLogger(__name__)
 
 HISTORY = 6  # previous messages given to the model
 
 
-async def hand_over(db: AsyncSession, convo: Conversation, *, reason: str, triggered_by: str) -> None:
-    """AI -> human. The dashboard's Handover count reads conversations.mode, so flipping it is the
-    whole signal; the event row is the audit trail. Only AI-triggered handovers notify the team:
-    when a person took over themselves they already know."""
-    if convo.mode != "ai":
-        return
-    convo.mode = "human"
-    db.add(
-        HandoverEvent(
-            conversation_id=convo.id, from_mode="ai", to_mode="human", reason=reason, triggered_by=triggered_by
+async def human_active(db: AsyncSession, conversation_id) -> bool:
+    """True while a person has replied in this chat within the pause window."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings.human_pause_minutes)
+    found = await db.execute(
+        select(Message.id)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.sender_type == "agent",
+            Message.created_at > cutoff,
         )
+        .limit(1)
     )
-    if triggered_by == "ai":
-        await create_notification(
-            db,
-            event="handover",
-            tenant_id=convo.tenant_id,
-            source_table="conversations",
-            entity_id=convo.id,
-            subject="A customer needs a person",
-            message=reason,
-            payload={"conversation_id": str(convo.id), "reason": reason},
-        )
+    return found.first() is not None
 
 
 async def build_knowledge(db: AsyncSession, tenant_id) -> str:
-    """The tenant's whole knowledge as one text block (the CAG context). Tenant-scoped, always."""
+    """The tenant's whole shop context as one text block (the CAG context). Tenant-scoped, always."""
     docs = (
         await db.execute(
             select(KnowledgeDocument)
@@ -75,8 +64,8 @@ async def build_knowledge(db: AsyncSession, tenant_id) -> str:
     return "\n\n".join(f"## {d.title}\n{d.content.strip()}" for d in docs if d.content and d.content.strip())
 
 
-async def _generate(system: str, history: list[tuple[str, str]], text: str):
-    """One retry: Groq occasionally answers 400/5xx/timeouts, and the customer is waiting."""
+async def _generate(system: str, history: list[tuple[str, str]], text: str) -> str:
+    """One retry: the API occasionally answers 400/5xx/timeouts, and the customer is waiting."""
     try:
         return await generate_reply(system, history, text)
     except httpx.HTTPError:
@@ -89,28 +78,21 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
         return
     convo = await db.get(Conversation, msg.conversation_id)
     tenant = await db.get(Tenant, convo.tenant_id)
-    if convo.mode != "ai" or not tenant.ai_auto_reply:
+    if not tenant.ai_auto_reply:
+        log.info("auto-reply skipped: AI is off for tenant %s", tenant.id)
         return
-
-    newer = await db.execute(
-        select(Message.id)
-        .where(
-            Message.conversation_id == convo.id,
-            Message.sender_type == "customer",
-            Message.created_at > msg.created_at,
-        )
-        .limit(1)
-    )
-    if newer.first():
+    if await human_active(db, convo.id):
+        log.info("auto-reply skipped: a person is handling conversation %s", convo.id)
         return
 
     account = await db.get(SocialAccount, convo.social_account_id) if convo.social_account_id else None
     customer = await db.get(Customer, convo.customer_id)
     if account is None or not account.access_token_encrypted or customer is None:
+        log.info("auto-reply skipped: conversation %s has no connected account", convo.id)
         return
     knowledge = await build_knowledge(db, tenant.id)
     if not knowledge:
-        log.info("auto-reply skipped: tenant %s has no knowledge yet", tenant.id)
+        log.info("auto-reply skipped: tenant %s has no shop context yet", tenant.id)
         return
 
     prior = (
@@ -128,12 +110,17 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     ).scalars()
     history = [("customer" if m.sender_type == "customer" else "assistant", m.content) for m in reversed(list(prior))]
 
-    system = build_system_prompt(tenant.name, knowledge, contact=tenant.owner_phone or "")
     try:
-        result = await _generate(system, history, msg.content)
-    except Exception:  # noqa: BLE001 — any LLM failure: say nothing wrong, let a person answer
+        reply = await _generate(build_system_prompt(knowledge), history, msg.content)
+    except Exception:  # noqa: BLE001 — stay quiet rather than send something wrong; a person can answer
         log.exception("LLM failed for conversation %s", convo.id)
-        await hand_over(db, convo, reason="llm_error", triggered_by="ai")
+        return
+    if not reply:
+        return
+
+    # A person usually jumps in DURING the second or two of generation: re-check right before sending.
+    if await human_active(db, convo.id):
+        log.info("auto-reply dropped: a person took over conversation %s while generating", convo.id)
         return
 
     send_text = whatsapp.send_text if account.platform == "whatsapp" else instagram.send_text
@@ -142,11 +129,10 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
             decrypt_token(account.access_token_encrypted),
             account.external_account_id,
             customer.external_user_id,
-            result.reply,
+            reply,
         )
     except httpx.HTTPError:
         log.exception("sending AI reply failed for conversation %s", convo.id)
-        await hand_over(db, convo, reason="send_failed", triggered_by="ai")
         return
 
     # Stored under Meta's message id so our own echo (Instagram sends one back) hits the unique index
@@ -156,9 +142,9 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
         external_message_id=sent.get("message_id"),
         sender_type="ai",
         message_type="text",
-        content=result.reply,
+        content=reply,
         ai_generated=True,
-        meta={"model": settings.llm_model, "tokens": result.tokens, "handover": result.handover, "reason": result.reason},
+        meta={"model": settings.llm_model},
     )
     await db.execute(
         stmt.on_conflict_do_update(
@@ -168,8 +154,6 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
         )
     )
     convo.last_message_at = datetime.now(timezone.utc)
-    if result.handover:
-        await hand_over(db, convo, reason=result.reason or "ai_handover", triggered_by="ai")
 
 
 async def run_auto_reply(message_id) -> None:

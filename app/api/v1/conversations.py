@@ -15,7 +15,6 @@ from app.models.conversation import Conversation
 from app.models.customer import Customer
 from app.models.message import Message
 from app.models.social_account import SocialAccount
-from app.services.reply_pipeline import hand_over
 from app.schemas.conversation import ConversationOut, MessageOut, ReplyIn
 from app.services.meta import instagram, whatsapp
 
@@ -125,7 +124,6 @@ async def reply(
     )
     db.add(msg)
     convo.last_message_at = datetime.now(timezone.utc)
-    await hand_over(db, convo, reason="agent_dashboard_reply", triggered_by="agent")  # a person is here: bot stops
     await db.commit()
     await db.refresh(msg)
     return msg

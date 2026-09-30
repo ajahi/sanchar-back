@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     # LLM for auto-replies (Groq's OpenAI-compatible API)
     groq_api_key: str = ""
     llm_model: str = "openai/gpt-oss-120b"
+    # After a person replies in a chat, the bot stays quiet this long (refreshed by every reply of theirs).
+    human_pause_minutes: int = 10
 
     # Outgoing mail (SMTP). Port 465 -> implicit TLS, anything else -> STARTTLS.
     # Empty mail_host = dev mode: the link is logged instead of sent.

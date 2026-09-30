@@ -109,9 +109,8 @@ async def test_bot(
     knowledge = await build_knowledge(db, tenant.id)
     if not knowledge:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Add some shop information first.")
-    system = build_system_prompt(tenant.name, knowledge, contact=tenant.owner_phone or "")
     try:
-        result = await generate_reply(system, [], body.message)
+        reply = await generate_reply(build_system_prompt(knowledge), [], body.message)
     except httpx.HTTPError:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="The AI service is not responding. Try again.")
-    return TestOut(reply=result.reply, handover=result.handover, reason=result.reason)
+    return TestOut(reply=reply)

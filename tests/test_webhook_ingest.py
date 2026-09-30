@@ -46,18 +46,17 @@ async def _run() -> None:
         first = await ingest_event(db, "biz-1", cust)
         assert first is not None and await ingest_event(db, "biz-1", cust) is None
         convo = (await db.execute(select(Conversation).where(Conversation.tenant_id == t.id))).scalar_one()
-        assert first[0] == convo.id and convo.mode == "ai"
+        assert first[0] == convo.id
 
-        # our own reply echoes back under the id we stored: not a takeover
+        # our own reply echoes back under the id we stored: not stored twice, not a person
         db.add(Message(conversation_id=convo.id, external_message_id="ours", sender_type="ai", content="bot"))
         await db.flush()
         own_echo = {"sender": {"id": "biz-1"}, "recipient": {"id": "cust-1"},
                     "message": {"mid": "ours", "text": "bot", "is_echo": True}}
-        assert await ingest_event(db, "biz-1", own_echo) is None and convo.mode == "ai"
+        assert await ingest_event(db, "biz-1", own_echo) is None
 
-        # a person answering from the Instagram app is: chat flips to human, audited
+        # a person answering from the Instagram app is stored as an agent message (that pauses the bot)
         assert await ingest_event(db, "biz-1", echo) is None
-        assert convo.mode == "human"
         for ev in (echo, read):  # redelivered echo + read receipt change nothing
             await ingest_event(db, "biz-1", ev)
 

@@ -12,17 +12,17 @@ from app.db.session import async_session_factory
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.schemas.knowledge import SectionIn, TestIn
-from app.services.auto_reply import Reply
 
 
 async def _run(monkeypatch) -> None:
     async def fake_generate(system, history, text):
-        assert "Shawl Rs 4,500" in system and "Shop" in system
-        return Reply("Rs 4,500 ho.", False, "", 5)
+        assert "Shawl Rs 4,500" in system
+        return "Rs 4,500 ho."
 
     monkeypatch.setattr(knowledge, "generate_reply", fake_generate)
 
     async with async_session_factory() as db:
+        db.commit = db.flush  # the endpoints commit; in a test that must stay inside the rolled-back transaction
         mine, other = Tenant(name="Shop"), Tenant(name="Other")
         db.add_all([mine, other])
         await db.flush()

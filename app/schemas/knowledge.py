@@ -25,5 +25,3 @@ class TestIn(BaseModel):
 
 class TestOut(BaseModel):
     reply: str
-    handover: bool
-    reason: str
