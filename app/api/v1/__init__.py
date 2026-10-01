@@ -7,6 +7,7 @@ from app.api.v1 import (
     dashboard,
     knowledge,
     notifications,
+    shop_media,
     social_accounts,
     tenants,
     users,
@@ -22,4 +23,5 @@ api_router.include_router(notifications.router)
 api_router.include_router(conversations.router)
 api_router.include_router(dashboard.router)
 api_router.include_router(knowledge.router)
+api_router.include_router(shop_media.router)
 api_router.include_router(webhooks.router)

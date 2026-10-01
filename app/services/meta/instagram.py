@@ -133,6 +133,39 @@ async def send_text(access_token: str, ig_account_id: str, recipient_igsid: str,
         return resp.json()
 
 
+async def send_image(access_token: str, ig_account_id: str, recipient_igsid: str, image_url: str) -> dict:
+    """Send an image DM by public URL (Meta fetches it). Returns {recipient_id, message_id}."""
+    body = {
+        "recipient": {"id": recipient_igsid},
+        "message": {"attachment": {"type": "image", "payload": {"url": image_url}}},
+    }
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(
+            f"{GRAPH_BASE}/{API_VERSION}/{ig_account_id}/messages",
+            json=body,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def fetch_media(access_token: str, limit: int = 9) -> list[dict]:
+    """The account's newest `limit` posts (needs instagram_business_basic). Image/carousel posts carry
+    media_url; videos/reels carry thumbnail_url instead. The urls are signed CDN links that expire."""
+    params = {
+        "fields": "id,media_type,media_url,thumbnail_url,permalink,caption,timestamp",
+        "limit": limit,
+    }
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(
+            f"{GRAPH_BASE}/{API_VERSION}/me/media",
+            params=params,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+
+
 async def fetch_recent_conversations(access_token: str, limit: int = 5) -> list[dict]:
     """Newest `limit` DM threads with their recent messages (Meta caps at 20 per thread)."""
     params = {

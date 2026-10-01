@@ -53,6 +53,14 @@ class Settings(BaseSettings):
     # After a person replies in a chat, the bot stays quiet this long (refreshed by every reply of theirs).
     human_pause_minutes: int = 10
 
+    # Object storage (MinIO / any S3) for admin-uploaded shop images. Empty keys = uploads disabled.
+    s3_endpoint: str = ""
+    s3_bucket: str = "sanchar"
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
+    s3_region: str = "us-east-1"
+    s3_public_base_url: str = ""  # e.g. https://minio.utsavupahar.com/sanchar
+
     # Outgoing mail (SMTP). Port 465 -> implicit TLS, anything else -> STARTTLS.
     # Empty mail_host = dev mode: the link is logged instead of sent.
     mail_host: str = ""

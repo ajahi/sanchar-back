@@ -15,7 +15,9 @@ from app.models.conversation import Conversation
 from app.models.customer import Customer
 from app.models.message import Message
 from app.models.social_account import SocialAccount
+from app.api.v1.shop_media import own_media
 from app.schemas.conversation import ConversationOut, MessageOut, ReplyIn
+from app.schemas.shop_media import SendMediaIn
 from app.services.meta import instagram, whatsapp
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -121,6 +123,57 @@ async def reply(
         sender_type="agent",
         sender_agent_id=user.id,
         content=body.text,
+    )
+    db.add(msg)
+    convo.last_message_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(msg)
+    return msg
+
+
+@router.post(
+    "/{conversation_id}/media",
+    response_model=MessageOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def send_media(
+    conversation_id: uuid.UUID,
+    body: SendMediaIn,
+    tenant: CurrentTenant,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> Message:
+    """Send one of the shop's images (see /shop-media) to the customer as an agent message."""
+    convo, customer = await _own_conversation(db, tenant.id, conversation_id)
+    media = await own_media(db, tenant.id, body.media_id)
+    account = (
+        await db.get(SocialAccount, convo.social_account_id) if convo.social_account_id else None
+    )
+    if account is None or not account.access_token_encrypted:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=f"{convo.channel} account not connected"
+        )
+    if account.platform != "instagram":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Sending images is Instagram-only for now")
+    try:
+        sent = await instagram.send_image(
+            decrypt_token(account.access_token_encrypted),
+            account.external_account_id,
+            customer.external_user_id,
+            media.url,
+        )
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.response.text[:500])
+    except httpx.HTTPError:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="instagram unreachable")
+
+    msg = Message(
+        conversation_id=convo.id,
+        external_message_id=sent.get("message_id"),
+        sender_type="agent",
+        sender_agent_id=user.id,
+        message_type="image",
+        media_url=media.url,
     )
     db.add(msg)
     convo.last_message_at = datetime.now(timezone.utc)
