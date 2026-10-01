@@ -1,4 +1,5 @@
 """Inbox — list a tenant's conversations, read a thread, reply as an agent over Instagram or WhatsApp."""
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Annotated
@@ -20,6 +21,7 @@ from app.schemas.conversation import ConversationOut, MessageOut, ReplyIn
 from app.schemas.shop_media import SendMediaIn
 from app.services.meta import instagram, whatsapp
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 
@@ -163,6 +165,7 @@ async def send_media(
             media.url,
         )
     except httpx.HTTPStatusError as exc:
+        log.warning("instagram image send failed (%s) for %s: %s", exc.response.status_code, media.url, exc.response.text[:500])
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.response.text[:500])
     except httpx.HTTPError:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="instagram unreachable")
