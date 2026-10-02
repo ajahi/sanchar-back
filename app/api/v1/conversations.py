@@ -6,7 +6,7 @@ from typing import Annotated
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decrypt_token
@@ -14,6 +14,7 @@ from app.core.tenant import CurrentTenant, CurrentUser
 from app.db.session import get_db
 from app.models.conversation import Conversation
 from app.models.customer import Customer
+from app.models.handover import HandoverEvent
 from app.models.message import Message
 from app.models.social_account import SocialAccount
 from app.api.v1.shop_media import own_media
@@ -47,8 +48,19 @@ async def list_conversations(
     db: Annotated[AsyncSession, Depends(get_db)],
     status_: Annotated[str, Query(alias="status")] = "open",
 ) -> list[ConversationOut]:
+    # Needs attention = a handover to a person exists that no agent message follows. A human reply
+    # (dashboard or the Instagram app) clears it, so there is no flag to reset.
+    needs_attention = exists().where(
+        HandoverEvent.conversation_id == Conversation.id,
+        HandoverEvent.to_mode == "human",
+        ~exists().where(
+            Message.conversation_id == HandoverEvent.conversation_id,
+            Message.sender_type == "agent",
+            Message.created_at > HandoverEvent.created_at,
+        ),
+    )
     rows = await db.execute(
-        select(Conversation, Customer)
+        select(Conversation, Customer, needs_attention.label("needs_attention"))
         .join(Customer, Customer.id == Conversation.customer_id)
         .where(Conversation.tenant_id == tenant.id, Conversation.status == status_)
         .order_by(Conversation.last_message_at.desc().nulls_last())
@@ -59,12 +71,13 @@ async def list_conversations(
             channel=c.channel,
             status=c.status,
             mode=c.mode,
+            needs_attention=attention,
             last_message_at=c.last_message_at,
             customer_id=cu.id,
             customer_name=cu.name,
             customer_username=cu.external_username,
         )
-        for c, cu in rows.all()
+        for c, cu, attention in rows.all()
     ]
 
 

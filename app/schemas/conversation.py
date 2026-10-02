@@ -11,6 +11,7 @@ class ConversationOut(BaseModel):
     channel: str
     status: str
     mode: str
+    needs_attention: bool = False  # a handover to a person is open and nobody has replied since
     last_message_at: Optional[datetime] = None
     customer_id: uuid.UUID
     customer_name: Optional[str] = None

@@ -149,6 +149,9 @@ async def hand_over_photo(db: AsyncSession, convo, tenant, account, customer) ->
         message="A customer sent an image. The bot did not answer; please reply.",
         payload={"conversation_id": str(convo.id), "customer_id": str(customer.id), "reason": PHOTO_REASON},
     )
+    # The holding reply is the bot talking: only when AI replies are on and the channel can send.
+    if not tenant.ai_auto_reply or account is None or not account.access_token_encrypted:
+        return
     send_text = whatsapp.send_text if account.platform == "whatsapp" else instagram.send_text
     try:
         sent = await send_text(
@@ -172,20 +175,24 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
         return
     convo = await db.get(Conversation, msg.conversation_id)
     tenant = await db.get(Tenant, convo.tenant_id)
+    account = await db.get(SocialAccount, convo.social_account_id) if convo.social_account_id else None
+    customer = await db.get(Customer, convo.customer_id)
+
+    # A photo is flagged for a person even when AI replies are off (nobody else will mark it).
+    if is_photo:
+        if customer is None or await human_active(db, convo.id):
+            return
+        await hand_over_photo(db, convo, tenant, account, customer)
+        return
+
     if not tenant.ai_auto_reply:
         log.info("auto-reply skipped: AI is off for tenant %s", tenant.id)
         return
     if await human_active(db, convo.id):
         log.info("auto-reply skipped: a person is handling conversation %s", convo.id)
         return
-
-    account = await db.get(SocialAccount, convo.social_account_id) if convo.social_account_id else None
-    customer = await db.get(Customer, convo.customer_id)
     if account is None or not account.access_token_encrypted or customer is None:
         log.info("auto-reply skipped: conversation %s has no connected account", convo.id)
-        return
-    if is_photo:
-        await hand_over_photo(db, convo, tenant, account, customer)
         return
     knowledge = await build_knowledge(db, tenant.id)
     if not knowledge:
