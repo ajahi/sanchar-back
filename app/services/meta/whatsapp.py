@@ -7,6 +7,7 @@ Inbound messages arrive on the shared Meta webhook (webhooks.py).
 """
 import httpx
 
+from app.services.http_client import SSL_CTX
 from app.services.meta.instagram import API_VERSION
 
 GRAPH_BASE = "https://graph.facebook.com"
@@ -22,7 +23,7 @@ async def fetch_phone_number(
     access_token: str, phone_number_id: str, fields: str = "display_phone_number,verified_name"
 ) -> dict:
     """The business number's fields — also proves the token works. Pass PHONE_FIELDS for status."""
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.get(
             f"{GRAPH_BASE}/{API_VERSION}/{phone_number_id}",
             params={"fields": fields},
@@ -35,7 +36,7 @@ async def fetch_phone_number(
 async def fetch_waba_phone_numbers(access_token: str, waba_id: str) -> list[dict]:
     """[{id, display_phone_number, verified_name}] on a WhatsApp Business Account. Meta answers
     400 (code 100) when the token's business has no access to that account."""
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.get(
             f"{GRAPH_BASE}/{API_VERSION}/{waba_id}/phone_numbers",
             params={"fields": "id,display_phone_number,verified_name"},
@@ -49,7 +50,7 @@ async def subscribe_app(access_token: str, waba_id: str) -> None:
     """Have Meta deliver this WhatsApp account's webhooks to our app (the token's app).
     Without it a linked number sends fine but its customers' messages never reach us.
     Repeating it is harmless."""
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.post(
             f"{GRAPH_BASE}/{API_VERSION}/{waba_id}/subscribed_apps",
             headers={"Authorization": f"Bearer {access_token}"},
@@ -59,7 +60,7 @@ async def subscribe_app(access_token: str, waba_id: str) -> None:
 
 async def fetch_subscribed_apps(access_token: str, waba_id: str) -> list[str]:
     """Names of the apps Meta delivers this WhatsApp account's webhooks to. Empty = no webhooks."""
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.get(
             f"{GRAPH_BASE}/{API_VERSION}/{waba_id}/subscribed_apps",
             headers={"Authorization": f"Bearer {access_token}"},
@@ -78,7 +79,7 @@ async def send_text(access_token: str, phone_number_id: str, to_wa_id: str, text
     answers 200; the failure (code 131047) arrives later as a `statuses` webhook.
     """
     body = {"messaging_product": "whatsapp", "to": to_wa_id, "type": "text", "text": {"body": text}}
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.post(
             f"{GRAPH_BASE}/{API_VERSION}/{phone_number_id}/messages",
             json=body,

@@ -20,16 +20,17 @@ from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.responses import PlainTextResponse
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.security import decrypt_token
-from app.db.session import get_db
+from app.db.session import async_session_factory, get_db
 from app.models.conversation import Conversation
 from app.models.customer import Customer
 from app.models.message import Message
+from app.models.notification import Notification
 from app.models.social_account import SocialAccount
 from app.services.meta import instagram
 from app.services.notifications import create_notification
@@ -52,7 +53,7 @@ async def verify(
 
 # --- step 2: customer -------------------------------------------------------
 async def _get_or_create_customer(
-    db: AsyncSession, account: SocialAccount, igsid: str, token: str
+    db: AsyncSession, account: SocialAccount, igsid: str, token: str, fetch_profile: bool = True
 ) -> Customer:
     customer = (
         await db.execute(
@@ -65,14 +66,14 @@ async def _get_or_create_customer(
     if customer is not None:
         # Earlier lookup may have failed/returned empty (stale thread, transient error) — retry
         # rather than leave the row nameless forever.
-        if customer.name is None and customer.external_username is None:
+        if fetch_profile and customer.name is None and customer.external_username is None:
             profile = await instagram.fetch_customer_profile(token, igsid)
             if profile:
                 customer.name = profile.get("name")
                 customer.external_username = profile.get("username")
         return customer
 
-    profile = await instagram.fetch_customer_profile(token, igsid)
+    profile = await instagram.fetch_customer_profile(token, igsid) if fetch_profile else {}
     customer = Customer(
         tenant_id=account.tenant_id,
         external_user_id=igsid,
@@ -179,8 +180,39 @@ async def backfill_recent_conversations(
             convo.last_message_at = updated
 
 
-async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> tuple | None:
+async def fill_customer_profile(customer_id, token: str, igsid: str, convo_id) -> None:
+    """Background: the Graph name lookup the webhook no longer waits on (it held a DB connection
+    for the whole call). Own short session; also fixes the "from a customer" notification subject."""
+    profile = await instagram.fetch_customer_profile(token, igsid)
+    name, username = profile.get("name"), profile.get("username")
+    if not (name or username):
+        return
+    try:
+        async with async_session_factory() as db:
+            await db.execute(
+                update(Customer).where(Customer.id == customer_id).values(name=name, external_username=username)
+            )
+            await db.execute(
+                update(Notification)
+                .where(
+                    Notification.source_table == "conversations",
+                    Notification.entity_id == convo_id,
+                    Notification.event == "message_received",
+                )
+                .values(subject=f"New Instagram chat from {name or username}")
+            )
+            await db.commit()
+    except Exception:  # noqa: BLE001 — a missing name must never break anything else
+        log.exception("saving profile for customer %s failed", customer_id)
+
+
+async def ingest_event(
+    db: AsyncSession, ig_account_id: str, event: dict, profile_jobs: list | None = None
+) -> tuple | None:
     """Store one Instagram `messaging` event, following the 5-step flow above.
+
+    profile_jobs: pass a list to skip the slow Graph name lookup here; nameless customers are appended
+    as fill_customer_profile args for the caller to run after the commit. None = look it up inline.
 
     Returns (conversation_id, message_id) when a NEW customer message was stored (the caller queues
     an auto-reply for it), else None. A NEW echo (a person answered from the Instagram app) is stored
@@ -213,8 +245,11 @@ async def ingest_event(db: AsyncSession, ig_account_id: str, event: dict) -> tup
     igsid = event["recipient"]["id"] if is_echo else event["sender"]["id"]
     token = decrypt_token(account.access_token_encrypted)
 
-    customer = await _get_or_create_customer(db, account, igsid, token)          # step 2
+    defer = profile_jobs is not None
+    customer = await _get_or_create_customer(db, account, igsid, token, fetch_profile=not defer)  # step 2
     convo, convo_is_new = await _get_or_create_conversation(db, account, customer)  # step 3
+    if defer and customer.name is None and customer.external_username is None:
+        profile_jobs.append((customer.id, token, igsid, convo.id))
 
     # 4. the message row, linked to the conversation, idempotent on Meta's mid.
     attachments = msg.get("attachments") or []
@@ -385,11 +420,12 @@ async def receive(
     if obj not in ("instagram", "whatsapp_business_account"):
         return {"status": "ignored"}
     to_reply: dict = {}  # conversation_id -> its newest new message (one reply per chat per batch)
+    profile_jobs: list = []  # Graph name lookups, run after the ack so no DB connection waits on Graph
     try:
         for entry in payload.get("entry", []):
             if obj == "instagram":
                 for event in entry.get("messaging", []):
-                    if job := await ingest_event(db, str(entry.get("id", "")), event):
+                    if job := await ingest_event(db, str(entry.get("id", "")), event, profile_jobs):
                         to_reply[job[0]] = job[1]
                 continue
             # WhatsApp: entry.changes[].value holds messages[] (inbound) and statuses[] (delivery
@@ -407,6 +443,8 @@ async def receive(
         log.exception("%s webhook ingest failed", obj)
         await db.rollback()
         return {"status": "ok"}
+    for job in profile_jobs:
+        bg.add_task(fill_customer_profile, *job)
     for message_id in to_reply.values():  # after the commit: the task reads the stored rows
         bg.add_task(run_auto_reply, message_id)
     return {"status": "ok"}

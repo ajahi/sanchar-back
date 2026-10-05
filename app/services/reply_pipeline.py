@@ -152,6 +152,7 @@ async def hand_over_photo(db: AsyncSession, convo, tenant, account, customer) ->
     # The holding reply is the bot talking: only when AI replies are on and the channel can send.
     if not tenant.ai_auto_reply or account is None or not account.access_token_encrypted:
         return
+    await db.commit()  # keep the handover even if sending the holding reply blows up below
     send_text = whatsapp.send_text if account.platform == "whatsapp" else instagram.send_text
     try:
         sent = await send_text(
@@ -214,6 +215,9 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     ).scalars()
     history = [("customer" if m.sender_type == "customer" else "assistant", m.content) for m in reversed(list(prior))]
 
+    # Everything needed is in memory now. Commit hands the DB connection back to the pool (the loaded
+    # rows stay usable: expire_on_commit=False) so the 1-3s LLM call below does not hold one.
+    await db.commit()
     try:
         reply = await _generate(build_system_prompt(knowledge), history, msg.content)
     except Exception:  # noqa: BLE001 — stay quiet rather than send something wrong; a person can answer
@@ -226,6 +230,7 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     if await human_active(db, convo.id):
         log.info("auto-reply dropped: a person took over conversation %s while generating", convo.id)
         return
+    await db.commit()  # release the connection again for the Graph send; _store_ai_message takes a fresh one
 
     send_text = whatsapp.send_text if account.platform == "whatsapp" else instagram.send_text
     try:

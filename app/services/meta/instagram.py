@@ -15,12 +15,13 @@ from urllib.parse import urlencode
 import httpx
 
 from app.core.config import settings
+from app.services.http_client import SSL_CTX
 
 log = logging.getLogger(__name__)
 
 AUTHORIZE_URL = "https://www.instagram.com/oauth/authorize"
 TOKEN_URL = "https://api.instagram.com/oauth/access_token"
-GRAPH_BASE = "https://graph.instagram.com"
+GRAPH_BASE = settings.instagram_graph_base
 API_VERSION = "v25.0"  # matches what Meta sends in webhook headers (instagram-api-version)
 
 _TIMEOUT = httpx.Timeout(15.0)
@@ -47,7 +48,7 @@ async def exchange_code_for_token(code: str) -> dict:
         "redirect_uri": settings.instagram_redirect_uri,
         "code": code,
     }
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.post(TOKEN_URL, data=data)
         resp.raise_for_status()
         return resp.json()
@@ -60,7 +61,7 @@ async def exchange_for_long_lived_token(short_lived_token: str) -> dict:
         "client_secret": settings.instagram_app_secret,
         "access_token": short_lived_token,
     }
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.get(f"{GRAPH_BASE}/access_token", params=params)
         resp.raise_for_status()
         return resp.json()
@@ -75,7 +76,7 @@ async def fetch_profile(access_token: str, fields: str = "user_id,username") -> 
     """Step 4 — the connected account's {user_id, username}; pass PROFILE_FIELDS for the full
     instagram_business_basic profile (picture, name, counts)."""
     params = {"fields": fields, "access_token": access_token}
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.get(f"{GRAPH_BASE}/me", params=params)
         resp.raise_for_status()
         return resp.json()
@@ -84,7 +85,7 @@ async def fetch_profile(access_token: str, fields: str = "user_id,username") -> 
 async def refresh_long_lived_token(long_lived_token: str) -> dict:
     """Refresh a 60-day token (must be >=24h old). Returns {access_token, token_type, expires_in}."""
     params = {"grant_type": "ig_refresh_token", "access_token": long_lived_token}
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.get(f"{GRAPH_BASE}/refresh_access_token", params=params)
         resp.raise_for_status()
         return resp.json()
@@ -111,7 +112,7 @@ def verify_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
 async def subscribe_to_messages(access_token: str) -> None:
     """Have Meta deliver this account's DM webhooks to us. Instagram Login needs this once per
     account (the app-level webhook config alone sends nothing); repeating it is harmless."""
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.post(
             f"{GRAPH_BASE}/{API_VERSION}/me/subscribed_apps",
             params={"subscribed_fields": "messages"},
@@ -123,7 +124,7 @@ async def subscribe_to_messages(access_token: str) -> None:
 async def send_text(access_token: str, ig_account_id: str, recipient_igsid: str, text: str) -> dict:
     """Send a text DM from the business account. Returns {recipient_id, message_id}."""
     body = {"recipient": {"id": recipient_igsid}, "message": {"text": text}}
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.post(
             f"{GRAPH_BASE}/{API_VERSION}/{ig_account_id}/messages",
             json=body,
@@ -139,7 +140,7 @@ async def send_image(access_token: str, ig_account_id: str, recipient_igsid: str
         "recipient": {"id": recipient_igsid},
         "message": {"attachment": {"type": "image", "payload": {"url": image_url}}},
     }
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.post(
             f"{GRAPH_BASE}/{API_VERSION}/{ig_account_id}/messages",
             json=body,
@@ -156,7 +157,7 @@ async def fetch_media(access_token: str, limit: int = 9) -> list[dict]:
         "fields": "id,media_type,media_url,thumbnail_url,permalink,caption,timestamp",
         "limit": limit,
     }
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.get(
             f"{GRAPH_BASE}/{API_VERSION}/me/media",
             params=params,
@@ -174,7 +175,7 @@ async def fetch_recent_conversations(access_token: str, limit: int = 5) -> list[
         "limit": limit,
         "access_token": access_token,
     }
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.get(f"{GRAPH_BASE}/{API_VERSION}/me/conversations", params=params)
         resp.raise_for_status()
         return resp.json().get("data", [])
@@ -184,7 +185,7 @@ async def fetch_customer_profile(access_token: str, igsid: str) -> dict:
     """Best-effort {name, username} of a messaging participant; {} on any failure."""
     params = {"fields": "name,username", "access_token": access_token}
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
             resp = await client.get(f"{GRAPH_BASE}/{API_VERSION}/{igsid}", params=params)
             resp.raise_for_status()
             return resp.json()

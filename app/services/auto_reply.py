@@ -10,11 +10,13 @@ import logging
 
 import httpx
 
+from app.services.http_client import SSL_CTX
+
 from app.core.config import settings
 
 log = logging.getLogger(__name__)
 
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_URL = settings.groq_url
 
 SYSTEM_TEMPLATE = """You are the chat assistant for the shop described in SHOP INFORMATION below, replying to customers on Instagram or WhatsApp.
 
@@ -39,7 +41,7 @@ def build_system_prompt(knowledge: str) -> str:
 
 
 async def _chat(messages: list[dict]) -> str:
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, verify=SSL_CTX) as client:
         res = await client.post(
             GROQ_URL,
             headers={"Authorization": f"Bearer {settings.groq_api_key}"},

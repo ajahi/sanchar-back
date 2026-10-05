@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     instagram_redirect_uri: str = ""
     instagram_scopes: str = "instagram_business_basic,instagram_business_manage_messages"
     oauth_state_expire_minutes: int = 10
+    # Overridable only so load tests can point the outbound DM/profile calls at a mock.
+    instagram_graph_base: str = "https://graph.instagram.com"
     # Any string you also paste into the Meta dashboard's webhook "Verify token" field
     instagram_webhook_verify_token: str = ""
     meta_app_secret: str=""
@@ -50,6 +52,7 @@ class Settings(BaseSettings):
     # LLM for auto-replies (Groq's OpenAI-compatible API)
     groq_api_key: str = ""
     llm_model: str = "openai/gpt-oss-120b"
+    groq_url: str = "https://api.groq.com/openai/v1/chat/completions"  # overridable for load tests
     # After a person replies in a chat, the bot stays quiet this long (refreshed by every reply of theirs).
     human_pause_minutes: int = 10
 
