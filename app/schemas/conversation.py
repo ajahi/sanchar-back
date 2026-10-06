@@ -28,6 +28,7 @@ class MessageOut(BaseModel):
     media_url: Optional[str] = None
     ai_generated: bool
     created_at: datetime
+    sender_name: Optional[str] = None  # the staff member who sent it (agent messages only)
 
 
 class ReplyIn(BaseModel):

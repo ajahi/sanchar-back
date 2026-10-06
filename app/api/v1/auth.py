@@ -216,6 +216,13 @@ async def verify_email(
 
 
 @router.get("/me")
-async def me(user: CurrentUser) -> dict:
+async def me(user: CurrentUser, db: Annotated[AsyncSession, Depends(get_db)]) -> dict:
     """Who is signed in and with which roles (the UI routes super admins to /admin)."""
-    return {"id": user.id, "name": user.name, "email": user.email, "roles": [r.name for r in user.roles]}
+    tenant = await db.get(Tenant, user.tenant_id) if user.tenant_id else None
+    return {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "roles": [r.name for r in user.roles],
+        "tenant_name": tenant.name if tenant else None,
+    }

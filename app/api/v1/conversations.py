@@ -17,6 +17,7 @@ from app.models.customer import Customer
 from app.models.handover import HandoverEvent
 from app.models.message import Message
 from app.models.social_account import SocialAccount
+from app.models.user import User
 from app.api.v1.shop_media import own_media
 from app.schemas.conversation import ConversationOut, MessageOut, ReplyIn
 from app.schemas.shop_media import SendMediaIn
@@ -89,11 +90,16 @@ async def list_messages(
 ) -> list[Message]:
     await _own_conversation(db, tenant.id, conversation_id)
     rows = await db.execute(
-        select(Message)
+        select(Message, User.name)
+        .outerjoin(User, User.id == Message.sender_agent_id)
         .where(Message.conversation_id == conversation_id)
         .order_by(Message.created_at)
     )
-    return list(rows.scalars().all())
+    out = []
+    for msg, name in rows.all():
+        msg.sender_name = name  # transient attr read by MessageOut
+        out.append(msg)
+    return out
 
 
 @router.post(
@@ -143,6 +149,7 @@ async def reply(
     convo.last_message_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(msg)
+    msg.sender_name = user.name
     return msg
 
 
@@ -195,4 +202,5 @@ async def send_media(
     convo.last_message_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(msg)
+    msg.sender_name = user.name
     return msg

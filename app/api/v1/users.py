@@ -111,6 +111,10 @@ async def update_user(
     if target is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
+    # Only an owner may touch an owner account (an admin must not demote or lock out the owner).
+    if "owner" in {r.name for r in target.roles} and "owner" not in {r.name for r in actor.roles}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only an owner can change an owner")
+
     changes = body.model_dump(exclude_unset=True)
     password = changes.pop("password", None)
     role_name = changes.pop("role", None)
