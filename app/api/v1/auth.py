@@ -21,6 +21,7 @@ from app.core.security import (
     decode_token,
     verify_password,
 )
+from app.core.tenant import CurrentUser
 from app.db.session import get_db
 from app.models.tenant import Tenant
 from app.models.user import User
@@ -212,3 +213,9 @@ async def verify_email(
         access_token=access,
         refresh_token=create_refresh_token(str(user.id), tenant_id=user.tenant_id),
     )
+
+
+@router.get("/me")
+async def me(user: CurrentUser) -> dict:
+    """Who is signed in and with which roles (the UI routes super admins to /admin)."""
+    return {"id": user.id, "name": user.name, "email": user.email, "roles": [r.name for r in user.roles]}

@@ -29,4 +29,3 @@ class TenantUpdate(BaseModel):
     location: Optional[str] = None
     owner_name: Optional[str] = None
     owner_phone: Optional[str] = None
-    ai_auto_reply: Optional[bool] = None
