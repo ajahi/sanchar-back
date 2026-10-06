@@ -45,3 +45,16 @@ async def send_verification_email(to: str, name: str, token: str) -> None:
         f"This link expires in {settings.email_verify_expire_hours} hours. "
         "If you didn't sign up, ignore this email.\n",
     )
+
+
+async def send_staff_invite_email(to: str, name: str, tenant_name: str, role: str, token: str) -> None:
+    """Tells a new teammate they were added; the link confirms the address and signs them in."""
+    base = settings.frontend_url.rstrip("/")
+    await send_email(
+        to,
+        f"You've been added to {tenant_name} on Sanchar",
+        f"Hi {name},\n\nYou were added to {tenant_name} on Sanchar as {role}.\n\n"
+        f"Confirm your email to get started:\n\n{base}/verify?token={token}\n\n"
+        f"Afterwards sign in at {base}/login with this email and the password your team owner "
+        f"gave you. The link expires in {settings.email_verify_expire_hours} hours.\n",
+    )

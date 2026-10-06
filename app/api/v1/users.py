@@ -2,17 +2,18 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import hash_password
+from app.core.security import create_email_verify_token, hash_password
 from app.core.tenant import CurrentTenant, CurrentUser, require_role
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.user import UserCreate, UserOut, UserUpdate
 from app.services.audit import record_audit
+from app.services.email import send_staff_invite_email
 from app.services.notifications import create_notification
 from app.services.rbac import get_roles_by_names
 
@@ -44,6 +45,7 @@ async def create_user(
     tenant: CurrentTenant,
     actor: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
+    bg: BackgroundTasks,
 ) -> User:
     roles = await get_roles_by_names(db, [body.role])
     if not roles:
@@ -58,7 +60,7 @@ async def create_user(
         phone_number=body.phone_number,
         username=body.username,
         password_hash=hash_password(body.password),
-        verified=True,  # created by an admin, who vouches for the address
+        verified=False,  # confirmed through the emailed invite link
         roles=roles,
     )
     db.add(new_user)
@@ -92,6 +94,14 @@ async def create_user(
     )
     await db.commit()
     await db.refresh(new_user)
+    bg.add_task(
+        send_staff_invite_email,
+        new_user.email,
+        new_user.name,
+        tenant.name,
+        body.role,
+        create_email_verify_token(str(new_user.id)),
+    )
     return new_user
 
 
