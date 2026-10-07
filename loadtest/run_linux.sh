@@ -16,6 +16,8 @@ PY=${PY:-.venv/bin/python}
 PEAKS=${*:-10 50}
 PG=lt-postgres; PGPORT=5436; APP_PORT=8006; MOCK_PORT=9000
 export DATABASE_URL=postgresql+asyncpg://lt:lt@localhost:$PGPORT/loadtest
+APP_PID=; MOCK_PID=; SAMPLER_PID=
+[ -x "$PY" ] || { echo "no python at $PY. Create it: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt (or run: PY=/path/to/python bash loadtest/run_linux.sh ...)"; exit 1; }
 psqlx() { docker exec "$PG" psql -U lt -d "${DB:-loadtest}" -At -F, "$@"; }
 
 cleanup() { kill $APP_PID $MOCK_PID $SAMPLER_PID 2>/dev/null; docker rm -f $PG >/dev/null 2>&1; }
