@@ -38,9 +38,8 @@ INSTAGRAM_APP_SECRET=loadtest-secret INSTAGRAM_GRAPH_BASE=http://localhost:$MOCK
 for _ in $(seq 40); do curl -s -m 2 localhost:$APP_PORT/docs -o /dev/null && break; sleep 1; done
 curl -s -m 3 localhost:$APP_PORT/docs -o /dev/null || { echo "app did not start, see loadtest/app.log"; exit 1; }
 sleep 2   # let every worker finish starting
-CHILDREN=$(pgrep -P $APP_PID | wc -l)
-RUNNING=$(( WORKERS > 1 ? CHILDREN : 1 ))
-echo "uvicorn workers requested: $WORKERS, running: $RUNNING, started-server-process lines in app.log: $(grep -c 'Started server process' loadtest/app.log)"
+RUNNING=$(grep -c 'Started server process' loadtest/app.log)   # one line per worker; child processes would also count multiprocessing's resource tracker
+echo "uvicorn workers requested: $WORKERS, started: $RUNNING, child processes of the parent: $(pgrep -P $APP_PID | wc -l) (includes a helper that is not a worker)"
 [ "$RUNNING" -eq "$WORKERS" ] || { echo "worker count mismatch, not testing. Check loadtest/app.log"; exit 1; }
 
 sampler() {  # $1 = output dir
