@@ -1,4 +1,4 @@
-"""Connect-mode guard: an IG account already linked to tenant A cannot be attached to tenant B.
+"""Connect-mode guard: an IG staff account already linked to tenant A cannot be attached to tenant B.
 
 Runs against the configured Postgres inside a transaction that is always rolled back.
     python -m pytest tests/test_ig_connect.py   (or: python -m tests.test_ig_connect)

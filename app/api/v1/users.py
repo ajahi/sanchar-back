@@ -29,7 +29,9 @@ async def list_users(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> list[User]:
     result = await db.execute(
-        select(User).where(User.tenant_id == tenant.id).order_by(User.created_at)
+        select(User)
+        .where(User.tenant_id == tenant.id, User.status != "deleted")
+        .order_by(User.created_at)
     )
     return list(result.scalars().all())
 
@@ -68,10 +70,14 @@ async def create_user(
         await db.flush()
     except IntegrityError:
         await db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="A user with this email or username already exists",
-        )
+        clash = (await db.execute(select(User.tenant_id).where(User.email == str(body.email)))).first()
+        if clash is None:
+            detail = f"The username '{body.username}' is already taken"
+        elif clash[0] == tenant.id:
+            detail = f"{body.email} is already on your team"
+        else:
+            detail = f"{body.email} is already registered to another account. Use a different email."
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
 
     await record_audit(
         db,
@@ -156,3 +162,40 @@ async def update_user(
     await db.commit()
     await db.refresh(target)
     return target
+
+
+@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[AdminRequired])
+async def delete_user(
+    user_id: uuid.UUID,
+    tenant: CurrentTenant,
+    actor: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> None:
+    """Soft delete: the row stays (replies keep their sender name) but the login is dead and the email is freed."""
+    target = (
+        await db.execute(
+            select(User).where(User.id == user_id, User.tenant_id == tenant.id, User.status != "deleted")
+        )
+    ).scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if target.id == actor.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You cannot remove yourself")
+    if "owner" in {r.name for r in target.roles}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="The owner cannot be removed")
+
+    old_email = target.email
+    target.status = "deleted"
+    target.password_hash = None
+    target.username = None
+    target.email = f"deleted+{target.id}@removed.invalid"  # unique column: free the address for reuse
+    await record_audit(
+        db,
+        tenant_id=tenant.id,
+        actor_id=actor.id,
+        action="user_deleted",
+        entity_type="user",
+        entity_id=target.id,
+        meta={"email": old_email},
+    )
+    await db.commit()
