@@ -105,3 +105,31 @@ def test_fb_webhook_http(monkeypatch) -> None:
     sig = "sha256=" + hmac.new(b"shh", body, hashlib.sha256).hexdigest()
     ok = client.post("/api/v1/webhooks/facebook", content=body, headers={"x-hub-signature-256": sig})
     assert ok.status_code == 200 and ok.json() == {"status": "ok"}  # "page" is routed, not "ignored"
+
+
+def test_fb_login_redirect(monkeypatch) -> None:
+    from urllib.parse import parse_qs, urlparse
+
+    from app.core.security import create_access_token
+
+    client = TestClient(app, follow_redirects=False)
+    # not configured -> 503, never a broken redirect to Facebook
+    assert client.get("/api/v1/social-accounts/facebook/login").status_code == 503
+
+    monkeypatch.setattr(settings, "facebook_app_id", "123")
+    monkeypatch.setattr(settings, "meta_app_secret", "shh")
+    monkeypatch.setattr(settings, "facebook_redirect_uri", "https://x.test/cb")
+    anon = client.get("/api/v1/social-accounts/facebook/login")
+    assert "fb_error=login_required" in anon.headers["location"]  # Pages need a tenant to attach to
+
+    cookie = create_access_token("00000000-0000-4000-8000-000000000001", tenant_id=None, roles=[])
+    client.cookies.set(settings.session_cookie_name, cookie)
+    go = client.get("/api/v1/social-accounts/facebook/login")
+    url = urlparse(go.headers["location"])
+    q = parse_qs(url.query)
+    assert url.netloc == "www.facebook.com" and q["client_id"] == ["123"] and q["redirect_uri"] == ["https://x.test/cb"]
+    assert "pages_messaging" in q["scope"][0] and q["state"][0]
+
+    # callback: user denied, and a forged state, both bounce to the dashboard without touching Meta
+    assert "fb_error=access_denied" in client.get("/api/v1/social-accounts/facebook/callback?error=access_denied").headers["location"]
+    assert "fb_error=invalid_state" in client.get("/api/v1/social-accounts/facebook/callback?code=c&state=forged").headers["location"]

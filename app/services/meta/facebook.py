@@ -7,8 +7,11 @@ webhook (webhooks.py, object "page"); same event shape as Instagram, signed with
 Function names and return shapes match instagram.py so the inbox and reply pipeline treat both alike.
 """
 import logging
+from urllib.parse import urlencode
 
 import httpx
+
+from app.core.config import settings
 
 from app.services.http_client import SSL_CTX
 from app.services.meta.instagram import API_VERSION
@@ -20,6 +23,48 @@ SUBSCRIBED_FIELDS = "messages,message_echoes"
 log = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(15.0)
+
+
+DIALOG_URL = f"https://www.facebook.com/{API_VERSION}/dialog/oauth"
+
+
+def build_authorize_url(state: str) -> str:
+    """Facebook Login: the URL to send the browser to. The admin ticks which Pages to grant."""
+    params = {
+        "client_id": settings.facebook_app_id,
+        "redirect_uri": settings.facebook_redirect_uri,
+        "state": state,
+        "scope": settings.facebook_scopes,
+        "response_type": "code",
+    }
+    return f"{DIALOG_URL}?{urlencode(params)}"
+
+
+async def _token_call(params: dict) -> str:
+    params = {"client_id": settings.facebook_app_id, "client_secret": settings.meta_app_secret, **params}
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
+        resp = await client.get(f"{GRAPH_BASE}/{API_VERSION}/oauth/access_token", params=params)
+        resp.raise_for_status()
+        return resp.json()["access_token"]
+
+
+async def exchange_code_for_long_lived_token(code: str) -> str:
+    """code -> short-lived user token -> ~60-day user token. Page tokens derived from a long-lived
+    user token do not expire."""
+    short = await _token_call({"redirect_uri": settings.facebook_redirect_uri, "code": code})
+    return await _token_call({"grant_type": "fb_exchange_token", "fb_exchange_token": short})
+
+
+async def fetch_user_pages(user_token: str) -> list[dict]:
+    """[{id, name, access_token}] for the Pages the admin granted. ponytail: first 100, no paging."""
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
+        resp = await client.get(
+            f"{GRAPH_BASE}/{API_VERSION}/me/accounts",
+            params={"fields": "id,name,access_token", "limit": 100},
+            headers=_auth(user_token),
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", [])
 
 
 def _auth(token: str) -> dict:

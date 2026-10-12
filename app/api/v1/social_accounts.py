@@ -437,6 +437,99 @@ async def facebook_pages(
     return out
 
 
+async def _audit_facebook(db: AsyncSession, tenant_id, actor_id, account_id, page_id: str) -> None:
+    await record_audit(
+        db,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        action="facebook_account_connected",
+        entity_type="social_account",
+        entity_id=account_id,
+        meta={"page_id": page_id},
+    )
+
+
+@router.get("/facebook/login")
+async def facebook_login(request: Request) -> RedirectResponse:
+    """Connect Facebook button: send the logged-in admin to Facebook's consent screen, where they
+    pick the Pages to grant. Needs a dashboard session (the Pages attach to that tenant)."""
+    if not settings.facebook_configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Facebook Login is not configured (missing FACEBOOK_APP_ID/FACEBOOK_REDIRECT_URI/META_APP_SECRET).",
+        )
+    user_id = _session_user_id(request)
+    if user_id is None:
+        return _redirect_to_frontend(fb_error="login_required")
+    return RedirectResponse(
+        facebook.build_authorize_url(create_oauth_state(user_id=user_id)), status_code=status.HTTP_302_FOUND
+    )
+
+
+@router.get("/facebook/callback")
+async def facebook_callback(
+    background_tasks: BackgroundTasks,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+) -> RedirectResponse:
+    """Facebook returns here: swap the code for Page tokens and link every granted Page to the
+    tenant of the admin who clicked Connect (same steps as link_facebook, once per Page)."""
+    log = logging.getLogger(__name__)
+    if error:
+        return _redirect_to_frontend(fb_error=error)
+    if not code or not state:
+        return _redirect_to_frontend(fb_error="invalid_request")
+    try:
+        user_id = decode_oauth_state(state).get("user_id")
+    except JWTError:
+        return _redirect_to_frontend(fb_error="invalid_state")
+    user = await db.get(User, user_id) if user_id else None
+    if user is None or user.status != "active" or user.tenant_id is None:
+        return _redirect_to_frontend(fb_error="invalid_session")
+
+    try:
+        pages = await facebook.fetch_user_pages(await facebook.exchange_code_for_long_lived_token(code))
+    except (httpx.HTTPError, KeyError) as exc:
+        body = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
+        log.error("facebook token exchange failed: %r %s", exc, body)
+        return _redirect_to_frontend(fb_error="token_exchange_failed")
+
+    linked = 0
+    for page in pages:
+        page_id, token = page.get("id"), page.get("access_token")
+        if not page_id or not token:
+            continue
+        account = (
+            await db.execute(
+                select(SocialAccount).where(
+                    SocialAccount.platform == "facebook", SocialAccount.external_account_id == page_id
+                )
+            )
+        ).scalar_one_or_none()
+        if account is not None and account.tenant_id != user.tenant_id:
+            log.warning("facebook page %s already linked to another tenant; skipped", page_id)
+            continue
+        try:
+            await facebook.subscribe_page(token, page_id)
+        except httpx.HTTPError as exc:
+            body = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
+            log.error("facebook webhook subscription failed for %s: %r %s", page_id, exc, body)
+            continue
+        if account is None:
+            account = SocialAccount(tenant_id=user.tenant_id, platform="facebook", external_account_id=page_id)
+            db.add(account)
+        account.access_token_encrypted = encrypt_token(token)
+        account.account_name = page.get("name")
+        await db.flush()
+        await _audit_facebook(db, user.tenant_id, user.id, account.id, page_id)
+        background_tasks.add_task(_backfill, account.id, token)
+        linked += 1
+    await db.commit()
+    return _redirect_to_frontend(**({"fb_connected": str(linked)} if linked else {"fb_error": "no_pages_linked"}))
+
+
 @router.post("/facebook", response_model=FacebookPageOut, status_code=status.HTTP_201_CREATED)
 async def link_facebook(
     body: FacebookLinkIn,
@@ -498,15 +591,7 @@ async def link_facebook(
     account.access_token_encrypted = encrypt_token(token)
     account.account_name = page.get("name")
     await db.flush()
-    await record_audit(
-        db,
-        tenant_id=tenant.id,
-        actor_id=user.id,
-        action="facebook_account_connected",
-        entity_type="social_account",
-        entity_id=account.id,
-        meta={"page_id": body.page_id},
-    )
+    await _audit_facebook(db, tenant.id, user.id, account.id, body.page_id)
     await db.commit()
     await db.refresh(account)
     background_tasks.add_task(_backfill, account.id, token)

@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     instagram_webhook_verify_token: str = ""
     # Same idea for Messenger (Meta app -> Webhooks -> Page). Pages webhooks are signed with META_APP_SECRET.
     facebook_webhook_verify_token: str = ""
+    # Facebook Login (Connect Facebook button). The app secret is META_APP_SECRET. Redirect URI must be
+    # registered under Facebook Login -> Settings, e.g. https://<host>/api/v1/social-accounts/facebook/callback
+    facebook_app_id: str = ""
+    facebook_redirect_uri: str = ""
+    facebook_scopes: str = "pages_show_list,pages_messaging,pages_manage_metadata"
     meta_app_secret: str=""
 
     # WhatsApp Cloud API — read only by scripts/connect_whatsapp.py, which stores the token
@@ -78,6 +83,10 @@ class Settings(BaseSettings):
 
     # App
     environment: str = "development"
+
+    @property
+    def facebook_configured(self) -> bool:
+        return bool(self.facebook_app_id and self.meta_app_secret and self.facebook_redirect_uri)
 
     @property
     def instagram_configured(self) -> bool:
