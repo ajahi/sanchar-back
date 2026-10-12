@@ -1,4 +1,4 @@
-"""Inbox — list a tenant's conversations, read a thread, reply as an agent over Instagram or WhatsApp."""
+"""Inbox — list a tenant's conversations, read a thread, reply as an agent over Instagram, Messenger or WhatsApp."""
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -21,7 +21,7 @@ from app.models.user import User
 from app.api.v1.shop_media import own_media
 from app.schemas.conversation import ConversationOut, MessageOut, ReplyIn
 from app.schemas.shop_media import SendMediaIn
-from app.services.meta import instagram, whatsapp
+from app.services.meta import CHANNELS
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -122,8 +122,8 @@ async def reply(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=f"{convo.channel} account not connected"
         )
-    # Both senders take (token, business account id, customer id, text) and return {message_id}.
-    send_text = whatsapp.send_text if account.platform == "whatsapp" else instagram.send_text
+    # Every channel's send_text takes (token, business account id, customer id, text) and returns {message_id}.
+    send_text = CHANNELS[account.platform].send_text
     try:
         sent = await send_text(
             decrypt_token(account.access_token_encrypted),
@@ -175,20 +175,21 @@ async def send_media(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=f"{convo.channel} account not connected"
         )
-    if account.platform != "instagram":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Sending images is Instagram-only for now")
+    send_image = getattr(CHANNELS[account.platform], "send_image", None)
+    if send_image is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Sending images isn't supported on WhatsApp yet")
     try:
-        sent = await instagram.send_image(
+        sent = await send_image(
             decrypt_token(account.access_token_encrypted),
             account.external_account_id,
             customer.external_user_id,
             media.url,
         )
     except httpx.HTTPStatusError as exc:
-        log.warning("instagram image send failed (%s) for %s: %s", exc.response.status_code, media.url, exc.response.text[:500])
+        log.warning("%s image send failed (%s) for %s: %s", account.platform, exc.response.status_code, media.url, exc.response.text[:500])
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.response.text[:500])
     except httpx.HTTPError:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="instagram unreachable")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"{account.platform} unreachable")
 
     msg = Message(
         conversation_id=convo.id,

@@ -17,6 +17,7 @@ from app.models.message import Message
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
 from app.services import reply_pipeline
+from app.services.meta import whatsapp
 
 NOW = datetime.now(timezone.utc)
 
@@ -44,7 +45,7 @@ async def _run(monkeypatch) -> None:
             raise nxt
         return nxt
 
-    monkeypatch.setattr(reply_pipeline.whatsapp, "send_text", fake_send)
+    monkeypatch.setattr(whatsapp, "send_text", fake_send)
     monkeypatch.setattr(reply_pipeline, "generate_reply", fake_generate)
 
     async with async_session_factory() as db:

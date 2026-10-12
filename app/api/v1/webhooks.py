@@ -1,7 +1,9 @@
-"""Meta webhook receiver — Instagram DMs and WhatsApp messages become customers/conversations/messages.
+"""Meta webhook receiver — Instagram DMs, Messenger and WhatsApp messages become customers/conversations/messages.
 
   GET  /webhooks/instagram  -> subscription handshake (echo hub.challenge)
   POST /webhooks/instagram  -> events; signature-checked, idempotent on message id (mid / wamid)
+  /webhooks/facebook        -> the same two handlers (Messenger, object "page"); a separate URL only
+                               so each Meta product can have its own callback
 
 WhatsApp (object "whatsapp_business_account") posts to the same URL — it's the callback set on
 the Meta app — and goes through ingest_whatsapp_message, which follows the same 5 steps.
@@ -32,7 +34,7 @@ from app.models.customer import Customer
 from app.models.message import Message
 from app.models.notification import Notification
 from app.models.social_account import SocialAccount
-from app.services.meta import instagram
+from app.services.meta import CHANNELS, instagram
 from app.services.notifications import create_notification
 from app.services.reply_pipeline import run_auto_reply
 
@@ -41,12 +43,14 @@ log = logging.getLogger(__name__)
 
 
 @router.get("/instagram", response_class=PlainTextResponse)
+@router.get("/facebook", response_class=PlainTextResponse)
 async def verify(
     hub_mode: Annotated[str, Query(alias="hub.mode")] = "",
     hub_token: Annotated[str, Query(alias="hub.verify_token")] = "",
     hub_challenge: Annotated[str, Query(alias="hub.challenge")] = "",
 ) -> str:
-    if hub_mode != "subscribe" or hub_token != settings.instagram_webhook_verify_token:
+    tokens = {settings.instagram_webhook_verify_token, settings.facebook_webhook_verify_token} - {""}
+    if hub_mode != "subscribe" or hub_token not in tokens:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bad verify token")
     return hub_challenge
 
@@ -55,6 +59,7 @@ async def verify(
 async def _get_or_create_customer(
     db: AsyncSession, account: SocialAccount, igsid: str, token: str, fetch_profile: bool = True
 ) -> Customer:
+    channel = CHANNELS[account.platform]
     customer = (
         await db.execute(
             select(Customer).where(
@@ -67,13 +72,13 @@ async def _get_or_create_customer(
         # Earlier lookup may have failed/returned empty (stale thread, transient error) — retry
         # rather than leave the row nameless forever.
         if fetch_profile and customer.name is None and customer.external_username is None:
-            profile = await instagram.fetch_customer_profile(token, igsid)
+            profile = await channel.fetch_customer_profile(token, igsid)
             if profile:
                 customer.name = profile.get("name")
                 customer.external_username = profile.get("username")
         return customer
 
-    profile = await instagram.fetch_customer_profile(token, igsid) if fetch_profile else {}
+    profile = await channel.fetch_customer_profile(token, igsid) if fetch_profile else {}
     customer = Customer(
         tenant_id=account.tenant_id,
         external_user_id=igsid,
@@ -135,13 +140,14 @@ async def backfill_recent_conversations(
     db: AsyncSession, account: SocialAccount, token: str, limit: int = 5
 ) -> None:
     """Seed the inbox from Graph on connect so the dashboard isn't empty until the next DM.
+    Instagram and Messenger (the CHANNELS with fetch_recent_conversations).
 
-    ponytail: Graph message ids and webhook mids are the same value for Instagram, so the
+    ponytail: Graph message ids and webhook mids are the same value for both, so the
     external_message_id unique index dedupes overlap; if they ever differ you get one duplicate
     per message that arrives during the login window.
     """
     me = account.external_account_id
-    for conv in await instagram.fetch_recent_conversations(token, limit):
+    for conv in await CHANNELS[account.platform].fetch_recent_conversations(token, limit):
         others = [p for p in (conv.get("participants") or {}).get("data", []) if p.get("id") != me]
         if not others:
             continue
@@ -180,10 +186,15 @@ async def backfill_recent_conversations(
             convo.last_message_at = updated
 
 
-async def fill_customer_profile(customer_id, token: str, igsid: str, convo_id) -> None:
+CHAT_LABEL = {"instagram": "Instagram", "facebook": "Messenger"}
+
+
+async def fill_customer_profile(
+    customer_id, token: str, igsid: str, convo_id, platform: str = "instagram"
+) -> None:
     """Background: the Graph name lookup the webhook no longer waits on (it held a DB connection
     for the whole call). Own short session; also fixes the "from a customer" notification subject."""
-    profile = await instagram.fetch_customer_profile(token, igsid)
+    profile = await CHANNELS[platform].fetch_customer_profile(token, igsid)
     name, username = profile.get("name"), profile.get("username")
     if not (name or username):
         return
@@ -199,7 +210,7 @@ async def fill_customer_profile(customer_id, token: str, igsid: str, convo_id) -
                     Notification.entity_id == convo_id,
                     Notification.event == "message_received",
                 )
-                .values(subject=f"New Instagram chat from {name or username}")
+                .values(subject=f"New {CHAT_LABEL[platform]} chat from {name or username}")
             )
             await db.commit()
     except Exception:  # noqa: BLE001 — a missing name must never break anything else
@@ -207,9 +218,12 @@ async def fill_customer_profile(customer_id, token: str, igsid: str, convo_id) -
 
 
 async def ingest_event(
-    db: AsyncSession, ig_account_id: str, event: dict, profile_jobs: list | None = None
+    db: AsyncSession, ig_account_id: str, event: dict, profile_jobs: list | None = None,
+    platform: str = "instagram",
 ) -> tuple | None:
-    """Store one Instagram `messaging` event, following the 5-step flow above.
+    """Store one Instagram or Messenger (platform="facebook") `messaging` event — same payload shape —
+    following the 5-step flow above. ig_account_id is the account's id on that platform (Instagram
+    business id / Facebook Page id); the customer is keyed by its IGSID / PSID.
 
     profile_jobs: pass a list to skip the slow Graph name lookup here; nameless customers are appended
     as fill_customer_profile args for the caller to run after the commit. None = look it up inline.
@@ -231,7 +245,7 @@ async def ingest_event(
     account = (
         await db.execute(
             select(SocialAccount).where(
-                SocialAccount.platform == "instagram",
+                SocialAccount.platform == platform,
                 SocialAccount.external_account_id == ig_account_id,
             )
         )
@@ -249,7 +263,7 @@ async def ingest_event(
     customer = await _get_or_create_customer(db, account, igsid, token, fetch_profile=not defer)  # step 2
     convo, convo_is_new = await _get_or_create_conversation(db, account, customer)  # step 3
     if defer and customer.name is None and customer.external_username is None:
-        profile_jobs.append((customer.id, token, igsid, convo.id))
+        profile_jobs.append((customer.id, token, igsid, convo.id, platform))
 
     # 4. the message row, linked to the conversation, idempotent on Meta's mid.
     attachments = msg.get("attachments") or []
@@ -261,7 +275,8 @@ async def ingest_event(
             external_message_id=msg["mid"],
             sender_type="agent" if is_echo else "customer",
             sender_customer_id=None if is_echo else customer.id,
-            message_type=first.get("type", "text"),
+            # Messenger's thumbs-up arrives as an "image" with a sticker_id: not a photo to hand over.
+            message_type="sticker" if (first.get("payload") or {}).get("sticker_id") else first.get("type", "text"),
             content=msg.get("text"),
             media_url=(first.get("payload") or {}).get("url"),
             meta={"attachments": attachments} if attachments else {},
@@ -284,31 +299,36 @@ async def ingest_event(
             tenant_id=account.tenant_id,
             source_table="conversations",
             entity_id=convo.id,
-            subject=f"New Instagram chat from {customer.name or customer.external_username or 'a customer'}",
+            subject=f"New {CHAT_LABEL[platform]} chat from {customer.name or customer.external_username or 'a customer'}",
             message=msg.get("text"),
             payload={"conversation_id": str(convo.id), "customer_id": str(customer.id)},
         )
     return (convo.id, inserted) if inserted and not is_echo else None
 
 
-async def stamp_whatsapp_event(db: AsyncSession, phone_number_id: str, waba_id: str) -> None:
-    """Note that Meta reached us for this number (any event: message or status). The Channels
-    page shows it as the live webhook check. entry.id on a WhatsApp event is the WhatsApp
-    Business Account id, which the page needs to look up the webhook subscription."""
+async def stamp_webhook_event(db: AsyncSession, platform: str, external_id: str, **extra) -> None:
+    """Note that Meta reached us for this account (any event: message, status, read…). The Channels
+    page shows it as the live webhook check. An account that isn't ours is ignored."""
     account = (
         await db.execute(
             select(SocialAccount).where(
-                SocialAccount.platform == "whatsapp",
-                SocialAccount.external_account_id == phone_number_id,
+                SocialAccount.platform == platform,
+                SocialAccount.external_account_id == external_id,
             )
         )
     ).scalar_one_or_none()
     if account is not None:
         account.meta = {
             **(account.meta or {}),
-            "waba_id": waba_id,
+            **extra,
             "last_webhook_at": datetime.now(timezone.utc).isoformat(),
         }
+
+
+async def stamp_whatsapp_event(db: AsyncSession, phone_number_id: str, waba_id: str) -> None:
+    """entry.id on a WhatsApp event is the WhatsApp Business Account id, which the Channels page
+    needs to look up the webhook subscription."""
+    await stamp_webhook_event(db, "whatsapp", phone_number_id, waba_id=waba_id)
 
 
 async def ingest_whatsapp_message(
@@ -400,6 +420,7 @@ async def ingest_whatsapp_message(
 
 
 @router.post("/instagram")
+@router.post("/facebook")
 async def receive(
     request: Request, db: Annotated[AsyncSession, Depends(get_db)], bg: BackgroundTasks
 ) -> dict:
@@ -417,15 +438,18 @@ async def receive(
     log.info("Parsed payload:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
 
     obj = payload.get("object")
-    if obj not in ("instagram", "whatsapp_business_account"):
+    if obj not in ("instagram", "page", "whatsapp_business_account"):
         return {"status": "ignored"}
     to_reply: dict = {}  # conversation_id -> its newest new message (one reply per chat per batch)
     profile_jobs: list = []  # Graph name lookups, run after the ack so no DB connection waits on Graph
     try:
         for entry in payload.get("entry", []):
-            if obj == "instagram":
+            if obj in ("instagram", "page"):
+                platform = "instagram" if obj == "instagram" else "facebook"  # entry.id = IG id / Page id
+                if platform == "facebook":
+                    await stamp_webhook_event(db, platform, str(entry.get("id", "")))
                 for event in entry.get("messaging", []):
-                    if job := await ingest_event(db, str(entry.get("id", "")), event, profile_jobs):
+                    if job := await ingest_event(db, str(entry.get("id", "")), event, profile_jobs, platform):
                         to_reply[job[0]] = job[1]
                 continue
             # WhatsApp: entry.changes[].value holds messages[] (inbound) and statuses[] (delivery

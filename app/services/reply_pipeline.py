@@ -32,7 +32,7 @@ from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
 from app.services.auto_reply import build_system_prompt, generate_reply
-from app.services.meta import instagram, whatsapp
+from app.services.meta import CHANNELS
 from app.services.notifications import create_notification
 
 log = logging.getLogger(__name__)
@@ -153,7 +153,7 @@ async def hand_over_photo(db: AsyncSession, convo, tenant, account, customer) ->
     if not tenant.ai_auto_reply or account is None or not account.access_token_encrypted:
         return
     await db.commit()  # keep the handover even if sending the holding reply blows up below
-    send_text = whatsapp.send_text if account.platform == "whatsapp" else instagram.send_text
+    send_text = CHANNELS[account.platform].send_text
     try:
         sent = await send_text(
             decrypt_token(account.access_token_encrypted),
@@ -232,7 +232,7 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
         return
     await db.commit()  # release the connection again for the Graph send; _store_ai_message takes a fresh one
 
-    send_text = whatsapp.send_text if account.platform == "whatsapp" else instagram.send_text
+    send_text = CHANNELS[account.platform].send_text
     try:
         sent = await send_text(
             decrypt_token(account.access_token_encrypted),

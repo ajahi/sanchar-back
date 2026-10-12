@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     instagram_graph_base: str = "https://graph.instagram.com"
     # Any string you also paste into the Meta dashboard's webhook "Verify token" field
     instagram_webhook_verify_token: str = ""
+    # Same idea for Messenger (Meta app -> Webhooks -> Page). Pages webhooks are signed with META_APP_SECRET.
+    facebook_webhook_verify_token: str = ""
     meta_app_secret: str=""
 
     # WhatsApp Cloud API — read only by scripts/connect_whatsapp.py, which stores the token
