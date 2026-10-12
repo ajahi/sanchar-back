@@ -251,6 +251,7 @@ async def ingest_event(
         )
     ).scalar_one_or_none()
     if account is None or not account.access_token_encrypted:
+        log.warning("%s webhook for %s dropped: no connected account with that id", platform, ig_account_id)
         return
 
     # is_echo -> a reply the business sent from the Instagram app; the customer is the
