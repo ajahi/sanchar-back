@@ -16,6 +16,7 @@ from app.models.conversation import Conversation
 from app.models.customer import Customer
 from app.models.handover import HandoverEvent
 from app.models.message import Message
+from app.models.sales_lead import SalesLead
 from app.models.social_account import SocialAccount
 from app.models.user import User
 from app.api.v1.shop_media import own_media
@@ -61,8 +62,9 @@ async def list_conversations(
         ),
     )
     rows = await db.execute(
-        select(Conversation, Customer, needs_attention.label("needs_attention"))
+        select(Conversation, Customer, needs_attention.label("needs_attention"), SalesLead.phone)
         .join(Customer, Customer.id == Conversation.customer_id)
+        .outerjoin(SalesLead, SalesLead.customer_id == Conversation.customer_id)
         .where(Conversation.tenant_id == tenant.id, Conversation.status == status_)
         .order_by(Conversation.last_message_at.desc().nulls_last())
     )
@@ -77,8 +79,9 @@ async def list_conversations(
             customer_id=cu.id,
             customer_name=cu.name,
             customer_username=cu.external_username,
+            lead_phone=lead_phone,
         )
-        for c, cu, attention in rows.all()
+        for c, cu, attention, lead_phone in rows.all()
     ]
 
 

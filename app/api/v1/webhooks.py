@@ -35,6 +35,7 @@ from app.models.message import Message
 from app.models.notification import Notification
 from app.models.social_account import SocialAccount
 from app.services.meta import CHANNELS, instagram
+from app.services.leads import capture_lead
 from app.services.notifications import create_notification
 from app.services.reply_pipeline import run_auto_reply
 
@@ -298,6 +299,9 @@ async def ingest_event(
         )
         .returning(Message.id)
     )
+    # A phone number in a customer's text becomes a sales lead (and customers.phone).
+    if inserted and not is_echo:
+        await capture_lead(db, account=account, convo=convo, customer=customer, message_id=inserted, text=msg.get("text"))
     # 5. dashboard sort key, + one notification when a brand-new customer thread opens.
     ts = event.get("timestamp")
     convo.last_message_at = (

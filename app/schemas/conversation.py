@@ -16,6 +16,7 @@ class ConversationOut(BaseModel):
     customer_id: uuid.UUID
     customer_name: Optional[str] = None
     customer_username: Optional[str] = None
+    lead_phone: Optional[str] = None  # the number the customer gave in chat (a sales lead exists)
 
 
 class MessageOut(BaseModel):
