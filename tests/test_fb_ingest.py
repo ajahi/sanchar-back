@@ -133,3 +133,58 @@ def test_fb_login_redirect(monkeypatch) -> None:
     # callback: user denied, and a forged state, both bounce to the dashboard without touching Meta
     assert "fb_error=access_denied" in client.get("/api/v1/social-accounts/facebook/callback?error=access_denied").headers["location"]
     assert "fb_error=invalid_state" in client.get("/api/v1/social-accounts/facebook/callback?code=c&state=forged").headers["location"]
+
+
+import httpx
+
+_REAL_CLIENT = httpx.AsyncClient  # captured before any patching: monkeypatch replaces it on the shared httpx module
+
+
+def _mock_graph(monkeypatch, handler) -> None:
+    monkeypatch.setattr(
+        facebook.httpx, "AsyncClient", lambda **kw: _REAL_CLIENT(transport=httpx.MockTransport(handler), **kw)
+    )
+
+
+def test_fetch_linked_instagram(monkeypatch) -> None:
+    seen = []
+
+    def ok(req):
+        seen.append(req)
+        return httpx.Response(200, json={"id": "p1", "instagram_business_account": {"id": "17841431601921729"}})
+
+    _mock_graph(monkeypatch, ok)
+    assert asyncio.run(facebook.fetch_linked_instagram("TOK", "p1")) == "17841431601921729"
+    assert seen[0].url.path.endswith("/p1") and seen[0].headers["authorization"] == "Bearer TOK"
+
+    _mock_graph(monkeypatch, lambda r: httpx.Response(200, json={"id": "p1"}))  # Page with no Instagram
+    assert asyncio.run(facebook.fetch_linked_instagram("TOK", "p1")) is None
+    _mock_graph(monkeypatch, lambda r: httpx.Response(400, json={"error": {}}))  # Meta refuses: unknown, not an error
+    assert asyncio.run(facebook.fetch_linked_instagram("TOK", "p1")) is None
+
+
+async def _linked_instagram_rules(monkeypatch) -> None:
+    from app.api.v1.social_accounts import _linked_instagram, _tenant_instagram_ids
+
+    async def fake_linked(*_a):
+        return "ig-1"
+
+    monkeypatch.setattr(facebook, "fetch_linked_instagram", fake_linked)
+    async with async_session_factory() as db:
+        mine, other = Tenant(name="Mine"), Tenant(name="Other")
+        db.add_all([mine, other])
+        await db.flush()
+        db.add(SocialAccount(tenant_id=mine.id, platform="instagram", external_account_id="ig-1"))
+        await db.flush()
+        assert await _linked_instagram(db, mine.id, "tok", "page-1") == "ig-1"  # same workspace: fine
+        assert "ig-1" in await _tenant_instagram_ids(db, mine.id)
+        try:
+            await _linked_instagram(db, other.id, "tok", "page-1")  # its Instagram belongs to someone else
+            raise AssertionError("should have refused")
+        except PermissionError:
+            pass
+        await db.rollback()
+
+
+def test_linked_instagram_rules(monkeypatch) -> None:
+    asyncio.run(_linked_instagram_rules(monkeypatch))

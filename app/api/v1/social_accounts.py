@@ -413,6 +413,7 @@ async def facebook_pages(
             .order_by(SocialAccount.created_at)
         )
     ).scalars()
+    own_ig = await _tenant_instagram_ids(db, tenant.id)
     out = []
     for acc in accounts:
         live: dict = {}
@@ -430,11 +431,40 @@ async def facebook_pages(
                 name=live.get("name") or acc.account_name,
                 subscribed_fields=fields,
                 last_webhook_at=(acc.meta or {}).get("last_webhook_at"),
+                linked_instagram_id=(acc.meta or {}).get("linked_instagram_id"),
+                instagram_verified=(acc.meta or {}).get("linked_instagram_id") in own_ig,
                 connected_at=acc.created_at,
                 live=bool(live),
             )
         )
     return out
+
+
+async def _tenant_instagram_ids(db: AsyncSession, tenant_id: uuid.UUID) -> set[str]:
+    rows = await db.execute(
+        select(SocialAccount.external_account_id).where(
+            SocialAccount.tenant_id == tenant_id, SocialAccount.platform == "instagram"
+        )
+    )
+    return set(rows.scalars())
+
+
+async def _linked_instagram(db: AsyncSession, tenant_id: uuid.UUID, token: str, page_id: str) -> Optional[str]:
+    """Instagram id Meta links to this Page. Raises PermissionError if that Instagram account is
+    already connected to ANOTHER workspace: the Page belongs with it, not here."""
+    ig_id = await facebook.fetch_linked_instagram(token, page_id)
+    if ig_id is None:
+        return None
+    owner = (
+        await db.execute(
+            select(SocialAccount.tenant_id).where(
+                SocialAccount.platform == "instagram", SocialAccount.external_account_id == ig_id
+            )
+        )
+    ).scalar_one_or_none()
+    if owner is not None and owner != tenant_id:
+        raise PermissionError("instagram_linked_to_other_workspace")
+    return ig_id
 
 
 async def _audit_facebook(db: AsyncSession, tenant_id, actor_id, account_id, page_id: str) -> None:
@@ -512,6 +542,11 @@ async def facebook_callback(
             log.warning("facebook page %s already linked to another tenant; skipped", page_id)
             continue
         try:
+            ig_id = await _linked_instagram(db, user.tenant_id, token, page_id)
+        except PermissionError:
+            log.warning("facebook page %s skipped: its Instagram account belongs to another workspace", page_id)
+            continue
+        try:
             await facebook.subscribe_page(token, page_id)
         except httpx.HTTPError as exc:
             body = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
@@ -522,6 +557,7 @@ async def facebook_callback(
             db.add(account)
         account.access_token_encrypted = encrypt_token(token)
         account.account_name = page.get("name")
+        account.meta = {**(account.meta or {}), "linked_instagram_id": ig_id}
         await db.flush()
         await _audit_facebook(db, user.tenant_id, user.id, account.id, page_id)
         background_tasks.add_task(_backfill, account.id, token)
@@ -576,6 +612,14 @@ async def link_facebook(
         )
 
     try:
+        ig_id = await _linked_instagram(db, tenant.id, token, body.page_id)
+    except PermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This Page's Instagram account is connected to a different workspace. "
+            "Connect the Page from that workspace instead.",
+        )
+    try:
         await facebook.subscribe_page(token, body.page_id)
     except httpx.HTTPError as exc:
         body_text = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
@@ -590,6 +634,7 @@ async def link_facebook(
         db.add(account)
     account.access_token_encrypted = encrypt_token(token)
     account.account_name = page.get("name")
+    account.meta = {**(account.meta or {}), "linked_instagram_id": ig_id}
     await db.flush()
     await _audit_facebook(db, tenant.id, user.id, account.id, body.page_id)
     await db.commit()
@@ -600,6 +645,8 @@ async def link_facebook(
         name=account.account_name,
         subscribed_fields=facebook.SUBSCRIBED_FIELDS.split(","),
         last_webhook_at=(account.meta or {}).get("last_webhook_at"),
+        linked_instagram_id=ig_id,
+        instagram_verified=ig_id in await _tenant_instagram_ids(db, tenant.id),
         connected_at=account.created_at,
         live=True,
     )

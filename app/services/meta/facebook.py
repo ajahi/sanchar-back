@@ -104,6 +104,24 @@ async def fetch_subscribed_fields(access_token: str, page_id: str) -> list[str]:
         return [f for app in resp.json().get("data", []) for f in app.get("subscribed_fields", [])]
 
 
+async def fetch_linked_instagram(access_token: str, page_id: str) -> str | None:
+    """Id of the Instagram professional account Meta has linked to this Page (the same id Instagram
+    Login gives us), or None if there is none or Meta didn't answer. The only ownership proof a Page
+    token can give; "same Business portfolio" needs business_management, which we don't have."""
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
+            resp = await client.get(
+                f"{GRAPH_BASE}/{API_VERSION}/{page_id}",
+                params={"fields": "instagram_business_account{id,username}"},
+                headers=_auth(access_token),
+            )
+            resp.raise_for_status()
+            return (resp.json().get("instagram_business_account") or {}).get("id")
+    except httpx.HTTPError as exc:
+        log.warning("facebook linked-instagram lookup failed for page=%s: %r", page_id, exc)
+        return None
+
+
 async def _send(access_token: str, page_id: str, recipient_psid: str, message: dict) -> dict:
     # RESPONSE = a reply inside the 24h window after the customer's last message; outside it Meta
     # answers 400 (code 10 / subcode 2018278), which the inbox surfaces as a 502 with Meta's text.

@@ -47,6 +47,8 @@ class FacebookPageOut(BaseModel):
     name: Optional[str] = None
     subscribed_fields: Optional[list[str]] = None  # webhook fields Meta delivers; None = unknown, [] = none
     last_webhook_at: Optional[datetime] = None  # when Meta last reached us for this Page
+    linked_instagram_id: Optional[str] = None  # the Instagram account Meta links to this Page, if any
+    instagram_verified: bool = False  # that Instagram account is connected to this same workspace
     connected_at: datetime
     live: bool  # False = Meta didn't answer (revoked/expired token…); only stored values shown
 
