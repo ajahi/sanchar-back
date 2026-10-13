@@ -56,8 +56,18 @@ async def verify(
 
 
 # --- step 2: customer -------------------------------------------------------
+async def _profile(channel, token: str, igsid: str, known: dict | None, fetch: bool) -> dict:
+    """{name, username} for a customer: the name Graph already gave us (a conversation's participant
+    entry) wins, because the per-user lookup can be refused (error 100/33 for people with no role on
+    the app); otherwise ask Graph if allowed to."""
+    if known and (known.get("name") or known.get("username")):
+        return known
+    return await channel.fetch_customer_profile(token, igsid) if fetch else {}
+
+
 async def _get_or_create_customer(
-    db: AsyncSession, account: SocialAccount, igsid: str, token: str, fetch_profile: bool = True
+    db: AsyncSession, account: SocialAccount, igsid: str, token: str, fetch_profile: bool = True,
+    known: dict | None = None,
 ) -> Customer:
     channel = CHANNELS[account.platform]
     customer = (
@@ -71,14 +81,14 @@ async def _get_or_create_customer(
     if customer is not None:
         # Earlier lookup may have failed/returned empty (stale thread, transient error) — retry
         # rather than leave the row nameless forever.
-        if fetch_profile and customer.name is None and customer.external_username is None:
-            profile = await channel.fetch_customer_profile(token, igsid)
+        if (fetch_profile or known) and customer.name is None and customer.external_username is None:
+            profile = await _profile(channel, token, igsid, known, fetch_profile)
             if profile:
                 customer.name = profile.get("name")
                 customer.external_username = profile.get("username")
         return customer
 
-    profile = await channel.fetch_customer_profile(token, igsid) if fetch_profile else {}
+    profile = await _profile(channel, token, igsid, known, fetch_profile)
     customer = Customer(
         tenant_id=account.tenant_id,
         external_user_id=igsid,
@@ -151,7 +161,7 @@ async def backfill_recent_conversations(
         others = [p for p in (conv.get("participants") or {}).get("data", []) if p.get("id") != me]
         if not others:
             continue
-        customer = await _get_or_create_customer(db, account, others[0]["id"], token)
+        customer = await _get_or_create_customer(db, account, others[0]["id"], token, known=others[0])
         convo, _ = await _get_or_create_conversation(db, account, customer)
         for msg in (conv.get("messages") or {}).get("data", []):
             is_agent = (msg.get("from") or {}).get("id") == me

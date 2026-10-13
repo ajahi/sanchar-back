@@ -188,3 +188,19 @@ async def _linked_instagram_rules(monkeypatch) -> None:
 
 def test_linked_instagram_rules(monkeypatch) -> None:
     asyncio.run(_linked_instagram_rules(monkeypatch))
+
+
+def test_profile_prefers_known_participant_name() -> None:
+    from app.api.v1.webhooks import _profile
+
+    calls = []
+
+    class Chan:
+        async def fetch_customer_profile(self, token, psid):
+            calls.append(psid)
+            return {"name": "From Graph"}
+
+    known = {"id": "p1", "name": "Sita K"}  # a conversation participant entry
+    assert asyncio.run(_profile(Chan(), "t", "p1", known, True)) == known and calls == []  # no extra Graph call
+    assert asyncio.run(_profile(Chan(), "t", "p1", {"id": "p1"}, True)) == {"name": "From Graph"}  # no name: ask
+    assert asyncio.run(_profile(Chan(), "t", "p1", None, False)) == {}  # lookups switched off
