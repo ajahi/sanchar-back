@@ -34,11 +34,13 @@ async def capture_lead(
     account: SocialAccount,
     convo: Conversation,
     customer: Customer,
-    message_id: uuid.UUID,
+    message_id: uuid.UUID | None,
     text: str | None,
+    notify: bool = True,
 ) -> bool:
     """If `text` carries a phone number: save it on the customer, upsert the sales lead (one per
-    customer; a newer number replaces the old one) and notify staff the first time. Adds, never commits."""
+    customer; a newer number replaces the old one) and notify staff the first time (notify=False for
+    the backfill script, so old chats don't flood the bell). Adds, never commits."""
     phone = extract_phone(text)
     if phone is None:
         return False
@@ -60,6 +62,8 @@ async def capture_lead(
                 phone=phone,
             )
         )
+        if not notify:
+            return True
         who = customer.name or customer.external_username or "A customer"
         await create_notification(
             db,

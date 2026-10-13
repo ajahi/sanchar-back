@@ -146,19 +146,31 @@ async def send_image(access_token: str, page_id: str, recipient_psid: str, image
     )
 
 
-async def fetch_recent_conversations(access_token: str, limit: int = 5) -> list[dict]:
-    """Newest `limit` Messenger threads with their recent messages (a Page token makes /me the Page)."""
+async def fetch_conversations_page(
+    access_token: str, limit: int = 5, after: str | None = None
+) -> tuple[list[dict], str | None]:
+    """`limit` Messenger threads (newest first, or older than the `after` cursor) with their recent
+    messages, plus the cursor for the next page, None when there are no more. A Page token makes /me the Page."""
     params = {
         "platform": "messenger",
         "fields": "id,updated_time,participants,messages{id,created_time,from,message,attachments}",
         "limit": limit,
     }
+    if after:
+        params["after"] = after
     async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.get(
             f"{GRAPH_BASE}/{API_VERSION}/me/conversations", params=params, headers=_auth(access_token)
         )
         resp.raise_for_status()
-        return resp.json().get("data", [])
+        body = resp.json()
+        paging = body.get("paging") or {}
+        return body.get("data", []), (paging.get("cursors") or {}).get("after") if paging.get("next") else None
+
+
+async def fetch_recent_conversations(access_token: str, limit: int = 5) -> list[dict]:
+    """Newest `limit` Messenger threads with their recent messages."""
+    return (await fetch_conversations_page(access_token, limit))[0]
 
 
 async def fetch_customer_profile(access_token: str, psid: str) -> dict:

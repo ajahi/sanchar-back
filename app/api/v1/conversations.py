@@ -1,16 +1,16 @@
 """Inbox — list a tenant's conversations, read a thread, reply as an agent over Instagram, Messenger or WhatsApp."""
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decrypt_token
-from app.core.tenant import CurrentTenant, CurrentUser
+from app.core.tenant import CurrentTenant, CurrentUser, require_role
 from app.db.session import get_db
 from app.models.conversation import Conversation
 from app.models.customer import Customer
@@ -20,6 +20,7 @@ from app.models.sales_lead import SalesLead
 from app.models.social_account import SocialAccount
 from app.models.user import User
 from app.api.v1.shop_media import own_media
+from app.api.v1.webhooks import SYNC_LOCK_MINUTES, run_history_sync
 from app.schemas.conversation import ConversationOut, MessageOut, ReplyIn
 from app.schemas.shop_media import SendMediaIn
 from app.services.meta import CHANNELS
@@ -83,6 +84,36 @@ async def list_conversations(
         )
         for c, cu, attention, lead_phone in rows.all()
     ]
+
+
+@router.post("/sync-history", dependencies=[Depends(require_role("owner", "admin"))])
+async def sync_history(
+    tenant: CurrentTenant, db: Annotated[AsyncSession, Depends(get_db)], bg: BackgroundTasks
+) -> dict:
+    """"Load older chats": for each Instagram/Messenger account of this tenant, pull older threads from
+    Meta in the background (50 per click, continuing where the last click stopped). Safe to repeat:
+    messages are stored once. The inbox's 5s refresh shows the chats as they arrive."""
+    accounts = (
+        await db.execute(
+            select(SocialAccount).where(
+                SocialAccount.tenant_id == tenant.id,
+                SocialAccount.platform.in_(("instagram", "facebook")),
+                SocialAccount.access_token_encrypted.isnot(None),
+            )
+        )
+    ).scalars().all()
+    now = datetime.now(timezone.utc)
+    started = running = 0
+    for acc in accounts:
+        since = (acc.meta or {}).get("history_syncing_at")
+        if since and now - datetime.fromisoformat(since) < timedelta(minutes=SYNC_LOCK_MINUTES):
+            running += 1
+            continue
+        acc.meta = {**(acc.meta or {}), "history_syncing_at": now.isoformat()}
+        bg.add_task(run_history_sync, acc.id)
+        started += 1
+    await db.commit()  # the lock is saved before the background task starts
+    return {"started": started, "already_running": running}
 
 
 @router.get("/{conversation_id}/messages", response_model=list[MessageOut])

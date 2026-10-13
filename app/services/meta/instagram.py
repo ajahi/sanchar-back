@@ -167,18 +167,30 @@ async def fetch_media(access_token: str, limit: int = 9) -> list[dict]:
         return resp.json().get("data", [])
 
 
-async def fetch_recent_conversations(access_token: str, limit: int = 5) -> list[dict]:
-    """Newest `limit` DM threads with their recent messages (Meta caps at 20 per thread)."""
+async def fetch_conversations_page(
+    access_token: str, limit: int = 5, after: str | None = None
+) -> tuple[list[dict], str | None]:
+    """`limit` DM threads (newest first, or older than the `after` cursor) with their recent messages
+    (Meta caps at 20 per thread), plus the cursor for the next page, None when there are no more."""
     params = {
         "platform": "instagram",
         "fields": "id,updated_time,participants,messages{id,created_time,from,message,attachments}",
         "limit": limit,
         "access_token": access_token,
     }
+    if after:
+        params["after"] = after
     async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.get(f"{GRAPH_BASE}/{API_VERSION}/me/conversations", params=params)
         resp.raise_for_status()
-        return resp.json().get("data", [])
+        body = resp.json()
+        paging = body.get("paging") or {}
+        return body.get("data", []), (paging.get("cursors") or {}).get("after") if paging.get("next") else None
+
+
+async def fetch_recent_conversations(access_token: str, limit: int = 5) -> list[dict]:
+    """Newest `limit` DM threads with their recent messages."""
+    return (await fetch_conversations_page(access_token, limit))[0]
 
 
 async def fetch_customer_profile(access_token: str, igsid: str) -> dict:

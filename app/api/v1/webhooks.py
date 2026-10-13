@@ -157,44 +157,93 @@ async def backfill_recent_conversations(
     external_message_id unique index dedupes overlap; if they ever differ you get one duplicate
     per message that arrives during the login window.
     """
-    me = account.external_account_id
     for conv in await CHANNELS[account.platform].fetch_recent_conversations(token, limit):
-        others = [p for p in (conv.get("participants") or {}).get("data", []) if p.get("id") != me]
-        if not others:
-            continue
-        customer = await _get_or_create_customer(db, account, others[0]["id"], token, known=others[0])
-        convo, _ = await _get_or_create_conversation(db, account, customer)
-        for msg in (conv.get("messages") or {}).get("data", []):
-            is_agent = (msg.get("from") or {}).get("id") == me
-            message_type, media_url = graph_attachment(msg)
-            stmt = pg_insert(Message).values(
-                conversation_id=convo.id,
-                external_message_id=msg["id"],
-                sender_type="agent" if is_agent else "customer",
-                sender_customer_id=None if is_agent else customer.id,
-                message_type=message_type,
-                content=msg.get("message") or None,
-                media_url=media_url,
-                created_at=datetime.fromisoformat(msg["created_time"]),
+        await _ingest_conversation(db, account, token, conv)
+
+
+async def _ingest_conversation(db: AsyncSession, account: SocialAccount, token: str, conv: dict) -> None:
+    """Store one Graph thread: its customer, the conversation, and its messages (idempotent). A phone
+    number in an old customer message becomes a sales lead, without a notification."""
+    me = account.external_account_id
+    others = [p for p in (conv.get("participants") or {}).get("data", []) if p.get("id") != me]
+    if not others:
+        return
+    customer = await _get_or_create_customer(db, account, others[0]["id"], token, known=others[0])
+    convo, _ = await _get_or_create_conversation(db, account, customer)
+    # Graph lists newest first; oldest first here, so the newest number a customer gave wins.
+    for msg in reversed((conv.get("messages") or {}).get("data", [])):
+        is_agent = (msg.get("from") or {}).get("id") == me
+        message_type, media_url = graph_attachment(msg)
+        stmt = pg_insert(Message).values(
+            conversation_id=convo.id,
+            external_message_id=msg["id"],
+            sender_type="agent" if is_agent else "customer",
+            sender_customer_id=None if is_agent else customer.id,
+            message_type=message_type,
+            content=msg.get("message") or None,
+            media_url=media_url,
+            created_at=datetime.fromisoformat(msg["created_time"]),
+        )
+        # Existing row: take a fresh media url when Graph has one (fills rows stored before
+        # attachments were fetched, and renews CDN urls that expire); otherwise keep what's there.
+        has_media = stmt.excluded.media_url.isnot(None)
+        message_id = await db.scalar(
+            stmt.on_conflict_do_update(
+                index_elements=["external_message_id"],
+                index_where=Message.external_message_id.isnot(None),
+                set_={
+                    "media_url": func.coalesce(stmt.excluded.media_url, Message.media_url),
+                    "message_type": case((has_media, stmt.excluded.message_type), else_=Message.message_type),
+                },
+            ).returning(Message.id)
+        )
+        if not is_agent:
+            await capture_lead(
+                db, account=account, convo=convo, customer=customer,
+                message_id=message_id, text=msg.get("message"), notify=False,
             )
-            # Existing row: take a fresh media url when Graph has one (fills rows stored before
-            # attachments were fetched, and renews CDN urls that expire); otherwise keep what's there.
-            has_media = stmt.excluded.media_url.isnot(None)
-            await db.execute(
-                stmt.on_conflict_do_update(
-                    index_elements=["external_message_id"],
-                    index_where=Message.external_message_id.isnot(None),
-                    set_={
-                        "media_url": func.coalesce(stmt.excluded.media_url, Message.media_url),
-                        "message_type": case(
-                            (has_media, stmt.excluded.message_type), else_=Message.message_type
-                        ),
-                    },
-                )
-            )
-        updated = datetime.fromisoformat(conv["updated_time"]) if conv.get("updated_time") else None
-        if updated and (convo.last_message_at is None or updated > convo.last_message_at):
-            convo.last_message_at = updated
+    updated = datetime.fromisoformat(conv["updated_time"]) if conv.get("updated_time") else None
+    if updated and (convo.last_message_at is None or updated > convo.last_message_at):
+        convo.last_message_at = updated
+
+
+SYNC_LOCK_MINUTES = 10  # a sync that crashed without clearing its flag stops blocking after this
+
+
+async def run_history_sync(account_id, max_threads: int = 50, page_size: int = 10) -> None:
+    """Background: pull older threads from Meta, `page_size` at a time, up to `max_threads` per click.
+    Each click continues where the last stopped (cursor in the account's metadata); after the last
+    page the cursor resets, so the next click starts from the newest again and catches anything missed.
+
+    ponytail: one cursor per account and a metadata flag as the lock (not a jobs table); a crash
+    mid-sync just frees the lock after SYNC_LOCK_MINUTES.
+    """
+    try:
+        async with async_session_factory() as db:
+            account = await db.get(SocialAccount, account_id)
+            token = decrypt_token(account.access_token_encrypted)
+            channel = CHANNELS[account.platform]
+            after = (account.meta or {}).get("history_after")
+            done = 0
+            while done < max_threads:
+                convs, after = await channel.fetch_conversations_page(token, page_size, after)
+                for conv in convs:
+                    await _ingest_conversation(db, account, token, conv)
+                done += len(convs)
+                account.meta = {**(account.meta or {}), "history_after": after}
+                await db.commit()  # keep what's pulled even if a later page fails
+                if not after:
+                    break
+    except Exception:  # noqa: BLE001
+        log.exception("history sync failed for account %s", account_id)
+    finally:
+        try:
+            async with async_session_factory() as db:
+                account = await db.get(SocialAccount, account_id)
+                account.meta = {k: v for k, v in (account.meta or {}).items() if k != "history_syncing_at"}
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            log.exception("could not clear the sync flag for account %s", account_id)
 
 
 CHAT_LABEL = {"instagram": "Instagram", "facebook": "Messenger"}
