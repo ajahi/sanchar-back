@@ -1,0 +1,40 @@
+name: deploy-backend
+
+# Runs on the VPS itself (self-hosted runner with the label "sanchar"): pulls tst/auto-reply into
+# the compose directory and rebuilds the api container. The runner's own checkout is not used.
+on:
+  push:
+    branches: [tst/auto-reply]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false  # let a running deploy finish; the next push queues behind it
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, sanchar]
+    timeout-minutes: 15
+    env:
+      APP_DIR: /home/ajahi/sanchar-back
+      BRANCH: tst/auto-reply
+    steps:
+      - name: Pull the branch
+        run: |
+          cd "$APP_DIR"
+          git fetch origin "$BRANCH"
+          git checkout -B "$BRANCH" "origin/$BRANCH"
+          git log --oneline -1
+
+      - name: Build and restart the api container
+        run: |
+          cd "$APP_DIR"
+          docker compose up -d --build api
+
+      - name: Wait for /health
+        run: |
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost:8005/health; then echo; exit 0; fi
+            sleep 3
+          done
+          echo "api did not become healthy"; docker logs --tail 50 nepsocial-api; exit 1
