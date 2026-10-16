@@ -32,6 +32,7 @@ from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
 from app.services.auto_reply import build_system_prompt, generate_reply
+from app.services import campaigns
 from app.services.meta import CHANNELS
 from app.services.notifications import create_notification
 
@@ -43,6 +44,11 @@ PHOTO_HOLDING_REPLY = (
     "Tapai ko photo pauna payo. Hamro team le herera chadai reply garnu hunchha. "
     "(Thanks for the photo, our team will check it and reply shortly.)"
 )
+
+
+def _meta_error(exc: httpx.HTTPError) -> str:
+    """Meta's own error text for a failed send (the bare 400 says nothing about why)."""
+    return exc.response.text[:500] if isinstance(exc, httpx.HTTPStatusError) else repr(exc)
 
 
 async def human_active(db: AsyncSession, conversation_id) -> bool:
@@ -115,6 +121,57 @@ async def _store_ai_message(db: AsyncSession, convo: Conversation, sent: dict, t
     convo.last_message_at = datetime.now(timezone.utc)
 
 
+async def _store_ai_image(db: AsyncSession, convo: Conversation, sent: dict, url: str, campaign_id) -> None:
+    """Like _store_ai_message, for a photo we sent. meta.campaign_id lets us skip resending it for a while."""
+    stmt = pg_insert(Message).values(
+        conversation_id=convo.id,
+        external_message_id=sent.get("message_id"),
+        sender_type="ai",
+        message_type="image",
+        media_url=url,
+        ai_generated=True,
+        meta={"campaign_id": str(campaign_id)},
+    )
+    await db.execute(
+        stmt.on_conflict_do_update(
+            index_elements=["external_message_id"],
+            index_where=Message.external_message_id.isnot(None),
+            set_={"sender_type": "ai", "ai_generated": True},
+        )
+    )
+    convo.last_message_at = datetime.now(timezone.utc)
+
+
+async def share_campaign(db: AsyncSession, convo, campaign, account, customer) -> None:
+    """The ad's price line, then its in-stock photos (not again within the cooldown). The text goes first and
+    stays even if a photo fails: the customer already has the price."""
+    channel = CHANNELS[account.platform]
+    text = campaigns.campaign_text(campaign)
+    photos = (
+        []
+        if await campaigns.photos_sent_recently(db, convo.id, campaign.id)
+        else await campaigns.photos_for(db, campaign)
+    )
+    token, acct, to = decrypt_token(account.access_token_encrypted), account.external_account_id, customer.external_user_id
+    await db.commit()  # release the connection for the Graph calls
+    try:
+        sent = await channel.send_text(token, acct, to, text)
+    except httpx.HTTPError as exc:
+        log.exception("sending campaign reply failed for conversation %s: %s", convo.id, _meta_error(exc))
+        return
+    await _store_ai_message(db, convo, sent, text)
+    await db.commit()
+    send_image = getattr(channel, "send_image", None)
+    for media in photos if send_image else []:
+        try:
+            sent = await send_image(token, acct, to, media.url)
+        except httpx.HTTPError as exc:
+            log.warning("sending campaign photo %s failed for conversation %s: %s", media.id, convo.id, _meta_error(exc))
+            break  # the rest would most likely fail the same way (expired url, window closed)
+        await _store_ai_image(db, convo, sent, media.url, campaign.id)
+        await db.commit()
+
+
 async def hand_over_photo(db: AsyncSession, convo, tenant, account, customer) -> None:
     """A customer's photo (usually "do you have this?") is for a person: the bot does not guess from
     pixels. Record the handover, ping the dashboard, tell the customer someone will look.
@@ -161,8 +218,8 @@ async def hand_over_photo(db: AsyncSession, convo, tenant, account, customer) ->
             customer.external_user_id,
             PHOTO_HOLDING_REPLY,
         )
-    except httpx.HTTPError:
-        log.exception("sending photo holding reply failed for conversation %s", convo.id)
+    except httpx.HTTPError as exc:
+        log.exception("sending photo holding reply failed for conversation %s: %s", convo.id, _meta_error(exc))
         return
     await _store_ai_message(db, convo, sent, PHOTO_HOLDING_REPLY)
 
@@ -195,6 +252,12 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     if account is None or not account.access_token_encrypted or customer is None:
         log.info("auto-reply skipped: conversation %s has no connected account", convo.id)
         return
+    # A price / colour / photo question in a chat that came from a mapped ad gets that campaign's own
+    # message and photos, no model involved (works before the shop has written any knowledge).
+    campaign = await campaigns.campaign_for(db, convo)
+    if campaign and campaigns.campaign_text(campaign) and campaigns.wants_campaign_info(msg.content):
+        await share_campaign(db, convo, campaign, account, customer)
+        return
     knowledge = await build_knowledge(db, tenant.id)
     if not knowledge:
         log.info("auto-reply skipped: tenant %s has no shop context yet", tenant.id)
@@ -219,7 +282,9 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     # rows stay usable: expire_on_commit=False) so the 1-3s LLM call below does not hold one.
     await db.commit()
     try:
-        reply = await _generate(build_system_prompt(knowledge), history, msg.content)
+        reply = await _generate(
+            build_system_prompt(knowledge, campaigns.campaign_context(campaign) if campaign else ""), history, msg.content
+        )
     except Exception:  # noqa: BLE001 — stay quiet rather than send something wrong; a person can answer
         log.exception("LLM failed for conversation %s", convo.id)
         return
@@ -240,8 +305,8 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
             customer.external_user_id,
             reply,
         )
-    except httpx.HTTPError:
-        log.exception("sending AI reply failed for conversation %s", convo.id)
+    except httpx.HTTPError as exc:
+        log.exception("sending AI reply failed for conversation %s: %s", convo.id, _meta_error(exc))
         return
 
     await _store_ai_message(db, convo, sent, reply)

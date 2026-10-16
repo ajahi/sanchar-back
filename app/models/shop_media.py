@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -35,3 +35,9 @@ class ShopMedia(UUIDPKMixin, TimestampMixin, Base):
     posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     in_stock: Mapped[bool] = mapped_column(Boolean, server_default=text("true"), nullable=False)
+
+    # The campaign this photo belongs to (one photo per colour), and the order the bot sends them in.
+    campaign_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="SET NULL")
+    )
+    sort_order: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)

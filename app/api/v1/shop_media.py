@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import decrypt_token
 from app.core.tenant import CurrentTenant, require_role
 from app.db.session import get_db
+from app.api.v1.campaigns import own_campaign
 from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
 from app.schemas.shop_media import ShopMediaOut, ShopMediaPatch
@@ -176,8 +177,11 @@ async def update_media(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> ShopMedia:
     row = await own_media(db, tenant.id, media_id)
-    for field, value in body.model_dump(exclude_unset=True).items():
-        if value is not None:
+    changes = body.model_dump(exclude_unset=True)
+    if changes.get("campaign_id"):
+        await own_campaign(db, tenant.id, changes["campaign_id"])  # a photo only joins its own shop's campaign
+    for field, value in changes.items():
+        if value is not None or field == "campaign_id":  # campaign_id null = unassign
             setattr(row, field, value)
     await db.commit()
     await db.refresh(row)

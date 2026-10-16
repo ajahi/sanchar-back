@@ -1,14 +1,16 @@
 """Create sales leads from numbers customers already typed in old chats (new chats are captured live).
 
-    python -m scripts.backfill_leads --dry-run     # list what it would create, change nothing
-    python -m scripts.backfill_leads               # create/update the leads
+    python -m scripts.backfill_leads --dry-run                       # list what it would create, change nothing
+    python -m scripts.backfill_leads                                 # create/update the leads, every account
+    python -m scripts.backfill_leads --account ajahi_amit --dry-run  # only the chats of one connected account
+    python -m scripts.backfill_leads --account ajahi_amit
 
 Reads every stored customer message oldest-first, so the newest number a customer gave wins, as it does
 live. Instagram and Messenger only (WhatsApp customers already have their number). No notifications are
 sent for old chats. Safe to re-run: one lead per customer, same result.
 """
+import argparse
 import asyncio
-import sys
 
 from sqlalchemy import select
 
@@ -21,8 +23,17 @@ from app.models.social_account import SocialAccount
 from app.services.leads import capture_lead, extract_phone
 
 
-async def main(dry_run: bool) -> None:
+async def main(dry_run: bool, account_name: str | None) -> None:
     async with async_session_factory() as db:
+        scope = (
+            [Conversation.social_account_id.in_(select(SocialAccount.id).where(SocialAccount.account_name == account_name))]
+            if account_name
+            else []
+        )
+        if account_name and not (
+            await db.execute(select(SocialAccount.id).where(SocialAccount.account_name == account_name))
+        ).first():
+            raise SystemExit(f"No connected account named {account_name!r}")
         rows = await db.execute(
             select(Message, Conversation, Customer)
             .join(Conversation, Conversation.id == Message.conversation_id)
@@ -32,6 +43,7 @@ async def main(dry_run: bool) -> None:
                 Message.content.isnot(None),
                 Conversation.channel != "whatsapp",
                 Conversation.social_account_id.isnot(None),
+                *scope,
             )
             .order_by(Message.created_at)
         )
@@ -60,4 +72,8 @@ async def main(dry_run: bool) -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main("--dry-run" in sys.argv[1:]))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--account", help="connected account name, e.g. ajahi_amit (default: all)")
+    args = ap.parse_args()
+    asyncio.run(main(args.dry_run, args.account))

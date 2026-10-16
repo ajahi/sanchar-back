@@ -36,7 +36,13 @@ Example: customer "Simple chura ko price kati ho?" -> "Simple Plain Chura ko pri
 """
 
 
-def build_system_prompt(knowledge: str) -> str:
+def build_system_prompt(knowledge: str, campaign: str = "") -> str:
+    """campaign: one line about the item this chat's ad promotes (campaigns.campaign_context), or ''."""
+    if campaign:
+        knowledge = (
+            f"{knowledge.strip()}\n\nTHIS CHAT IS ABOUT THIS ITEM (the customer came from its ad; answer about it "
+            f"unless they ask about something else): {campaign}"
+        )
     return SYSTEM_TEMPLATE.format(knowledge=knowledge.strip())
 
 

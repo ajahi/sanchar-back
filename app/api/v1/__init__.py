@@ -4,6 +4,7 @@ from fastapi import APIRouter
 from app.api.v1 import (
     admin,
     auth,
+    campaigns,
     conversations,
     dashboard,
     knowledge,
@@ -26,4 +27,5 @@ api_router.include_router(conversations.router)
 api_router.include_router(dashboard.router)
 api_router.include_router(knowledge.router)
 api_router.include_router(shop_media.router)
+api_router.include_router(campaigns.router)
 api_router.include_router(webhooks.router)

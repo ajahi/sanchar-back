@@ -35,6 +35,7 @@ from app.models.message import Message
 from app.models.notification import Notification
 from app.models.social_account import SocialAccount
 from app.services.meta import CHANNELS, instagram
+from app.services.campaigns import apply_referral, referral_of
 from app.services.leads import capture_lead
 from app.services.notifications import create_notification
 from app.services.reply_pipeline import run_auto_reply
@@ -293,14 +294,12 @@ async def ingest_event(
     as an 'agent' message, which pauses the bot for a while (see reply_pipeline.human_active); our own
     replies echo back under the id we stored, so they are not stored twice and do not pause it.
     """
-    # 1. keep only real messages (an unsend, or a read/reaction/postback, is not stored).
-    match event:
-        case {"message": {"is_deleted": True}}:
-            return
-        case {"message": {"mid": str()} as msg}:
-            pass
-        case _:
-            return
+    # 1. keep only real messages (an unsend, or a read/reaction, is not stored), and referral events:
+    # a customer opening the chat from an ad / ref link, which can arrive without a message.
+    msg = event.get("message") or {}
+    referral = referral_of(event)
+    if msg.get("is_deleted") or (not msg.get("mid") and referral is None):
+        return
 
     account = (
         await db.execute(
@@ -326,28 +325,33 @@ async def ingest_event(
     if defer and customer.name is None and customer.external_username is None:
         profile_jobs.append((customer.id, token, igsid, convo.id, platform))
 
-    # 4. the message row, linked to the conversation, idempotent on Meta's mid.
+    if referral and not is_echo:
+        await apply_referral(db, account, convo, referral)  # which ad this chat came from
+
+    # 4. the message row, linked to the conversation, idempotent on Meta's mid (none for a referral-only event).
     attachments = msg.get("attachments") or []
     first = attachments[0] if attachments else {}
-    inserted = await db.scalar(
-        pg_insert(Message)
-        .values(
-            conversation_id=convo.id,
-            external_message_id=msg["mid"],
-            sender_type="agent" if is_echo else "customer",
-            sender_customer_id=None if is_echo else customer.id,
-            # Messenger's thumbs-up arrives as an "image" with a sticker_id: not a photo to hand over.
-            message_type="sticker" if (first.get("payload") or {}).get("sticker_id") else first.get("type", "text"),
-            content=msg.get("text"),
-            media_url=(first.get("payload") or {}).get("url"),
-            meta={"attachments": attachments} if attachments else {},
+    inserted = None
+    if msg.get("mid"):
+        inserted = await db.scalar(
+            pg_insert(Message)
+            .values(
+                conversation_id=convo.id,
+                external_message_id=msg["mid"],
+                sender_type="agent" if is_echo else "customer",
+                sender_customer_id=None if is_echo else customer.id,
+                # Messenger's thumbs-up arrives as an "image" with a sticker_id: not a photo to hand over.
+                message_type="sticker" if (first.get("payload") or {}).get("sticker_id") else first.get("type", "text"),
+                content=msg.get("text"),
+                media_url=(first.get("payload") or {}).get("url"),
+                meta={"attachments": attachments} if attachments else {},
+            )
+            .on_conflict_do_nothing(
+                index_elements=["external_message_id"],
+                index_where=Message.external_message_id.isnot(None),
+            )
+            .returning(Message.id)
         )
-        .on_conflict_do_nothing(
-            index_elements=["external_message_id"],
-            index_where=Message.external_message_id.isnot(None),
-        )
-        .returning(Message.id)
-    )
     # A phone number in a customer's text becomes a sales lead (and customers.phone).
     if inserted and not is_echo:
         await capture_lead(db, account=account, convo=convo, customer=customer, message_id=inserted, text=msg.get("text"))
@@ -440,6 +444,8 @@ async def ingest_whatsapp_message(
         customer.name = name
 
     convo, convo_is_new = await _get_or_create_conversation(db, account, customer)  # step 3
+    if ref := referral_of(msg):  # opened from a click-to-WhatsApp ad
+        await apply_referral(db, account, convo, ref)
 
     # 4. message. Media comes as an id, not a url (needs a Graph fetch) — keep the raw item in
     # meta and show the caption for now.

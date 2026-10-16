@@ -6,13 +6,14 @@ from typing import Annotated
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
-from sqlalchemy import exists, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decrypt_token
 from app.core.tenant import CurrentTenant, CurrentUser, require_role
 from app.db.session import get_db
 from app.models.conversation import Conversation
+from app.models.campaign import Campaign, CampaignLink
 from app.models.customer import Customer
 from app.models.handover import HandoverEvent
 from app.models.message import Message
@@ -63,9 +64,14 @@ async def list_conversations(
         ),
     )
     rows = await db.execute(
-        select(Conversation, Customer, needs_attention.label("needs_attention"), SalesLead.phone)
+        select(
+            Conversation, Customer, needs_attention.label("needs_attention"), SalesLead.phone,
+            Campaign.name, func.coalesce(CampaignLink.ad_title, CampaignLink.external_id),
+        )
         .join(Customer, Customer.id == Conversation.customer_id)
         .outerjoin(SalesLead, SalesLead.customer_id == Conversation.customer_id)
+        .outerjoin(CampaignLink, CampaignLink.id == Conversation.campaign_link_id)
+        .outerjoin(Campaign, Campaign.id == CampaignLink.campaign_id)
         .where(Conversation.tenant_id == tenant.id, Conversation.status == status_)
         .order_by(Conversation.last_message_at.desc().nulls_last())
     )
@@ -81,8 +87,10 @@ async def list_conversations(
             customer_name=cu.name,
             customer_username=cu.external_username,
             lead_phone=lead_phone,
+            campaign_name=campaign_name,
+            ad_title=ad_title,
         )
-        for c, cu, attention, lead_phone in rows.all()
+        for c, cu, attention, lead_phone, campaign_name, ad_title in rows.all()
     ]
 
 

@@ -72,6 +72,19 @@ async def fetch_subscribed_apps(access_token: str, waba_id: str) -> list[str]:
         ]
 
 
+async def send_image(access_token: str, phone_number_id: str, to_wa_id: str, image_url: str) -> dict:
+    """Send an image by public link (Meta fetches it). Returns {message_id}. Same 24h window as text."""
+    body = {"messaging_product": "whatsapp", "to": to_wa_id, "type": "image", "image": {"link": image_url}}
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
+        resp = await client.post(
+            f"{GRAPH_BASE}/{API_VERSION}/{phone_number_id}/messages",
+            json=body,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        resp.raise_for_status()
+        return {"message_id": resp.json()["messages"][0]["id"]}
+
+
 async def send_text(access_token: str, phone_number_id: str, to_wa_id: str, text: str) -> dict:
     """Send a free-form text. Returns {message_id}, same shape as instagram.send_text.
 
