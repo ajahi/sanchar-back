@@ -17,6 +17,7 @@ class TenantOut(BaseModel):
     owner_name: Optional[str] = None
     owner_phone: Optional[str] = None
     status: str
+    ai_auto_reply: bool
     created_at: datetime
     updated_at: datetime
 

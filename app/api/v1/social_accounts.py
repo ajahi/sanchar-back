@@ -41,10 +41,16 @@ from app.models.role import Role
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
 from app.models.user import User
-from app.schemas.social_account import InstagramProfileOut, WhatsAppAccountOut, WhatsAppLinkIn
+from app.schemas.social_account import (
+    FacebookLinkIn,
+    FacebookPageOut,
+    InstagramProfileOut,
+    WhatsAppAccountOut,
+    WhatsAppLinkIn,
+)
 from app.services.audit import record_audit
 from app.api.v1.webhooks import backfill_recent_conversations
-from app.services.meta import instagram, whatsapp
+from app.services.meta import facebook, instagram, whatsapp
 from app.services.rbac import get_roles_by_names
 
 router = APIRouter(prefix="/social-accounts", tags=["social-accounts"])
@@ -393,15 +399,261 @@ async def link_whatsapp(
     )
 
 
-async def _after_login(account_id: uuid.UUID, token: str) -> None:
-    """Runs after the redirect is sent: webhook subscription, then inbox seed. Each step is
-    best-effort and independent; own DB session since the request's is closed."""
+@router.get("/facebook", response_model=list[FacebookPageOut])
+async def facebook_pages(
+    tenant: CurrentTenant, db: Annotated[AsyncSession, Depends(get_db)]
+) -> list[FacebookPageOut]:
+    """This tenant's Facebook Pages with live status from Meta. Also the Channels page's PING:
+    live = token works, subscribed_fields has "messages" = Meta will deliver webhooks,
+    last_webhook_at = Meta actually did. If Meta doesn't answer, stored values with live=False."""
+    accounts = (
+        await db.execute(
+            select(SocialAccount)
+            .where(SocialAccount.tenant_id == tenant.id, SocialAccount.platform == "facebook")
+            .order_by(SocialAccount.created_at)
+        )
+    ).scalars()
+    own_ig = await _tenant_instagram_ids(db, tenant.id)
+    out = []
+    for acc in accounts:
+        live: dict = {}
+        fields: Optional[list[str]] = None
+        if acc.access_token_encrypted:
+            token = decrypt_token(acc.access_token_encrypted)
+            try:
+                live = await facebook.fetch_page(token)
+                fields = await facebook.fetch_subscribed_fields(token, acc.external_account_id)
+            except httpx.HTTPError as exc:
+                logging.getLogger(__name__).warning("facebook status fetch failed: %r", exc)
+        out.append(
+            FacebookPageOut(
+                page_id=acc.external_account_id,
+                name=live.get("name") or acc.account_name,
+                subscribed_fields=fields,
+                last_webhook_at=(acc.meta or {}).get("last_webhook_at"),
+                linked_instagram_id=(acc.meta or {}).get("linked_instagram_id"),
+                instagram_verified=(acc.meta or {}).get("linked_instagram_id") in own_ig,
+                connected_at=acc.created_at,
+                live=bool(live),
+            )
+        )
+    return out
+
+
+async def _tenant_instagram_ids(db: AsyncSession, tenant_id: uuid.UUID) -> set[str]:
+    rows = await db.execute(
+        select(SocialAccount.external_account_id).where(
+            SocialAccount.tenant_id == tenant_id, SocialAccount.platform == "instagram"
+        )
+    )
+    return set(rows.scalars())
+
+
+async def _linked_instagram(db: AsyncSession, tenant_id: uuid.UUID, token: str, page_id: str) -> Optional[str]:
+    """Instagram id Meta links to this Page. Raises PermissionError if that Instagram account is
+    already connected to ANOTHER workspace: the Page belongs with it, not here."""
+    ig_id = await facebook.fetch_linked_instagram(token, page_id)
+    if ig_id is None:
+        return None
+    owner = (
+        await db.execute(
+            select(SocialAccount.tenant_id).where(
+                SocialAccount.platform == "instagram", SocialAccount.external_account_id == ig_id
+            )
+        )
+    ).scalar_one_or_none()
+    if owner is not None and owner != tenant_id:
+        raise PermissionError("instagram_linked_to_other_workspace")
+    return ig_id
+
+
+async def _audit_facebook(db: AsyncSession, tenant_id, actor_id, account_id, page_id: str) -> None:
+    await record_audit(
+        db,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        action="facebook_account_connected",
+        entity_type="social_account",
+        entity_id=account_id,
+        meta={"page_id": page_id},
+    )
+
+
+@router.get("/facebook/login")
+async def facebook_login(request: Request) -> RedirectResponse:
+    """Connect Facebook button: send the logged-in admin to Facebook's consent screen, where they
+    pick the Pages to grant. Needs a dashboard session (the Pages attach to that tenant)."""
+    if not settings.facebook_configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Facebook Login is not configured (missing FACEBOOK_APP_ID/FACEBOOK_REDIRECT_URI/META_APP_SECRET).",
+        )
+    user_id = _session_user_id(request)
+    if user_id is None:
+        return _redirect_to_frontend(fb_error="login_required")
+    return RedirectResponse(
+        facebook.build_authorize_url(create_oauth_state(user_id=user_id)), status_code=status.HTTP_302_FOUND
+    )
+
+
+@router.get("/facebook/callback")
+async def facebook_callback(
+    background_tasks: BackgroundTasks,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+) -> RedirectResponse:
+    """Facebook returns here: swap the code for Page tokens and link every granted Page to the
+    tenant of the admin who clicked Connect (same steps as link_facebook, once per Page)."""
     log = logging.getLogger(__name__)
+    if error:
+        return _redirect_to_frontend(fb_error=error)
+    if not code or not state:
+        return _redirect_to_frontend(fb_error="invalid_request")
     try:
-        await instagram.subscribe_to_messages(token)
+        user_id = decode_oauth_state(state).get("user_id")
+    except JWTError:
+        return _redirect_to_frontend(fb_error="invalid_state")
+    user = await db.get(User, user_id) if user_id else None
+    if user is None or user.status != "active" or user.tenant_id is None:
+        return _redirect_to_frontend(fb_error="invalid_session")
+
+    try:
+        pages = await facebook.fetch_user_pages(await facebook.exchange_code_for_long_lived_token(code))
+    except (httpx.HTTPError, KeyError) as exc:
+        body = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
+        log.error("facebook token exchange failed: %r %s", exc, body)
+        return _redirect_to_frontend(fb_error="token_exchange_failed")
+
+    linked = 0
+    for page in pages:
+        page_id, token = page.get("id"), page.get("access_token")
+        if not page_id or not token:
+            continue
+        account = (
+            await db.execute(
+                select(SocialAccount).where(
+                    SocialAccount.platform == "facebook", SocialAccount.external_account_id == page_id
+                )
+            )
+        ).scalar_one_or_none()
+        if account is not None and account.tenant_id != user.tenant_id:
+            log.warning("facebook page %s already linked to another tenant; skipped", page_id)
+            continue
+        try:
+            ig_id = await _linked_instagram(db, user.tenant_id, token, page_id)
+        except PermissionError:
+            log.warning("facebook page %s skipped: its Instagram account belongs to another workspace", page_id)
+            continue
+        try:
+            await facebook.subscribe_page(token, page_id)
+        except httpx.HTTPError as exc:
+            body = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
+            log.error("facebook webhook subscription failed for %s: %r %s", page_id, exc, body)
+            continue
+        if account is None:
+            account = SocialAccount(tenant_id=user.tenant_id, platform="facebook", external_account_id=page_id)
+            db.add(account)
+        account.access_token_encrypted = encrypt_token(token)
+        account.account_name = page.get("name")
+        account.meta = {**(account.meta or {}), "linked_instagram_id": ig_id}
+        await db.flush()
+        await _audit_facebook(db, user.tenant_id, user.id, account.id, page_id)
+        background_tasks.add_task(_backfill, account.id, token)
+        linked += 1
+    await db.commit()
+    return _redirect_to_frontend(**({"fb_connected": str(linked)} if linked else {"fb_error": "no_pages_linked"}))
+
+
+@router.post("/facebook", response_model=FacebookPageOut, status_code=status.HTTP_201_CREATED)
+async def link_facebook(
+    body: FacebookLinkIn,
+    background_tasks: BackgroundTasks,
+    tenant: CurrentTenant,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> FacebookPageOut:
+    """Link a Facebook Page's Messenger inbox to the logged-in tenant (Channels page → Connect).
+
+    The token must be a Page access token for `page_id` (Meta answers /me with the Page itself).
+    Then: the Page is subscribed to our app's webhooks, saved for this tenant, and its recent
+    threads are pulled into the inbox.
+    ponytail: the admin pastes a long-lived Page token; Facebook Login (page picker) replaces this
+    form when you want one-click connect. A linked Page is never moved to another workspace.
+    """
+    log = logging.getLogger(__name__)
+    token = body.page_access_token
+    try:
+        page = await facebook.fetch_page(token)
+    except httpx.HTTPStatusError as exc:
+        log.warning("facebook link: token rejected: %s", exc.response.text[:300])
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Facebook rejected that access token.")
+    except httpx.HTTPError:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Meta unreachable")
+    if page.get("id") != body.page_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"That token is not a Page access token for Page {body.page_id}.",
+        )
+
+    account = (
+        await db.execute(
+            select(SocialAccount).where(
+                SocialAccount.platform == "facebook",
+                SocialAccount.external_account_id == body.page_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if account is not None and account.tenant_id != tenant.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This Facebook Page is already linked to another workspace.",
+        )
+
+    try:
+        ig_id = await _linked_instagram(db, tenant.id, token, body.page_id)
+    except PermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This Page's Instagram account is connected to a different workspace. "
+            "Connect the Page from that workspace instead.",
+        )
+    try:
+        await facebook.subscribe_page(token, body.page_id)
     except httpx.HTTPError as exc:
-        body = exc.response.text if isinstance(exc, httpx.HTTPStatusError) else ""
-        log.error("instagram webhook subscription failed: %r %s", exc, body)
+        body_text = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
+        log.error("facebook webhook subscription failed: %r %s", exc, body_text)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Couldn't subscribe the Page to Sanchar's webhooks; check the token has pages_messaging and pages_manage_metadata.",
+        )
+
+    if account is None:
+        account = SocialAccount(tenant_id=tenant.id, platform="facebook", external_account_id=body.page_id)
+        db.add(account)
+    account.access_token_encrypted = encrypt_token(token)
+    account.account_name = page.get("name")
+    account.meta = {**(account.meta or {}), "linked_instagram_id": ig_id}
+    await db.flush()
+    await _audit_facebook(db, tenant.id, user.id, account.id, body.page_id)
+    await db.commit()
+    await db.refresh(account)
+    background_tasks.add_task(_backfill, account.id, token)
+    return FacebookPageOut(
+        page_id=account.external_account_id,
+        name=account.account_name,
+        subscribed_fields=facebook.SUBSCRIBED_FIELDS.split(","),
+        last_webhook_at=(account.meta or {}).get("last_webhook_at"),
+        linked_instagram_id=ig_id,
+        instagram_verified=ig_id in await _tenant_instagram_ids(db, tenant.id),
+        connected_at=account.created_at,
+        live=True,
+    )
+
+
+async def _backfill(account_id: uuid.UUID, token: str) -> None:
+    """Seed the inbox from Graph. Best-effort; own DB session since the request's is closed."""
     try:
         async with async_session_factory() as db:
             account = await db.get(SocialAccount, account_id)
@@ -409,7 +661,18 @@ async def _after_login(account_id: uuid.UUID, token: str) -> None:
                 await backfill_recent_conversations(db, account, token)
                 await db.commit()
     except Exception:  # noqa: BLE001
-        log.exception("instagram conversation backfill failed")
+        logging.getLogger(__name__).exception("conversation backfill failed for account %s", account_id)
+
+
+async def _after_login(account_id: uuid.UUID, token: str) -> None:
+    """Runs after the redirect is sent: webhook subscription, then inbox seed. Each step is
+    best-effort and independent."""
+    try:
+        await instagram.subscribe_to_messages(token)
+    except httpx.HTTPError as exc:
+        body = exc.response.text if isinstance(exc, httpx.HTTPStatusError) else ""
+        logging.getLogger(__name__).error("instagram webhook subscription failed: %r %s", exc, body)
+    await _backfill(account_id, token)
 
 
 # Same look as the frontend's Loader. The browser keeps this page painted while /finish works.

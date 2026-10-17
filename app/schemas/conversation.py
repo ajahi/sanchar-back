@@ -11,10 +11,16 @@ class ConversationOut(BaseModel):
     channel: str
     status: str
     mode: str
+    needs_attention: bool = False  # a handover to a person is open and nobody has replied since
     last_message_at: Optional[datetime] = None
     customer_id: uuid.UUID
     customer_name: Optional[str] = None
     customer_username: Optional[str] = None
+    lead_phone: Optional[str] = None  # the number the customer gave in chat (a sales lead exists)
+    campaign_name: Optional[str] = None  # the campaign their ad is mapped to
+    ad_title: Optional[str] = None  # the ad / ref they came from, mapped or not
+    ad_kind: Optional[str] = None  # "ad" or "ref": how they reached us
+    ad_code: Optional[str] = None  # the reference code itself: Meta's ad id, or the ref code
 
 
 class MessageOut(BaseModel):
@@ -27,6 +33,7 @@ class MessageOut(BaseModel):
     media_url: Optional[str] = None
     ai_generated: bool
     created_at: datetime
+    sender_name: Optional[str] = None  # the staff member who sent it (agent messages only)
 
 
 class ReplyIn(BaseModel):
