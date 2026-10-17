@@ -67,6 +67,7 @@ async def list_conversations(
         select(
             Conversation, Customer, needs_attention.label("needs_attention"), SalesLead.phone,
             Campaign.name, func.coalesce(CampaignLink.ad_title, CampaignLink.external_id),
+            CampaignLink.kind, CampaignLink.external_id,
         )
         .join(Customer, Customer.id == Conversation.customer_id)
         .outerjoin(SalesLead, SalesLead.customer_id == Conversation.customer_id)
@@ -89,8 +90,10 @@ async def list_conversations(
             lead_phone=lead_phone,
             campaign_name=campaign_name,
             ad_title=ad_title,
+            ad_kind=ad_kind,
+            ad_code=ad_code,
         )
-        for c, cu, attention, lead_phone, campaign_name, ad_title in rows.all()
+        for c, cu, attention, lead_phone, campaign_name, ad_title, ad_kind, ad_code in rows.all()
     ]
 
 

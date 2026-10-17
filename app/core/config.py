@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     # Must match a redirect URI registered in the Meta app dashboard, e.g.
     # https://<tunnel>/api/v1/social-accounts/instagram/callback
     instagram_redirect_uri: str = ""
-    instagram_scopes: str = "instagram_business_basic,instagram_business_manage_messages"
+    instagram_scopes: str = "instagram_business_basic,instagram_business_manage_messages,instagram_business_content_publish"
     oauth_state_expire_minutes: int = 10
     # Overridable only so load tests can point the outbound DM/profile calls at a mock.
     instagram_graph_base: str = "https://graph.instagram.com"

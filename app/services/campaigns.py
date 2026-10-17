@@ -4,6 +4,7 @@ A chat links to the ad (or `ref` code) it arrived through; staff map each link t
 price, one-line blurb and photos). When the customer then asks for the price / colours / a photo, the bot
 answers from the campaign's own fields instead of letting the model phrase a price, then sends the photos.
 """
+import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,8 @@ from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
 from app.services.notifications import create_notification
 
+log = logging.getLogger(__name__)
+
 MAX_PHOTOS = 5
 PHOTO_COOLDOWN = timedelta(hours=24)  # one campaign's photos are not resent into the same chat within this
 MAX_QUESTION_CHARS = 40  # longer messages ("price of delivery to Pokhara?") go to the AI, not the fixed reply
@@ -29,6 +32,9 @@ _INTENT = re.compile(
     r"|मूल्य|कति|रंग|रङ|फोटो|तस्बिर",
     re.IGNORECASE,
 )
+
+
+_CODE_KEYS = ("ad_id", "ref", "source", "type", "source_id", "source_type", "source_url", "ctwa_clid", "headline", "ads_context_data")
 
 
 def wants_campaign_info(text: str | None) -> bool:
@@ -47,6 +53,8 @@ def referral_of(event: dict) -> dict | None:
     r = event.get("referral") or (event.get("message") or {}).get("referral") or (event.get("postback") or {}).get("referral")
     if not isinstance(r, dict):
         return None
+    # Every code Meta sent (an ad can carry ad_id AND ref), so a real ad's payload can be read from the logs.
+    log.info("referral codes: %s", {k: v for k, v in r.items() if k in _CODE_KEYS and v})
     ctx = r.get("ads_context_data") or {}
     ad_id = r.get("ad_id") or (r.get("source_id") if r.get("source_type") in ("ad", "post") else None)
     if ad_id:
@@ -94,6 +102,10 @@ async def apply_referral(db: AsyncSession, account: SocialAccount, convo: Conver
         link.ad_title = link.ad_title or ref["title"]
         link.ad_image_url = link.ad_image_url or ref["image"]
     convo.campaign_link_id = link.id
+    log.info(
+        "conversation %s tagged with %s %s (%s)", convo.id, link.kind, link.external_id,
+        f"campaign {link.campaign_id}" if link.campaign_id else "not mapped to a campaign yet",
+    )
 
 
 async def campaign_for(db: AsyncSession, convo: Conversation) -> Campaign | None:

@@ -19,6 +19,8 @@ class ConversationOut(BaseModel):
     lead_phone: Optional[str] = None  # the number the customer gave in chat (a sales lead exists)
     campaign_name: Optional[str] = None  # the campaign their ad is mapped to
     ad_title: Optional[str] = None  # the ad / ref they came from, mapped or not
+    ad_kind: Optional[str] = None  # "ad" or "ref": how they reached us
+    ad_code: Optional[str] = None  # the reference code itself: Meta's ad id, or the ref code
 
 
 class MessageOut(BaseModel):

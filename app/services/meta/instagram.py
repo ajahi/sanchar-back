@@ -7,6 +7,7 @@ Flow (see Meta docs: Business Login for Instagram):
   4. Read the profile (GRAPH /me).
 Long-lived tokens are refreshed elsewhere via GRAPH /refresh_access_token.
 """
+import asyncio
 import hmac
 import logging
 from hashlib import sha256
@@ -148,6 +149,30 @@ async def send_image(access_token: str, ig_account_id: str, recipient_igsid: str
         )
         resp.raise_for_status()
         return resp.json()
+
+
+# ---- Publishing (instagram_business_content_publish) ----
+async def publish_image(access_token: str, ig_account_id: str, image_url: str, caption: str) -> dict:
+    """Post one photo to the feed. Instagram only takes photos by public url (it downloads the file), so:
+    create a container from the url, wait until Instagram has fetched it, publish it.
+    Returns {"id": post id, "permalink": post url or None}."""
+    base = f"{GRAPH_BASE}/{API_VERSION}"
+    auth = {"Authorization": f"Bearer {access_token}"}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), verify=SSL_CTX) as client:
+        resp = await client.post(f"{base}/{ig_account_id}/media", params={"image_url": image_url, "caption": caption}, headers=auth)
+        resp.raise_for_status()
+        container = resp.json()["id"]
+        for _ in range(15):  # photos are usually ready at once; give a slow download up to ~30s
+            resp = await client.get(f"{base}/{container}", params={"fields": "status_code"}, headers=auth)
+            resp.raise_for_status()
+            if resp.json().get("status_code") != "IN_PROGRESS":
+                break
+            await asyncio.sleep(2)
+        resp = await client.post(f"{base}/{ig_account_id}/media_publish", params={"creation_id": container}, headers=auth)
+        resp.raise_for_status()
+        post_id = resp.json()["id"]
+        resp = await client.get(f"{base}/{post_id}", params={"fields": "permalink"}, headers=auth)
+        return {"id": post_id, "permalink": resp.json().get("permalink") if resp.is_success else None}
 
 
 async def fetch_media(access_token: str, limit: int = 9) -> list[dict]:
