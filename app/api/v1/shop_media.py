@@ -7,12 +7,12 @@ object storage (permanent, public, safe for Meta to fetch when we send them).
 import logging
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated
 
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,7 +22,7 @@ from app.db.session import get_db
 from app.api.v1.campaigns import own_campaign
 from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
-from app.schemas.shop_media import ShopMediaOut, ShopMediaPatch
+from app.schemas.shop_media import PostIn, ShopMediaOut, ShopMediaPatch
 from app.services import storage
 from app.services.meta import instagram
 
@@ -46,11 +46,8 @@ def _sniff(data: bytes) -> tuple[str, str] | None:
     return None
 
 
-async def _sync_instagram(db: AsyncSession, tenant_id: uuid.UUID) -> None:
-    """Upsert the page's newest posts (url, caption, permalink); title and in_stock are the admin's and stay."""
-    if time.monotonic() - _last_sync.get(tenant_id, float("-inf")) < REFRESH_SECONDS:
-        return
-    account = (
+async def _instagram_account(db: AsyncSession, tenant_id: uuid.UUID) -> SocialAccount | None:
+    return (
         await db.execute(
             select(SocialAccount).where(
                 SocialAccount.tenant_id == tenant_id,
@@ -60,6 +57,13 @@ async def _sync_instagram(db: AsyncSession, tenant_id: uuid.UUID) -> None:
             )
         )
     ).scalars().first()
+
+
+async def _sync_instagram(db: AsyncSession, tenant_id: uuid.UUID) -> None:
+    """Upsert the page's newest posts (url, caption, permalink); title and in_stock are the admin's and stay."""
+    if time.monotonic() - _last_sync.get(tenant_id, float("-inf")) < REFRESH_SECONDS:
+        return
+    account = await _instagram_account(db, tenant_id)
     if account is None:
         return
     try:
@@ -90,7 +94,9 @@ async def _sync_instagram(db: AsyncSession, tenant_id: uuid.UUID) -> None:
         await db.execute(
             stmt.on_conflict_do_update(
                 constraint="uq_shop_media_ig",
-                set_={"url": stmt.excluded.url, "caption": stmt.excluded.caption,
+                # a photo posted from Sanchar matches its own post here: keep our permanent url, not the expiring CDN one
+                set_={"url": case((ShopMedia.source == "upload", ShopMedia.url), else_=stmt.excluded.url),
+                      "caption": stmt.excluded.caption,
                       "permalink": stmt.excluded.permalink, "media_type": stmt.excluded.media_type},
             )
         )
@@ -164,6 +170,47 @@ async def upload_media(
         title=title.strip() or None, caption=caption.strip() or None,
     )
     db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+@router.post(
+    "/{media_id}/post",
+    response_model=ShopMediaOut,
+    dependencies=[Depends(require_role("owner", "admin"))],
+)
+async def post_to_instagram(
+    media_id: uuid.UUID, body: PostIn, tenant: CurrentTenant, db: Annotated[AsyncSession, Depends(get_db)]
+) -> ShopMedia:
+    """Post an uploaded photo to the shop's Instagram feed (instagram_business_content_publish) and keep the
+    post id and link on it. The owner then boosts that post in Instagram; chats from the ad carry its ad id."""
+    row = await own_media(db, tenant.id, media_id)
+    if row.source != "upload":  # Instagram downloads the photo, so it must be one on our public storage
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Only photos uploaded in Sanchar can be posted.")
+    if row.ig_media_id:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This photo is already posted.")
+    account = await _instagram_account(db, tenant.id)
+    if account is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Connect your Instagram account first.")
+    caption = body.caption.strip()
+    try:
+        post = await instagram.publish_image(decrypt_token(account.access_token_encrypted), account.external_account_id, row.url, caption)
+    except httpx.HTTPStatusError as exc:  # Meta says why (missing permission, bad image...): pass it on
+        try:
+            why = exc.response.json()["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            why = f"HTTP {exc.response.status_code}"
+        log.warning("instagram post failed for tenant %s: %s", tenant.id, exc.response.text[:300])
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Instagram refused the post: {why}. If it is about permission, log in with Instagram again.",
+        )
+    except httpx.HTTPError:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Instagram is not responding. Try again.")
+    log.info("posted media %s to instagram: post %s %s", row.id, post["id"], post["permalink"])
+    row.ig_media_id, row.permalink = post["id"], post["permalink"]
+    row.caption, row.posted_at = caption or row.caption, datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(row)
     return row

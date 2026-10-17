@@ -6,16 +6,20 @@ themselves when a chat opens from an unknown ad; staff map them here once.
 import uuid
 from typing import Annotated
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import decrypt_token
 from app.core.tenant import CurrentTenant, require_role
 from app.db.session import get_db
 from app.models.campaign import Campaign, CampaignLink
 from app.models.shop_media import ShopMedia
-from app.schemas.campaign import CampaignIn, CampaignOut, CampaignPatch, LinkIn, LinkOut, LinkPatch
+from app.models.social_account import SocialAccount
+from app.services.meta import instagram
+from app.schemas.campaign import CampaignIn, CampaignOut, CampaignPatch, LinkIn, LinkOut, LinkPatch, PublishIn
 
 router = APIRouter(
     prefix="/campaigns", tags=["campaigns"], dependencies=[Depends(require_role("owner", "admin"))]
@@ -114,8 +118,50 @@ async def update_campaign(
 ) -> CampaignOut:
     row = await own_campaign(db, tenant.id, campaign_id)
     for field, value in body.model_dump(exclude_unset=True).items():
-        if value is not None or field in ("price", "blurb"):  # price / blurb may be cleared with null
+        if value is not None or field in ("price", "blurb", "details"):  # these may be cleared with null
             setattr(row, field, value)
+    await db.commit()
+    await db.refresh(row)
+    return (await _out(db, tenant.id, [row]))[0]
+
+
+@router.post("/{campaign_id}/publish", response_model=CampaignOut)
+async def publish_post(
+    campaign_id: uuid.UUID, body: PublishIn, tenant: CurrentTenant, db: Annotated[AsyncSession, Depends(get_db)]
+) -> CampaignOut:
+    """Post one of the campaign's photos to the shop's Instagram feed and keep the post id, so the ad the
+    owner makes by boosting that post can be traced back to this campaign."""
+    row = await own_campaign(db, tenant.id, campaign_id)
+    media = (
+        await db.execute(select(ShopMedia).where(ShopMedia.id == body.media_id, ShopMedia.tenant_id == tenant.id))
+    ).scalar_one_or_none()
+    if media is None or media.source != "upload":  # Instagram fetches the photo, so it must be on our public storage
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Pick a photo uploaded in Sanchar.")
+    account = (
+        await db.execute(
+            select(SocialAccount).where(
+                SocialAccount.tenant_id == tenant.id, SocialAccount.platform == "instagram",
+                SocialAccount.access_token_encrypted.isnot(None),
+            )
+        )
+    ).scalars().first()
+    if account is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Connect your Instagram account first.")
+    try:
+        post = await instagram.publish_image(
+            decrypt_token(account.access_token_encrypted), account.external_account_id, media.url, body.caption.strip()
+        )
+    except httpx.HTTPStatusError as exc:  # Meta says why (missing permission, bad image...): pass it on
+        why = (exc.response.json().get("error") or {}).get("message") if "json" in exc.response.headers.get("content-type", "") else None
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Instagram refused the post: {why or exc.response.status_code}. If it is about permission, "
+            "log in with Instagram again so Sanchar may post for you.",
+        )
+    except httpx.HTTPError:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Instagram is not responding. Try again.")
+    row.ig_post_id, row.ig_permalink = post["id"], post["permalink"]
+    media.campaign_id = row.id  # the posted photo belongs to the campaign
     await db.commit()
     await db.refresh(row)
     return (await _out(db, tenant.id, [row]))[0]

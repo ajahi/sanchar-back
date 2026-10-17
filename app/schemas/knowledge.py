@@ -1,22 +1,32 @@
 """Shop-context request/response schemas."""
+import uuid
+
 from pydantic import BaseModel, Field
 
 
-class SectionOut(BaseModel):
-    key: str
-    label: str
+class TopicOut(BaseModel):
+    id: uuid.UUID
+    title: str  # the owner's own topic name, e.g. "Courses", "Nail art prices"
+    content: str  # the answers the bot gives on this topic
+    hint: str = ""  # example text, kept from the starter suggestion it was added from
+
+
+class Suggestion(BaseModel):
+    title: str
     hint: str
-    content: str
 
 
 class KnowledgeOut(BaseModel):
-    sections: list[SectionOut]
+    topics: list[TopicOut]
+    suggestions: dict[str, list[Suggestion]]  # business type -> starter topics (one tap to add)
     ai_enabled: bool
     max_chars: int
 
 
-class SectionIn(BaseModel):
-    content: str = Field(max_length=30_000)
+class TopicIn(BaseModel):
+    title: str = Field(min_length=1, max_length=255)
+    content: str = Field(default="", max_length=30_000)
+    hint: str = Field(default="", max_length=500)
 
 
 class TestIn(BaseModel):

@@ -144,3 +144,53 @@ async def _run(monkeypatch) -> None:
 
 def test_campaign_flow(monkeypatch) -> None:
     asyncio.run(_run(monkeypatch))
+
+
+async def _publish(monkeypatch) -> None:
+    import pytest
+    from fastapi import HTTPException
+
+    from app.api.v1 import campaigns as api
+    from app.schemas.campaign import PublishIn
+
+    posted: list[tuple] = []
+
+    async def fake_publish(token, account_id, url, caption):
+        posted.append((account_id, url, caption))
+        return {"id": "post-1", "permalink": "https://instagram.com/p/x"}
+
+    monkeypatch.setattr(api.instagram, "publish_image", fake_publish)
+    async with async_session_factory() as db:
+        db.commit = db.flush  # stay inside the rolled-back transaction
+        t = Tenant(name="Pub T")
+        db.add(t)
+        await db.flush()
+        camp = Campaign(tenant_id=t.id, name="Sharara", price=3350, details="Colours: maroon, navy")
+        photo = ShopMedia(tenant_id=t.id, source="upload", url="https://cdn/x.jpg")
+        ig_photo = ShopMedia(tenant_id=t.id, source="instagram", url="https://ig-cdn/y.jpg")
+        db.add_all([camp, photo, ig_photo])
+        await db.flush()
+
+        # no Instagram account yet -> refused
+        with pytest.raises(HTTPException) as e:
+            await api.publish_post(camp.id, PublishIn(media_id=photo.id, caption="hi"), t, db)
+        assert e.value.status_code == 409
+
+        db.add(SocialAccount(tenant_id=t.id, platform="instagram", external_account_id="ig-pub",
+                             access_token_encrypted=encrypt_token("tok")))
+        await db.flush()
+        # only photos on our storage can be posted (Instagram downloads them)
+        with pytest.raises(HTTPException) as e:
+            await api.publish_post(camp.id, PublishIn(media_id=ig_photo.id), t, db)
+        assert e.value.status_code == 422
+
+        out = await api.publish_post(camp.id, PublishIn(media_id=photo.id, caption="  New sharara!  "), t, db)
+        assert posted == [("ig-pub", "https://cdn/x.jpg", "New sharara!")]
+        assert (out.ig_post_id, out.ig_permalink, out.details) == ("post-1", "https://instagram.com/p/x", "Colours: maroon, navy")
+        assert photo.campaign_id == camp.id  # the posted photo joins the campaign
+        assert campaigns.campaign_context(camp).endswith("\nColours: maroon, navy")  # details reach the AI
+        await db.rollback()
+
+
+def test_publish_post(monkeypatch) -> None:
+    asyncio.run(_publish(monkeypatch))

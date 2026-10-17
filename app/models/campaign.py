@@ -23,6 +23,9 @@ class Campaign(UUIDPKMixin, TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     price: Mapped[Optional[int]] = mapped_column(Integer)  # whole rupees
     blurb: Mapped[Optional[str]] = mapped_column(Text)  # e.g. "pure chinnon silk fabric, comes with quality guarantee"
+    details: Mapped[Optional[str]] = mapped_column(Text)  # colours, sizes, stock...: the AI answers this chat's other questions from it
+    ig_post_id: Mapped[Optional[str]] = mapped_column(String(64))  # the Instagram post published for it from Sanchar
+    ig_permalink: Mapped[Optional[str]] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), server_default="active", nullable=False)  # active | paused
 
 

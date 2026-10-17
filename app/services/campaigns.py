@@ -128,8 +128,10 @@ def campaign_text(c: Campaign) -> str:
 
 
 def campaign_context(c: Campaign) -> str:
-    """One line for the AI prompt, so other questions in this chat are answered about this item."""
-    return f"{c.name}. {campaign_text(c)}".strip()
+    """The item for the AI prompt, so other questions in this chat (colours, sizes...) are answered about it."""
+    head = f"{c.name}. {campaign_text(c)}".strip()
+    details = (c.details or "").strip()
+    return f"{head}\n{details}" if details else head
 
 
 async def photos_for(db: AsyncSession, c: Campaign) -> list[ShopMedia]:
