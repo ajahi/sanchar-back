@@ -1,4 +1,4 @@
-"""Connected channel accounts: Instagram profile (instagram_business_basic), WhatsApp number."""
+"""Connected channel accounts: Instagram profile (instagram_business_basic), WhatsApp number, Facebook Page."""
 from datetime import datetime
 from typing import Optional
 
@@ -38,3 +38,23 @@ class WhatsAppLinkIn(BaseModel):
 
     phone_number_id: str = Field(pattern=r"^\d{5,30}$")
     waba_id: str = Field(pattern=r"^\d{5,30}$")
+
+
+class FacebookPageOut(BaseModel):
+    """One linked Facebook Page + the live checks the Channels page's PING shows."""
+
+    page_id: str
+    name: Optional[str] = None
+    subscribed_fields: Optional[list[str]] = None  # webhook fields Meta delivers; None = unknown, [] = none
+    last_webhook_at: Optional[datetime] = None  # when Meta last reached us for this Page
+    linked_instagram_id: Optional[str] = None  # the Instagram account Meta links to this Page, if any
+    instagram_verified: bool = False  # that Instagram account is connected to this same workspace
+    connected_at: datetime
+    live: bool  # False = Meta didn't answer (revoked/expired token…); only stored values shown
+
+
+class FacebookLinkIn(BaseModel):
+    """Channels page Connect form: the Page id and a Page access token (never a user token)."""
+
+    page_id: str = Field(pattern=r"^\d{5,30}$")
+    page_access_token: str = Field(min_length=20, max_length=1000)

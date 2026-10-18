@@ -28,10 +28,19 @@ class Settings(BaseSettings):
     # Must match a redirect URI registered in the Meta app dashboard, e.g.
     # https://<tunnel>/api/v1/social-accounts/instagram/callback
     instagram_redirect_uri: str = ""
-    instagram_scopes: str = "instagram_business_basic,instagram_business_manage_messages"
+    instagram_scopes: str = "instagram_business_basic,instagram_business_manage_messages,instagram_business_content_publish"
     oauth_state_expire_minutes: int = 10
+    # Overridable only so load tests can point the outbound DM/profile calls at a mock.
+    instagram_graph_base: str = "https://graph.instagram.com"
     # Any string you also paste into the Meta dashboard's webhook "Verify token" field
     instagram_webhook_verify_token: str = ""
+    # Same idea for Messenger (Meta app -> Webhooks -> Page). Pages webhooks are signed with META_APP_SECRET.
+    facebook_webhook_verify_token: str = ""
+    # Facebook Login (Connect Facebook button). The app secret is META_APP_SECRET. Redirect URI must be
+    # registered under Facebook Login -> Settings, e.g. https://<host>/api/v1/social-accounts/facebook/callback
+    facebook_app_id: str = ""
+    facebook_redirect_uri: str = ""
+    facebook_scopes: str = "pages_show_list,pages_messaging,pages_manage_metadata"
     meta_app_secret: str=""
 
     # WhatsApp Cloud API — read only by scripts/connect_whatsapp.py, which stores the token
@@ -47,6 +56,21 @@ class Settings(BaseSettings):
     cookie_secure: bool = False  # True in production (HTTPS); needed with SameSite=None
     cookie_samesite: str = "lax"  # "none" for cross-site frontend<->backend over HTTPS
 
+    # LLM for auto-replies (Groq's OpenAI-compatible API)
+    groq_api_key: str = ""
+    llm_model: str = "openai/gpt-oss-120b"
+    groq_url: str = "https://api.groq.com/openai/v1/chat/completions"  # overridable for load tests
+    # After a person replies in a chat, the bot stays quiet this long (refreshed by every reply of theirs).
+    human_pause_minutes: int = 10
+
+    # Object storage (MinIO / any S3) for admin-uploaded shop images. Empty keys = uploads disabled.
+    s3_endpoint: str = ""
+    s3_bucket: str = "sanchar"
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
+    s3_region: str = "us-east-1"
+    s3_public_base_url: str = ""  # e.g. https://minio.utsavupahar.com/sanchar
+
     # Outgoing mail (SMTP). Port 465 -> implicit TLS, anything else -> STARTTLS.
     # Empty mail_host = dev mode: the link is logged instead of sent.
     mail_host: str = ""
@@ -59,6 +83,10 @@ class Settings(BaseSettings):
 
     # App
     environment: str = "development"
+
+    @property
+    def facebook_configured(self) -> bool:
+        return bool(self.facebook_app_id and self.meta_app_secret and self.facebook_redirect_uri)
 
     @property
     def instagram_configured(self) -> bool:

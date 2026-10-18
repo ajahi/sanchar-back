@@ -41,6 +41,11 @@ class Conversation(UUIDPKMixin, TimestampMixin, Base):
 
     external_conversation_id: Mapped[Optional[str]] = mapped_column(String(255))
 
+    # The ad / ref link this chat arrived through (its campaign is looked up through the link).
+    campaign_link_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("campaign_links.id", ondelete="SET NULL")
+    )
+
     channel: Mapped[str] = mapped_column(String(30), nullable=False)
     status: Mapped[str] = mapped_column(String(30), server_default="open", nullable=False)
     mode: Mapped[str] = mapped_column(String(30), server_default="ai", nullable=False)

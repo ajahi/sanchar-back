@@ -1,6 +1,7 @@
 """Model registry — importing this module registers every table on Base.metadata."""
 from app.models.base import Base
 from app.models.assignment import ConversationAssignment
+from app.models.campaign import Campaign, CampaignLink
 from app.models.audit_log import AuditLog
 from app.models.conversation import Conversation
 from app.models.customer import Customer
@@ -10,6 +11,8 @@ from app.models.message import Message
 from app.models.notification import Notification
 from app.models.permission import Permission, role_permissions
 from app.models.role import Role, user_roles
+from app.models.sales_lead import SalesLead
+from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
 from app.models.user import User
@@ -29,6 +32,10 @@ __all__ = [
     "ConversationAssignment",
     "HandoverEvent",
     "KnowledgeDocument",
+    "ShopMedia",
+    "SalesLead",
+    "Campaign",
+    "CampaignLink",
     "AuditLog",
     "Notification",
 ]
