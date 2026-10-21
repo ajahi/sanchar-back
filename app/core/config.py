@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     # registered under Facebook Login -> Settings, e.g. https://<host>/api/v1/social-accounts/facebook/callback
     facebook_app_id: str = ""
     facebook_redirect_uri: str = ""
-    facebook_scopes: str = "pages_show_list,pages_messaging,pages_manage_metadata"
+    facebook_scopes: str = "pages_show_list,pages_messaging,pages_manage_metadata,pages_read_engagement"
     meta_app_secret: str=""
 
     # WhatsApp Cloud API — read only by scripts/connect_whatsapp.py, which stores the token
