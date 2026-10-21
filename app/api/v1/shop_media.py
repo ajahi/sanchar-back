@@ -32,6 +32,7 @@ router = APIRouter(prefix="/shop-media", tags=["shop-media"])
 IG_SHOWN = 9  # newest Instagram posts shown in the panel
 REFRESH_SECONDS = 900
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+IG_BAD_ASPECT_RATIO = 2207009  # Graph error_subcode: photo outside 3:4 … 1.91:1
 _last_sync: dict[uuid.UUID, float] = {}  # ponytail: per-process; with several workers each refreshes on its own
 
 
@@ -198,10 +199,17 @@ async def post_to_instagram(
         post = await instagram.publish_image(decrypt_token(account.access_token_encrypted), account.external_account_id, row.url, caption)
     except httpx.HTTPStatusError as exc:  # Meta says why (missing permission, bad image...): pass it on
         try:
-            why = exc.response.json()["error"]["message"]
+            error = exc.response.json()["error"]
+            why = error["message"]
         except (ValueError, KeyError, TypeError):
-            why = f"HTTP {exc.response.status_code}"
+            error, why = {}, f"HTTP {exc.response.status_code}"
         log.warning("instagram post failed for tenant %s: %s", tenant.id, exc.response.text[:300])
+        if error.get("error_subcode") == IG_BAD_ASPECT_RATIO:  # the photo's fault, not the server's
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Instagram only takes photos between 3:4 portrait and 1.91:1 landscape (square works). "
+                "Crop the photo and upload it again.",
+            )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Instagram refused the post: {why}. If it is about permission, log in with Instagram again.",

@@ -94,6 +94,15 @@ async def subscribe_page(access_token: str, page_id: str) -> None:
         resp.raise_for_status()
 
 
+async def unsubscribe_page(access_token: str, page_id: str) -> None:
+    """Stop Meta delivering this Page's webhooks to our app (undoes subscribe_page)."""
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
+        resp = await client.delete(
+            f"{GRAPH_BASE}/{API_VERSION}/{page_id}/subscribed_apps", headers=_auth(access_token)
+        )
+        resp.raise_for_status()
+
+
 async def fetch_subscribed_fields(access_token: str, page_id: str) -> list[str]:
     """Webhook fields Meta delivers for this Page to our app. Empty = no webhooks."""
     async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:

@@ -35,7 +35,7 @@ from app.core.security import (
     encrypt_token,
     set_session_cookie,
 )
-from app.core.tenant import CurrentTenant, CurrentUser
+from app.core.tenant import CurrentTenant, CurrentUser, require_role
 from app.db.session import async_session_factory, get_db
 from app.models.role import Role
 from app.models.social_account import SocialAccount
@@ -409,7 +409,11 @@ async def facebook_pages(
     accounts = (
         await db.execute(
             select(SocialAccount)
-            .where(SocialAccount.tenant_id == tenant.id, SocialAccount.platform == "facebook")
+            .where(
+                SocialAccount.tenant_id == tenant.id,
+                SocialAccount.platform == "facebook",
+                SocialAccount.access_token_encrypted.isnot(None),  # no token = disconnected
+            )
             .order_by(SocialAccount.created_at)
         )
     ).scalars()
@@ -479,6 +483,67 @@ async def _audit_facebook(db: AsyncSession, tenant_id, actor_id, account_id, pag
     )
 
 
+async def _page_row(db: AsyncSession, page_id: str, tenant_id) -> Optional[SocialAccount]:
+    """This Page's row for (re)linking to `tenant_id`, None if it was never linked. Reusing the row keeps
+    the Page's old chats attached. A Page another workspace has disconnected is released to this one (its
+    chats there stay, read-only); one still connected elsewhere raises PermissionError."""
+    account = (
+        await db.execute(
+            select(SocialAccount).where(
+                SocialAccount.platform == "facebook", SocialAccount.external_account_id == page_id
+            )
+        )
+    ).scalar_one_or_none()
+    if account is None or account.tenant_id == tenant_id:
+        return account
+    if account.access_token_encrypted:
+        raise PermissionError(page_id)
+    await db.delete(account)
+    await db.flush()
+    return None
+
+
+@router.delete(
+    "/facebook/{page_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_role("owner", "admin"))],
+)
+async def unlink_facebook(
+    page_id: str, tenant: CurrentTenant, user: CurrentUser, db: Annotated[AsyncSession, Depends(get_db)]
+) -> None:
+    """Channels → Disconnect: Meta stops sending this Page's messages and its token is dropped. The row
+    and its chats stay (read-only), so connecting the same Page again brings its history back."""
+    account = (
+        await db.execute(
+            select(SocialAccount).where(
+                SocialAccount.tenant_id == tenant.id,
+                SocialAccount.platform == "facebook",
+                SocialAccount.external_account_id == page_id,
+                SocialAccount.access_token_encrypted.isnot(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if account is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This Page is not connected.")
+    try:
+        await facebook.unsubscribe_page(decrypt_token(account.access_token_encrypted), page_id)
+    except httpx.HTTPError as exc:  # e.g. token already revoked; the webhook drops events for a tokenless Page anyway
+        body = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
+        logging.getLogger(__name__).warning("facebook unsubscribe failed for %s: %r %s", page_id, exc, body)
+    account.access_token_encrypted = None
+    account.status = "disconnected"
+    await record_audit(
+        db,
+        tenant_id=tenant.id,
+        actor_id=user.id,
+        action="facebook_account_disconnected",
+        entity_type="social_account",
+        entity_id=account.id,
+        meta={"page_id": page_id},
+    )
+    await db.commit()
+
+
 @router.get("/facebook/login")
 async def facebook_login(request: Request) -> RedirectResponse:
     """Connect Facebook button: send the logged-in admin to Facebook's consent screen, where they
@@ -531,14 +596,9 @@ async def facebook_callback(
         page_id, token = page.get("id"), page.get("access_token")
         if not page_id or not token:
             continue
-        account = (
-            await db.execute(
-                select(SocialAccount).where(
-                    SocialAccount.platform == "facebook", SocialAccount.external_account_id == page_id
-                )
-            )
-        ).scalar_one_or_none()
-        if account is not None and account.tenant_id != user.tenant_id:
+        try:
+            account = await _page_row(db, page_id, user.tenant_id)
+        except PermissionError:
             log.warning("facebook page %s already linked to another tenant; skipped", page_id)
             continue
         try:
@@ -555,7 +615,7 @@ async def facebook_callback(
         if account is None:
             account = SocialAccount(tenant_id=user.tenant_id, platform="facebook", external_account_id=page_id)
             db.add(account)
-        account.access_token_encrypted = encrypt_token(token)
+        account.access_token_encrypted, account.status = encrypt_token(token), "active"
         account.account_name = page.get("name")
         account.meta = {**(account.meta or {}), "linked_instagram_id": ig_id}
         await db.flush()
@@ -597,15 +657,9 @@ async def link_facebook(
             detail=f"That token is not a Page access token for Page {body.page_id}.",
         )
 
-    account = (
-        await db.execute(
-            select(SocialAccount).where(
-                SocialAccount.platform == "facebook",
-                SocialAccount.external_account_id == body.page_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if account is not None and account.tenant_id != tenant.id:
+    try:
+        account = await _page_row(db, body.page_id, tenant.id)
+    except PermissionError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This Facebook Page is already linked to another workspace.",
@@ -632,7 +686,7 @@ async def link_facebook(
     if account is None:
         account = SocialAccount(tenant_id=tenant.id, platform="facebook", external_account_id=body.page_id)
         db.add(account)
-    account.access_token_encrypted = encrypt_token(token)
+    account.access_token_encrypted, account.status = encrypt_token(token), "active"
     account.account_name = page.get("name")
     account.meta = {**(account.meta or {}), "linked_instagram_id": ig_id}
     await db.flush()
