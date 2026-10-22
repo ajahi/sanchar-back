@@ -40,6 +40,12 @@ class WhatsAppLinkIn(BaseModel):
     waba_id: str = Field(pattern=r"^\d{5,30}$")
 
 
+class WhatsAppSignupIn(BaseModel):
+    """Connect WhatsApp button: the one-time code Meta's Embedded Signup popup hands the browser."""
+
+    code: str = Field(min_length=10, max_length=2000)
+
+
 class FacebookPageOut(BaseModel):
     """One linked Facebook Page + the live checks the Channels page's PING shows."""
 

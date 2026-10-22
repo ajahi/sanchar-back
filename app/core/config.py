@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     # (encrypted) on the tenant's social_accounts row. System User token, doesn't expire.
     waba_token: str = ""
     waba_phone_number_id: str = ""
+    # Connect WhatsApp button (Embedded Signup): App → Facebook Login for Business → Configurations →
+    # the "WhatsApp Embedded Signup" one's id. Empty = only the link-by-id form.
+    whatsapp_config_id: str = ""
 
     # Where the callback sends the browser after a successful connect/login
     frontend_url: str = "http://localhost:3000"

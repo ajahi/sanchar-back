@@ -48,6 +48,12 @@ async def _token_call(params: dict) -> str:
         return resp.json()["access_token"]
 
 
+async def exchange_popup_code(code: str) -> str:
+    """A code from the JS SDK popup (no redirect_uri) -> its token. For Embedded Signup that is the
+    business's own system-user token, which doesn't expire."""
+    return await _token_call({"code": code})
+
+
 async def exchange_code_for_long_lived_token(code: str) -> str:
     """code -> short-lived user token -> ~60-day user token. Page tokens derived from a long-lived
     user token do not expire."""

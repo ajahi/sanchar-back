@@ -12,6 +12,7 @@ Incoming traffic is tracked two ways (kept simple): the source/referrer uri is s
 social_accounts.metadata, and every attempt is logged to audit_logs (uri, ip, user-agent).
 """
 import logging
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
@@ -47,6 +48,7 @@ from app.schemas.social_account import (
     InstagramProfileOut,
     WhatsAppAccountOut,
     WhatsAppLinkIn,
+    WhatsAppSignupIn,
 )
 from app.services.audit import record_audit
 from app.api.v1.webhooks import backfill_recent_conversations
@@ -341,20 +343,6 @@ async def link_whatsapp(
             detail=f"Phone number ID {body.phone_number_id} is not on WhatsApp account {body.waba_id}.",
         )
 
-    account = (
-        await db.execute(
-            select(SocialAccount).where(
-                SocialAccount.platform == "whatsapp",
-                SocialAccount.external_account_id == body.phone_number_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if account is not None and account.tenant_id != tenant.id:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This WhatsApp number is already linked to another workspace.",
-        )
-
     try:
         await whatsapp.subscribe_app(token, body.waba_id)
     except httpx.HTTPError as exc:
@@ -365,38 +353,137 @@ async def link_whatsapp(
             detail="Couldn't subscribe the account to Sanchar's webhooks; try again.",
         )
 
+    account = await _save_whatsapp(db, tenant.id, user.id, token, body.waba_id, number)
     if account is None:
-        account = SocialAccount(
-            tenant_id=tenant.id, platform="whatsapp", external_account_id=body.phone_number_id
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This WhatsApp number is already linked to another workspace.",
         )
+    await db.commit()
+    await db.refresh(account)
+    return _whatsapp_out(account, number)
+
+
+async def _save_whatsapp(
+    db: AsyncSession, tenant_id, actor_id, token: str, waba_id: str, number: dict
+) -> Optional[SocialAccount]:
+    """Store one number of `waba_id` for this tenant (with the token that reaches it) and audit it.
+    None if another workspace already has it: a linked number is never moved."""
+    account = (
+        await db.execute(
+            select(SocialAccount).where(
+                SocialAccount.platform == "whatsapp", SocialAccount.external_account_id == number["id"]
+            )
+        )
+    ).scalar_one_or_none()
+    if account is not None and account.tenant_id != tenant_id:
+        return None
+    if account is None:
+        account = SocialAccount(tenant_id=tenant_id, platform="whatsapp", external_account_id=number["id"])
         db.add(account)
     account.access_token_encrypted = encrypt_token(token)
     account.account_name = number.get("verified_name") or number.get("display_phone_number")
     account.meta = {
         **(account.meta or {}),
-        "waba_id": body.waba_id,
+        "waba_id": waba_id,
         "display_phone_number": number.get("display_phone_number"),
     }
     await db.flush()
     await record_audit(
         db,
-        tenant_id=tenant.id,
-        actor_id=user.id,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
         action="whatsapp_account_connected",
         entity_type="social_account",
         entity_id=account.id,
-        meta={"phone_number_id": body.phone_number_id, "waba_id": body.waba_id},
+        meta={"phone_number_id": number["id"], "waba_id": waba_id},
     )
-    await db.commit()
-    await db.refresh(account)
+    return account
+
+
+def _whatsapp_out(account: SocialAccount, number: dict) -> WhatsAppAccountOut:
     return WhatsAppAccountOut(
         phone_number_id=account.external_account_id,
         display_phone_number=number.get("display_phone_number"),
         verified_name=number.get("verified_name"),
-        waba_id=body.waba_id,
+        status=number.get("status"),
+        waba_id=(account.meta or {}).get("waba_id"),
         connected_at=account.created_at,
         live=True,
     )
+
+
+@router.get("/whatsapp/signup-config")
+async def whatsapp_signup_config(tenant: CurrentTenant) -> dict:
+    """What the Connect WhatsApp button needs to open Meta's Embedded Signup popup."""
+    if not (settings.whatsapp_config_id and settings.facebook_app_id and settings.meta_app_secret):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="WhatsApp sign-up is not configured (WHATSAPP_CONFIG_ID / FACEBOOK_APP_ID / META_APP_SECRET).",
+        )
+    return {
+        "app_id": settings.facebook_app_id,
+        "config_id": settings.whatsapp_config_id,
+        "api_version": instagram.API_VERSION,
+    }
+
+
+@router.post(
+    "/whatsapp/signup",
+    response_model=list[WhatsAppAccountOut],
+    dependencies=[Depends(require_role("owner", "admin"))],
+)
+async def whatsapp_signup(
+    body: WhatsAppSignupIn,
+    tenant: CurrentTenant,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[WhatsAppAccountOut]:
+    """Connect WhatsApp button: Meta's Embedded Signup popup gives the browser a one-time code. It becomes
+    the business's own token, and every number on the WhatsApp accounts they granted is linked to this
+    tenant (link_whatsapp's steps, once per number), like Facebook Pages in facebook_callback."""
+    log = logging.getLogger(__name__)
+    try:
+        token = await facebook.exchange_popup_code(body.code)
+        wabas = await whatsapp.fetch_granted_wabas(token)
+    except (httpx.HTTPError, KeyError) as exc:
+        detail = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
+        log.error("whatsapp signup: code exchange failed: %r %s", exc, detail)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="Meta didn't accept the sign-up. Click Connect WhatsApp again."
+        )
+
+    out = []
+    for waba_id in wabas:
+        try:
+            numbers = await whatsapp.fetch_waba_phone_numbers(token, waba_id)
+            await whatsapp.subscribe_app(token, waba_id)
+        except httpx.HTTPError as exc:
+            detail = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
+            log.error("whatsapp signup: account %s skipped: %r %s", waba_id, exc, detail)
+            continue
+        for number in numbers:
+            account = await _save_whatsapp(db, tenant.id, user.id, token, waba_id, number)
+            if account is None:
+                log.warning("whatsapp number %s already linked to another tenant; skipped", number["id"])
+                continue
+            if number.get("status") != "CONNECTED":  # new to Cloud API: switch it on (the PIN is kept for re-registering)
+                pin = f"{secrets.randbelow(10**6):06d}"
+                try:
+                    await whatsapp.register_number(token, number["id"], pin)
+                    account.meta = {**account.meta, "pin_encrypted": encrypt_token(pin)}
+                except httpx.HTTPError as exc:  # e.g. the business already set its own PIN; Channels shows the status
+                    detail = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
+                    log.warning("whatsapp number %s not registered: %r %s", number["id"], exc, detail)
+            out.append((account, number))
+    await db.commit()
+    if not out:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No WhatsApp number could be linked. Pick a WhatsApp account with a phone number in the "
+            "sign-up window, or check it isn't connected to another Sanchar workspace.",
+        )
+    return [_whatsapp_out(account, number) for account, number in out]
 
 
 @router.get("/facebook", response_model=list[FacebookPageOut])
