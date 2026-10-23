@@ -2,13 +2,16 @@
 
 import logging
 
-from app.utils import global_exception_handler
+from app.utils.global_exception_handler import global_exception_handler
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     force=True,
 )
+# httpx logs every request URL at INFO. Two OAuth calls must carry secrets in the query string (Meta's API),
+# so keep those lines out of the logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 from typing import Annotated
 
