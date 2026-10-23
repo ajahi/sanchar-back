@@ -2,13 +2,16 @@
 //
 // What really hits the app is ONE request per DM: POST /webhooks/instagram. The customer/conversation/
 // message rows are DB writes inside that handler, and the AI reply + Graph send are the app's own
-// outbound calls (background task) -- so they are not requests this script sends. Mock them instead.
+// outbound calls (a background task, or a RabbitMQ reply worker) -- so they are not requests this script sends.
+// Mock them instead.
 //
-// Run (4 terminals, all from the repo root):
+// Easiest: `bash loadtest/run_linux.sh 10 50` does all of the below (LT_QUEUE=N adds RabbitMQ + N reply workers).
+// By hand (4 terminals, all from the repo root):
 //   1. python -m loadtest.mock_external                         # fake Graph + Groq, LLM_LATENCY=2 by default
 //   2. python -m loadtest.seed_tenants 20                       # 20 tenants -> loadtest/accounts.json
 //   3. start the app with:  INSTAGRAM_APP_SECRET=loadtest-secret  INSTAGRAM_GRAPH_BASE=http://localhost:9000
 //                           GROQ_URL=http://localhost:9000/chat/completions  (and a throwaway DATABASE_URL)
+//                           for queued replies also RABBITMQ_URL=... and `python -m app.worker` (same env)
 //   4. k6 run loadtest/webhook_burst.js                         # live view: K6_WEB_DASHBOARD=true k6 run ...
 // Then: python -m loadtest.verify    (the webhook answers 200 even when ingest fails, so k6 alone can't see losses)
 //

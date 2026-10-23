@@ -22,12 +22,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1 import api_router
 from app.db.session import get_db
-from app.services import http_client
+from app.services import http_client, reply_queue
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     http_client.start()
     yield
+    await reply_queue.stop()
     await http_client.stop()
 
 

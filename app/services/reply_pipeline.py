@@ -9,14 +9,17 @@ stays quiet; every human reply refreshes the window, and once they go idle the b
 "Human replied recently" is read from the stored messages (sender_type = 'agent'), so there is no
 mode to flip back and nothing to lose on a restart.
 
-ponytail: FastAPI BackgroundTasks, so a server restart loses in-flight replies; move to a jobs table
-+ worker if that ever matters.
+With RABBITMQ_URL set, the webhook publishes the message id to RabbitMQ (reply_queue) and the worker
+(app/worker.py) runs process_reply_job; without it, or if the broker is down, it falls back to the
+in-process background task, which loses in-flight replies on a restart.
 """
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import exists, select
+from sqlalchemy.orm import aliased
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -67,8 +70,22 @@ async def human_active(db: AsyncSession, conversation_id) -> bool:
     return found.first() is not None
 
 
+_KNOWLEDGE: dict = {}  # tenant_id -> (expires_at, text); per process, so an edit shows up within the TTL
+
+
 async def build_knowledge(db: AsyncSession, tenant_id) -> str:
-    """The tenant's whole shop context as one text block (the CAG context). Tenant-scoped, always."""
+    """The tenant's whole shop context as one text block (the CAG context). Tenant-scoped, always.
+    Cached KNOWLEDGE_CACHE_SECONDS per process (0 = off): it is the same for every reply of a tenant."""
+    hit = _KNOWLEDGE.get(tenant_id)
+    if hit and hit[0] > time.monotonic():
+        return hit[1]
+    text = await _load_knowledge(db, tenant_id)
+    if settings.knowledge_cache_seconds:
+        _KNOWLEDGE[tenant_id] = (time.monotonic() + settings.knowledge_cache_seconds, text)
+    return text
+
+
+async def _load_knowledge(db: AsyncSession, tenant_id) -> str:
     docs = (
         await db.execute(
             select(KnowledgeDocument)
@@ -225,11 +242,28 @@ async def hand_over_photo(db: AsyncSession, convo, tenant, account, customer) ->
     await _store_ai_message(db, convo, sent, PHOTO_HOLDING_REPLY)
 
 
-async def auto_reply(db: AsyncSession, message_id) -> None:
+async def auto_reply(db: AsyncSession, message_id, *, queued: bool = False) -> None:
+    """queued=True is the RabbitMQ worker: also drop a job that is too old or no longer needed, and let an
+    LLM failure raise so the broker retries (nothing has been sent at that point)."""
     # One joined query, not five db.get round-trips (each costs ~0.5ms of CPU, and this runs per message).
+    # The "is a person handling this chat" check rides along, and so do the queue's drop checks.
+    later = aliased(Message)
+    after = (later.conversation_id == Message.conversation_id, later.created_at > Message.created_at)
+    pause = datetime.now(timezone.utc) - timedelta(minutes=settings.human_pause_minutes)
+    human = exists().where(
+        later.conversation_id == Message.conversation_id, later.sender_type == "agent", later.created_at > pause
+    )
+    extra = (
+        [
+            exists().where(*after, later.sender_type.in_(("ai", "agent"))),
+            exists().where(*after, later.sender_type == "customer"),
+        ]
+        if queued
+        else []
+    )
     row = (
         await db.execute(
-            select(Message, Conversation, Tenant, SocialAccount, Customer)
+            select(Message, Conversation, Tenant, SocialAccount, Customer, human, *extra)
             .join(Conversation, Conversation.id == Message.conversation_id)
             .join(Tenant, Tenant.id == Conversation.tenant_id)
             .outerjoin(SocialAccount, SocialAccount.id == Conversation.social_account_id)
@@ -239,7 +273,10 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     ).first()
     if row is None:
         return
-    msg, convo, tenant, account, customer = row
+    msg, convo, tenant, account, customer, person_handling, *flags = row
+    if queued and (why := stale_reason(msg.created_at, *flags)):
+        log.info("reply job for message %s dropped: %s", message_id, why)
+        return
     if msg.sender_type != "customer":
         return
     is_photo = msg.message_type == "image"
@@ -248,7 +285,7 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
 
     # A photo is flagged for a person even when AI replies are off (nobody else will mark it).
     if is_photo:
-        if customer is None or await human_active(db, convo.id):
+        if customer is None or person_handling:
             return
         await hand_over_photo(db, convo, tenant, account, customer)
         return
@@ -256,7 +293,7 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     if not tenant.ai_auto_reply:
         log.info("auto-reply skipped: AI is off for tenant %s", tenant.id)
         return
-    if await human_active(db, convo.id):
+    if person_handling:
         log.info("auto-reply skipped: a person is handling conversation %s", convo.id)
         return
     if account is None or not account.access_token_encrypted or customer is None:
@@ -275,7 +312,7 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
 
     prior = (
         await db.execute(
-            select(Message)
+            select(Message.sender_type, Message.content)  # two columns, not six whole rows
             .where(
                 Message.conversation_id == convo.id,
                 Message.id != msg.id,
@@ -285,8 +322,8 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
             .order_by(Message.created_at.desc())
             .limit(HISTORY)
         )
-    ).scalars()
-    history = [("customer" if m.sender_type == "customer" else "assistant", m.content) for m in reversed(list(prior))]
+    ).all()
+    history = [("customer" if sender == "customer" else "assistant", text) for sender, text in reversed(prior)]
 
     # Everything needed is in memory now. Commit hands the DB connection back to the pool (the loaded
     # rows stay usable: expire_on_commit=False) so the 1-3s LLM call below does not hold one.
@@ -297,6 +334,8 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
         )
     except Exception:  # noqa: BLE001 — stay quiet rather than send something wrong; a person can answer
         log.exception("LLM failed for conversation %s", convo.id)
+        if queued:  # nothing was sent yet, so the queue can safely redeliver
+            raise
         return
     if not reply:
         return
@@ -330,3 +369,22 @@ async def run_auto_reply(message_id) -> None:
             await db.commit()
     except Exception:  # noqa: BLE001
         log_failure(log, "auto-reply failed for message %s", message_id)
+
+
+def stale_reason(created_at: datetime, answered: bool, superseded: bool) -> str | None:
+    """Why a queued job should not reply any more (None = go ahead). A job can wait out an outage or be
+    redelivered after the reply was sent, and a late or doubled DM is worse than none."""
+    if created_at < datetime.now(timezone.utc) - timedelta(minutes=settings.reply_max_age_minutes):
+        return "older than the reply cutoff"
+    if answered:
+        return "already answered"
+    if superseded:
+        return "a newer message in the chat will be answered instead"  # its history includes this one
+    return None
+
+
+async def process_reply_job(message_id) -> None:
+    """Queue-worker entry: own session; raises on failure so the worker can retry."""
+    async with async_session_factory() as db:
+        await auto_reply(db, message_id, queued=True)
+        await db.commit()
