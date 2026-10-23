@@ -13,6 +13,7 @@ import httpx
 
 from app.core.config import settings
 
+from app.services import http_client
 from app.services.http_client import SSL_CTX
 from app.services.meta.instagram import API_VERSION
 
@@ -141,12 +142,9 @@ async def _send(access_token: str, page_id: str, recipient_psid: str, message: d
     # RESPONSE = a reply inside the 24h window after the customer's last message; outside it Meta
     # answers 400 (code 10 / subcode 2018278), which the inbox surfaces as a 502 with Meta's text.
     body = {"recipient": {"id": recipient_psid}, "messaging_type": "RESPONSE", "message": message}
-    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
-        resp = await client.post(
-            f"{GRAPH_BASE}/{API_VERSION}/{page_id}/messages", json=body, headers=_auth(access_token)
-        )
-        resp.raise_for_status()
-        return resp.json()
+    return await http_client.request_json(
+        "POST", f"{GRAPH_BASE}/{API_VERSION}/{page_id}/messages", json=body, headers=_auth(access_token)
+    )
 
 
 async def send_text(access_token: str, page_id: str, recipient_psid: str, text: str) -> dict:
@@ -191,12 +189,9 @@ async def fetch_recent_conversations(access_token: str, limit: int = 5) -> list[
 async def fetch_customer_profile(access_token: str, psid: str) -> dict:
     """Best-effort {name} of a Messenger user (no username on Messenger); {} on any failure."""
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
-            resp = await client.get(
-                f"{GRAPH_BASE}/{API_VERSION}/{psid}", params={"fields": "name"}, headers=_auth(access_token)
-            )
-            resp.raise_for_status()
-            return resp.json()
+        return await http_client.request_json(
+            "GET", f"{GRAPH_BASE}/{API_VERSION}/{psid}", params={"fields": "name"}, headers=_auth(access_token)
+        )
     except httpx.HTTPError as exc:
         body = exc.response.text if isinstance(exc, httpx.HTTPStatusError) else str(exc)
         log.warning("facebook profile fetch failed for psid=%s: %s", psid, body)

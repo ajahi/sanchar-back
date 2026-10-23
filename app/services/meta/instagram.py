@@ -16,6 +16,7 @@ from urllib.parse import urlencode
 import httpx
 
 from app.core.config import settings
+from app.services import http_client
 from app.services.http_client import SSL_CTX
 
 log = logging.getLogger(__name__)
@@ -130,14 +131,9 @@ async def subscribe_to_messages(access_token: str) -> None:
 async def send_text(access_token: str, ig_account_id: str, recipient_igsid: str, text: str) -> dict:
     """Send a text DM from the business account. Returns {recipient_id, message_id}."""
     body = {"recipient": {"id": recipient_igsid}, "message": {"text": text}}
-    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
-        resp = await client.post(
-            f"{GRAPH_BASE}/{API_VERSION}/{ig_account_id}/messages",
-            json=body,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        resp.raise_for_status()
-        return resp.json()
+    return await http_client.request_json(
+        "POST", f"{GRAPH_BASE}/{API_VERSION}/{ig_account_id}/messages", json=body, headers=_bearer(access_token)
+    )
 
 
 async def send_image(access_token: str, ig_account_id: str, recipient_igsid: str, image_url: str) -> dict:
@@ -146,14 +142,9 @@ async def send_image(access_token: str, ig_account_id: str, recipient_igsid: str
         "recipient": {"id": recipient_igsid},
         "message": {"attachment": {"type": "image", "payload": {"url": image_url}}},
     }
-    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
-        resp = await client.post(
-            f"{GRAPH_BASE}/{API_VERSION}/{ig_account_id}/messages",
-            json=body,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        resp.raise_for_status()
-        return resp.json()
+    return await http_client.request_json(
+        "POST", f"{GRAPH_BASE}/{API_VERSION}/{ig_account_id}/messages", json=body, headers=_bearer(access_token)
+    )
 
 
 # ---- Publishing (instagram_business_content_publish) ----
@@ -228,12 +219,9 @@ async def fetch_customer_profile(access_token: str, igsid: str) -> dict:
     """Best-effort {name, username} of a messaging participant; {} on any failure."""
     params = {"fields": "name,username"}
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
-            resp = await client.get(
-                f"{GRAPH_BASE}/{API_VERSION}/{igsid}", params=params, headers=_bearer(access_token)
-            )
-            resp.raise_for_status()
-            return resp.json()
+        return await http_client.request_json(
+            "GET", f"{GRAPH_BASE}/{API_VERSION}/{igsid}", params=params, headers=_bearer(access_token)
+        )
     except httpx.HTTPError as exc:
         body = exc.response.text if isinstance(exc, httpx.HTTPStatusError) else str(exc)
         log.warning("instagram profile fetch failed for igsid=%s: %s", igsid, body)

@@ -9,9 +9,7 @@ needs retrieval (pgvector), not a bigger prompt.
 import asyncio
 import logging
 
-import httpx
-
-from app.services.http_client import SSL_CTX
+from app.services import http_client
 
 from app.core.config import settings
 
@@ -51,8 +49,9 @@ def build_system_prompt(knowledge: str, campaign: str = "") -> str:
 
 
 async def _chat(messages: list[dict]) -> str:
-    async with _LLM_SLOTS, httpx.AsyncClient(timeout=30, verify=SSL_CTX) as client:
-        res = await client.post(
+    async with _LLM_SLOTS:
+        body = await http_client.request_json(
+            "POST",
             GROQ_URL,
             headers={"Authorization": f"Bearer {settings.groq_api_key}"},
             json={
@@ -62,9 +61,8 @@ async def _chat(messages: list[dict]) -> str:
                 "max_completion_tokens": 600,
                 "reasoning_effort": "low",  # gpt-oss: skip long hidden reasoning, latency matters in chat
             },
+            timeout=30,
         )
-    res.raise_for_status()
-    body = res.json()
     log.info("LLM reply: %s tokens", (body.get("usage") or {}).get("total_tokens"))
     return body["choices"][0]["message"]["content"].strip()
 

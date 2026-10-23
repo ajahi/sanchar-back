@@ -13,6 +13,7 @@ logging.basicConfig(
 # so keep those lines out of the logs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, FastAPI
@@ -21,8 +22,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1 import api_router
 from app.db.session import get_db
+from app.services import http_client
 
-app = FastAPI(title="NepSocial Backend", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    http_client.start()
+    yield
+    await http_client.stop()
+
+
+app = FastAPI(title="NepSocial Backend", version="0.1.0", lifespan=lifespan)
 
 app.add_exception_handler(Exception, global_exception_handler)
 app.include_router(api_router)

@@ -8,6 +8,7 @@ Inbound messages arrive on the shared Meta webhook (webhooks.py).
 import httpx
 
 from app.core.config import settings
+from app.services import http_client
 from app.services.http_client import SSL_CTX
 from app.services.meta.instagram import API_VERSION
 
@@ -104,14 +105,13 @@ async def fetch_subscribed_apps(access_token: str, waba_id: str) -> list[str]:
 async def send_image(access_token: str, phone_number_id: str, to_wa_id: str, image_url: str) -> dict:
     """Send an image by public link (Meta fetches it). Returns {message_id}. Same 24h window as text."""
     body = {"messaging_product": "whatsapp", "to": to_wa_id, "type": "image", "image": {"link": image_url}}
-    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
-        resp = await client.post(
-            f"{GRAPH_BASE}/{API_VERSION}/{phone_number_id}/messages",
-            json=body,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        resp.raise_for_status()
-        return {"message_id": resp.json()["messages"][0]["id"]}
+    sent = await http_client.request_json(
+        "POST",
+        f"{GRAPH_BASE}/{API_VERSION}/{phone_number_id}/messages",
+        json=body,
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    return {"message_id": sent["messages"][0]["id"]}
 
 
 async def send_text(access_token: str, phone_number_id: str, to_wa_id: str, text: str) -> dict:
@@ -121,11 +121,10 @@ async def send_text(access_token: str, phone_number_id: str, to_wa_id: str, text
     answers 200; the failure (code 131047) arrives later as a `statuses` webhook.
     """
     body = {"messaging_product": "whatsapp", "to": to_wa_id, "type": "text", "text": {"body": text}}
-    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
-        resp = await client.post(
-            f"{GRAPH_BASE}/{API_VERSION}/{phone_number_id}/messages",
-            json=body,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        resp.raise_for_status()
-        return {"message_id": resp.json()["messages"][0]["id"]}
+    sent = await http_client.request_json(
+        "POST",
+        f"{GRAPH_BASE}/{API_VERSION}/{phone_number_id}/messages",
+        json=body,
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    return {"message_id": sent["messages"][0]["id"]}
