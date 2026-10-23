@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     # After a person replies in a chat, the bot stays quiet this long (refreshed by every reply of theirs).
     human_pause_minutes: int = 10
 
+    # How long a webhook handler may reuse a looked-up social account before re-reading it (seconds, 0 = never).
+    account_cache_seconds: int = 30
+
     # Object storage (MinIO / any S3) for admin-uploaded shop images. Empty keys = uploads disabled.
     s3_endpoint: str = ""
     s3_bucket: str = "sanchar"

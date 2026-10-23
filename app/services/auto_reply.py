@@ -6,6 +6,7 @@ per-message part (history + question) last, so provider prompt caching can reuse
 ponytail: shop context is one text blob per tenant (~30K chars max); a tenant that outgrows that
 needs retrieval (pgvector), not a bigger prompt.
 """
+import asyncio
 import logging
 
 import httpx
@@ -17,6 +18,9 @@ from app.core.config import settings
 log = logging.getLogger(__name__)
 
 GROQ_URL = settings.groq_url
+# At most this many model calls in flight per process; the rest wait here holding no DB connection.
+# ponytail: fixed cap, tune to the Groq plan's rate limit (or make it a setting) if replies queue too long.
+_LLM_SLOTS = asyncio.Semaphore(20)
 
 SYSTEM_TEMPLATE = """You are the chat assistant for the shop described in SHOP INFORMATION below, replying to customers on Instagram, Facebook Messenger or WhatsApp.
 
@@ -47,7 +51,7 @@ def build_system_prompt(knowledge: str, campaign: str = "") -> str:
 
 
 async def _chat(messages: list[dict]) -> str:
-    async with httpx.AsyncClient(timeout=30, verify=SSL_CTX) as client:
+    async with _LLM_SLOTS, httpx.AsyncClient(timeout=30, verify=SSL_CTX) as client:
         res = await client.post(
             GROQ_URL,
             headers={"Authorization": f"Bearer {settings.groq_api_key}"},

@@ -9,7 +9,12 @@ from sqlalchemy.ext.asyncio import (
 
 from app.core.config import settings
 
-engine = create_async_engine(settings.database_url, pool_pre_ping=True, future=True)
+# pool_size connections are kept open; only the overflow beyond them is opened and closed per use, and a new
+# asyncpg connection costs a TCP + auth handshake (~8% of CPU in the load-test profile with the old 5 + 10).
+# Per process: with N workers keep N * (pool_size + max_overflow) under Postgres max_connections (100).
+engine = create_async_engine(
+    settings.database_url, pool_pre_ping=True, future=True, pool_size=15, max_overflow=5
+)
 
 async_session_factory = async_sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False
