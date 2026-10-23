@@ -6,11 +6,53 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-nepsocial}:${POSTGRES_PASSWORD:-nepsocial}@postgres:5432/${POSTGRES_DB:-nepsocial}
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-nepsocial}:${RABBITMQ_PASSWORD:-nepsocial}@rabbitmq:5672/
     ports:
       - "8005:8000"
     depends_on:
       postgres:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - nepsocial
+
+  # Sends the auto-replies the api queues. Scale with `docker compose up -d --scale worker=N`.
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    env_file: .env
+    environment:
+      DB_POOL_PRE_PING: "false"  # a dead pooled connection only fails one job, which the queue retries
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-nepsocial}:${POSTGRES_PASSWORD:-nepsocial}@postgres:5432/${POSTGRES_DB:-nepsocial}
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-nepsocial}:${RABBITMQ_PASSWORD:-nepsocial}@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - nepsocial
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: nepsocial-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-nepsocial}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-nepsocial}
+    ports:
+      - "5672:5672"    # AMQP, for an app or worker run on the host (RABBITMQ_URL=amqp://...@localhost:5672/)
+      - "15672:15672"  # management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      # gosu: a root healthcheck that runs before the server has made its erlang cookie leaves it root-owned and the broker dies
+      test: ["CMD", "gosu", "rabbitmq", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
     networks:
       - nepsocial
 
@@ -45,9 +87,9 @@ services:
 
 volumes:
   postgres_data:
+  rabbitmq_data:
 
 # Named so the frontend compose (next-app) can join it as `external`.
 networks:
   nepsocial:
-    external: true
   

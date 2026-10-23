@@ -71,6 +71,20 @@ class Settings(BaseSettings):
     # After a person replies in a chat, the bot stays quiet this long (refreshed by every reply of theirs).
     human_pause_minutes: int = 10
 
+    # Test each pooled connection with a round trip before use. The reply worker turns it off (DB_POOL_PRE_PING=false):
+    # it costs ~2ms of CPU per reply, and a dead connection there just fails one job, which the queue retries.
+    db_pool_pre_ping: bool = True
+
+    # RabbitMQ for the reply queue (e.g. amqp://guest:guest@localhost:5672/). Empty = replies run in-process.
+    rabbitmq_url: str = ""
+    reply_max_age_minutes: int = 10  # a queued reply older than this is dropped, not sent late
+    reply_concurrency: int = 20  # model calls in flight per process, and jobs a reply worker takes at once
+    reply_retry_seconds: int = 30  # wait before a failed job is tried again (3 tries, then replies.dead)
+
+    # How long a process reuses a tenant's shop-knowledge text before re-reading it (0 = never). An edit or a
+    # sold-out toggle reaches the bot within this long.
+    knowledge_cache_seconds: int = 30
+
     # How long a webhook handler may reuse a looked-up social account before re-reading it (seconds, 0 = never).
     account_cache_seconds: int = 30
 

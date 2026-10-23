@@ -53,6 +53,7 @@ from app.services.meta import CHANNELS, instagram
 from app.services.campaigns import apply_referral, referral_of
 from app.services.leads import capture_lead
 from app.services.notifications import create_notification
+from app.services import reply_queue
 from app.services.reply_pipeline import run_auto_reply
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
@@ -756,6 +757,7 @@ async def receive(
         bg.add_task(fill_customer_profile, *job)
     for (
         message_id
-    ) in to_reply.values():  # after the commit: the task reads the stored rows
-        bg.add_task(run_auto_reply, message_id)
+    ) in to_reply.values():  # after the commit: the job reads the stored rows
+        if not await reply_queue.publish(message_id):  # no broker configured, or it is down
+            bg.add_task(run_auto_reply, message_id)
     return {"status": "ok"}
