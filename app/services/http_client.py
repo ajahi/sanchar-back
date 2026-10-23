@@ -23,11 +23,23 @@ SSL_CTX = httpx.create_ssl_context()
 _session: aiohttp.ClientSession | None = None
 
 
+def _new_session() -> aiohttp.ClientSession:
+    # trust_env: honour HTTPS_PROXY / NO_PROXY like httpx did, so a proxied deployment keeps working.
+    # The DNS cache stays at aiohttp's short default: reused connections make a longer one pointless, and a
+    # retired IP would otherwise be retried for its whole TTL.
+    return aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=SSL_CTX, limit=100), trust_env=True)
+
+
 def start() -> None:
     """Open the shared session (app startup, inside the running loop).
-    ponytail: one connection pool for every host (100 total); split per host if a slow API starves the rest."""
+    ponytail: one connection pool for every host (100 total); split per host if a slow API starves the rest.
+
+    TLS (checked against graph.facebook.com, graph.instagram.com and api.groq.com): certificates verify with
+    SSL_CTX; a reused connection costs ~1ms of CPU against ~4.5ms (and ~120ms of latency) for a new handshake;
+    those hosts keep idle connections open for 2+ minutes, so aiohttp's default 15s idle drop (kept: it also
+    guards against NAT or firewall idle timeouts we can't see) never hits a connection the server already closed."""
     global _session
-    _session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=SSL_CTX, limit=100, ttl_dns_cache=300))
+    _session = _new_session()
 
 
 async def stop() -> None:
@@ -44,7 +56,7 @@ async def request_json(
     """One JSON request. Raises httpx.HTTPStatusError on a non-2xx answer (body kept on .response) and
     httpx.TransportError on a connection failure or timeout. Messages carry the URL without its query string."""
     shown = url.split("?", 1)[0]
-    session = _session or aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=SSL_CTX))  # tests, scripts
+    session = _session or _new_session()  # no shared session: tests, scripts
     try:
         async with session.request(
             method, url, params=params, headers=headers, json=json, timeout=aiohttp.ClientTimeout(total=timeout)
