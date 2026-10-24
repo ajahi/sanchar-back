@@ -15,18 +15,33 @@ The flow for one inbound message (ingest_event):
   4. insert the message                 linked to the conversation, idempotent on mid
   5. bump last_message_at (dashboard sort) + notify admins if the thread is brand new
 """
+
+import asyncio
 import json
 import logging
+import time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    status,
+)
 from fastapi.responses import PlainTextResponse
+from pydantic_core import from_json
 from sqlalchemy import case, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.log import log_failure
 from app.core.security import decrypt_token
 from app.db.session import async_session_factory, get_db
 from app.models.conversation import Conversation
@@ -51,14 +66,62 @@ async def verify(
     hub_token: Annotated[str, Query(alias="hub.verify_token")] = "",
     hub_challenge: Annotated[str, Query(alias="hub.challenge")] = "",
 ) -> str:
-    tokens = {settings.instagram_webhook_verify_token, settings.facebook_webhook_verify_token} - {""}
+    tokens = {
+        settings.instagram_webhook_verify_token,
+        settings.facebook_webhook_verify_token,
+    } - {""}
     if hub_mode != "subscribe" or hub_token not in tokens:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bad verify token")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Bad verify token"
+        )
     return hub_challenge
 
 
+# --- the connected account an event is for ---------------------------------
+@dataclass(frozen=True)
+class _Account:
+    """The SocialAccount fields ingest reads, detached from any session so it can be cached."""
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    platform: str
+    external_account_id: str
+    access_token_encrypted: str | None
+
+
+# ponytail: per-process dict with a short TTL (settings.account_cache_seconds, 0 = off). The row is read on
+# every webhook event and almost never changes; the price is that a disconnect, a token swap or a deleted
+# account takes up to the TTL to show here. Each worker has its own copy. Few accounts, so no size bound.
+_account_cache: dict[tuple[str, str], tuple[float, _Account]] = {}
+
+
+async def _find_account(db: AsyncSession, platform: str, external_id: str) -> _Account | None:
+    ttl = settings.account_cache_seconds
+    hit = _account_cache.get((platform, external_id)) if ttl else None
+    if hit and hit[0] > time.monotonic():
+        return hit[1]
+    row = (
+        await db.execute(
+            select(SocialAccount).where(
+                SocialAccount.platform == platform,
+                SocialAccount.external_account_id == external_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    account = _Account(
+        row.id, row.tenant_id, row.platform, row.external_account_id, row.access_token_encrypted
+    )
+    if ttl:
+        _account_cache[(platform, external_id)] = (time.monotonic() + ttl, account)
+    return account
+
+
 # --- step 2: customer -------------------------------------------------------
-async def _profile(channel, token: str, igsid: str, known: dict | None, fetch: bool) -> dict:
+async def _profile(
+    channel, token: str, igsid: str, known: dict | None, fetch: bool
+) -> dict:
     """{name, username} for a customer: the name Graph already gave us (a conversation's participant
     entry) wins, because the per-user lookup can be refused (error 100/33 for people with no role on
     the app); otherwise ask Graph if allowed to."""
@@ -68,9 +131,14 @@ async def _profile(channel, token: str, igsid: str, known: dict | None, fetch: b
 
 
 async def _get_or_create_customer(
-    db: AsyncSession, account: SocialAccount, igsid: str, token: str, fetch_profile: bool = True,
+    db: AsyncSession,
+    account: SocialAccount,
+    igsid: str,
+    token: str,
+    fetch_profile: bool = True,
     known: dict | None = None,
-) -> Customer:
+) -> tuple[Customer, bool]:
+    """(customer, created)."""
     channel = CHANNELS[account.platform]
     customer = (
         await db.execute(
@@ -83,12 +151,16 @@ async def _get_or_create_customer(
     if customer is not None:
         # Earlier lookup may have failed/returned empty (stale thread, transient error) — retry
         # rather than leave the row nameless forever.
-        if (fetch_profile or known) and customer.name is None and customer.external_username is None:
+        if (
+            (fetch_profile or known)
+            and customer.name is None
+            and customer.external_username is None
+        ):
             profile = await _profile(channel, token, igsid, known, fetch_profile)
             if profile:
                 customer.name = profile.get("name")
                 customer.external_username = profile.get("username")
-        return customer
+        return customer, False
 
     profile = await _profile(channel, token, igsid, known, fetch_profile)
     customer = Customer(
@@ -99,24 +171,33 @@ async def _get_or_create_customer(
     )
     db.add(customer)
     await db.flush()
-    return customer
+    return customer, True
 
 
 # --- step 3: conversation ---------------------------------------------------
 async def _get_or_create_conversation(
-    db: AsyncSession, account: SocialAccount, customer: Customer
+    db: AsyncSession,
+    account: SocialAccount,
+    customer: Customer,
+    *,
+    fresh: bool = False,
+    last_message_at: datetime | None = None,
 ) -> tuple[Conversation, bool]:
+    """fresh: the customer was just created, so no open conversation can exist (skips the SELECT).
+    last_message_at: stored with a new row, so the caller needs no follow-up UPDATE."""
     # ponytail: select-then-insert. The `uq_open_conversation` partial index catches the
     # rare concurrent first-message race (this delivery fails -> Meta retries -> retry finds it).
-    convo = (
-        await db.execute(
-            select(Conversation).where(
-                Conversation.customer_id == customer.id,
-                Conversation.social_account_id == account.id,
-                Conversation.status == "open",
+    convo = None
+    if not fresh:
+        convo = (
+            await db.execute(
+                select(Conversation).where(
+                    Conversation.customer_id == customer.id,
+                    Conversation.social_account_id == account.id,
+                    Conversation.status == "open",
+                )
             )
-        )
-    ).scalar_one_or_none()
+        ).scalar_one_or_none()
     if convo is not None:
         return convo, False
 
@@ -125,6 +206,7 @@ async def _get_or_create_conversation(
         customer_id=customer.id,
         social_account_id=account.id,
         channel=account.platform,
+        last_message_at=last_message_at,
     )
     db.add(convo)
     await db.flush()
@@ -158,18 +240,26 @@ async def backfill_recent_conversations(
     external_message_id unique index dedupes overlap; if they ever differ you get one duplicate
     per message that arrives during the login window.
     """
-    for conv in await CHANNELS[account.platform].fetch_recent_conversations(token, limit):
+    for conv in await CHANNELS[account.platform].fetch_recent_conversations(
+        token, limit
+    ):
         await _ingest_conversation(db, account, token, conv)
 
 
-async def _ingest_conversation(db: AsyncSession, account: SocialAccount, token: str, conv: dict) -> None:
+async def _ingest_conversation(
+    db: AsyncSession, account: SocialAccount, token: str, conv: dict
+) -> None:
     """Store one Graph thread: its customer, the conversation, and its messages (idempotent). A phone
     number in an old customer message becomes a sales lead, without a notification."""
     me = account.external_account_id
-    others = [p for p in (conv.get("participants") or {}).get("data", []) if p.get("id") != me]
+    others = [
+        p for p in (conv.get("participants") or {}).get("data", []) if p.get("id") != me
+    ]
     if not others:
         return
-    customer = await _get_or_create_customer(db, account, others[0]["id"], token, known=others[0])
+    customer, _ = await _get_or_create_customer(
+        db, account, others[0]["id"], token, known=others[0]
+    )
     convo, _ = await _get_or_create_conversation(db, account, customer)
     # Graph lists newest first; oldest first here, so the newest number a customer gave wins.
     for msg in reversed((conv.get("messages") or {}).get("data", [])):
@@ -193,25 +283,43 @@ async def _ingest_conversation(db: AsyncSession, account: SocialAccount, token: 
                 index_elements=["external_message_id"],
                 index_where=Message.external_message_id.isnot(None),
                 set_={
-                    "media_url": func.coalesce(stmt.excluded.media_url, Message.media_url),
-                    "message_type": case((has_media, stmt.excluded.message_type), else_=Message.message_type),
+                    "media_url": func.coalesce(
+                        stmt.excluded.media_url, Message.media_url
+                    ),
+                    "message_type": case(
+                        (has_media, stmt.excluded.message_type),
+                        else_=Message.message_type,
+                    ),
                 },
             ).returning(Message.id)
         )
         if not is_agent:
             await capture_lead(
-                db, account=account, convo=convo, customer=customer,
-                message_id=message_id, text=msg.get("message"), notify=False,
+                db,
+                account=account,
+                convo=convo,
+                customer=customer,
+                message_id=message_id,
+                text=msg.get("message"),
+                notify=False,
             )
-    updated = datetime.fromisoformat(conv["updated_time"]) if conv.get("updated_time") else None
+    updated = (
+        datetime.fromisoformat(conv["updated_time"])
+        if conv.get("updated_time")
+        else None
+    )
     if updated and (convo.last_message_at is None or updated > convo.last_message_at):
         convo.last_message_at = updated
 
 
-SYNC_LOCK_MINUTES = 10  # a sync that crashed without clearing its flag stops blocking after this
+SYNC_LOCK_MINUTES = (
+    10  # a sync that crashed without clearing its flag stops blocking after this
+)
 
 
-async def run_history_sync(account_id, max_threads: int = 50, page_size: int = 10) -> None:
+async def run_history_sync(
+    account_id, max_threads: int = 50, page_size: int = 10
+) -> None:
     """Background: pull older threads from Meta, `page_size` at a time, up to `max_threads` per click.
     Each click continues where the last stopped (cursor in the account's metadata); after the last
     page the cursor resets, so the next click starts from the newest again and catches anything missed.
@@ -227,7 +335,9 @@ async def run_history_sync(account_id, max_threads: int = 50, page_size: int = 1
             after = (account.meta or {}).get("history_after")
             done = 0
             while done < max_threads:
-                convs, after = await channel.fetch_conversations_page(token, page_size, after)
+                convs, after = await channel.fetch_conversations_page(
+                    token, page_size, after
+                )
                 for conv in convs:
                     await _ingest_conversation(db, account, token, conv)
                 done += len(convs)
@@ -241,13 +351,19 @@ async def run_history_sync(account_id, max_threads: int = 50, page_size: int = 1
         try:
             async with async_session_factory() as db:
                 account = await db.get(SocialAccount, account_id)
-                account.meta = {k: v for k, v in (account.meta or {}).items() if k != "history_syncing_at"}
+                account.meta = {
+                    k: v
+                    for k, v in (account.meta or {}).items()
+                    if k != "history_syncing_at"
+                }
                 await db.commit()
         except Exception:  # noqa: BLE001
             log.exception("could not clear the sync flag for account %s", account_id)
 
 
 CHAT_LABEL = {"instagram": "Instagram", "facebook": "Messenger"}
+# Name lookups in flight per process: a burst of new customers must not pile up Graph calls on the loop.
+_PROFILE_SLOTS = asyncio.Semaphore(20)
 
 
 async def fill_customer_profile(
@@ -255,14 +371,17 @@ async def fill_customer_profile(
 ) -> None:
     """Background: the Graph name lookup the webhook no longer waits on (it held a DB connection
     for the whole call). Own short session; also fixes the "from a customer" notification subject."""
-    profile = await CHANNELS[platform].fetch_customer_profile(token, igsid)
+    async with _PROFILE_SLOTS:
+        profile = await CHANNELS[platform].fetch_customer_profile(token, igsid)
     name, username = profile.get("name"), profile.get("username")
     if not (name or username):
         return
     try:
         async with async_session_factory() as db:
             await db.execute(
-                update(Customer).where(Customer.id == customer_id).values(name=name, external_username=username)
+                update(Customer)
+                .where(Customer.id == customer_id)
+                .values(name=name, external_username=username)
             )
             await db.execute(
                 update(Notification)
@@ -271,15 +390,20 @@ async def fill_customer_profile(
                     Notification.entity_id == convo_id,
                     Notification.event == "message_received",
                 )
-                .values(subject=f"New {CHAT_LABEL[platform]} chat from {name or username}")
+                .values(
+                    subject=f"New {CHAT_LABEL[platform]} chat from {name or username}"
+                )
             )
             await db.commit()
     except Exception:  # noqa: BLE001 — a missing name must never break anything else
-        log.exception("saving profile for customer %s failed", customer_id)
+        log_failure(log, "saving profile for customer %s failed", customer_id)
 
 
 async def ingest_event(
-    db: AsyncSession, ig_account_id: str, event: dict, profile_jobs: list | None = None,
+    db: AsyncSession,
+    ig_account_id: str,
+    event: dict,
+    profile_jobs: list | None = None,
     platform: str = "instagram",
 ) -> tuple | None:
     """Store one Instagram or Messenger (platform="facebook") `messaging` event — same payload shape —
@@ -301,16 +425,13 @@ async def ingest_event(
     if msg.get("is_deleted") or (not msg.get("mid") and referral is None):
         return
 
-    account = (
-        await db.execute(
-            select(SocialAccount).where(
-                SocialAccount.platform == platform,
-                SocialAccount.external_account_id == ig_account_id,
-            )
-        )
-    ).scalar_one_or_none()
+    account = await _find_account(db, platform, ig_account_id)
     if account is None or not account.access_token_encrypted:
-        log.warning("%s webhook for %s dropped: no connected account with that id", platform, ig_account_id)
+        log.warning(
+            "%s webhook for %s dropped: no connected account with that id",
+            platform,
+            ig_account_id,
+        )
         return
 
     # is_echo -> a reply the business sent from the Instagram app; the customer is the
@@ -320,13 +441,25 @@ async def ingest_event(
     token = decrypt_token(account.access_token_encrypted)
 
     defer = profile_jobs is not None
-    customer = await _get_or_create_customer(db, account, igsid, token, fetch_profile=not defer)  # step 2
-    convo, convo_is_new = await _get_or_create_conversation(db, account, customer)  # step 3
+    customer, customer_is_new = await _get_or_create_customer(
+        db, account, igsid, token, fetch_profile=not defer
+    )  # step 2
+    ts = event.get("timestamp")
+    last_message_at = (
+        datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+        if ts
+        else datetime.now(timezone.utc)
+    )
+    convo, convo_is_new = await _get_or_create_conversation(
+        db, account, customer, fresh=customer_is_new, last_message_at=last_message_at
+    )  # step 3
     if defer and customer.name is None and customer.external_username is None:
         profile_jobs.append((customer.id, token, igsid, convo.id, platform))
 
     if referral and not is_echo:
-        await apply_referral(db, account, convo, referral)  # which ad this chat came from
+        await apply_referral(
+            db, account, convo, referral
+        )  # which ad this chat came from
 
     # 4. the message row, linked to the conversation, idempotent on Meta's mid (none for a referral-only event).
     attachments = msg.get("attachments") or []
@@ -341,7 +474,9 @@ async def ingest_event(
                 sender_type="agent" if is_echo else "customer",
                 sender_customer_id=None if is_echo else customer.id,
                 # Messenger's thumbs-up arrives as an "image" with a sticker_id: not a photo to hand over.
-                message_type="sticker" if (first.get("payload") or {}).get("sticker_id") else first.get("type", "text"),
+                message_type="sticker"
+                if (first.get("payload") or {}).get("sticker_id")
+                else first.get("type", "text"),
                 content=msg.get("text"),
                 media_url=(first.get("payload") or {}).get("url"),
                 meta={"attachments": attachments} if attachments else {},
@@ -354,12 +489,17 @@ async def ingest_event(
         )
     # A phone number in a customer's text becomes a sales lead (and customers.phone).
     if inserted and not is_echo:
-        await capture_lead(db, account=account, convo=convo, customer=customer, message_id=inserted, text=msg.get("text"))
+        await capture_lead(
+            db,
+            account=account,
+            convo=convo,
+            customer=customer,
+            message_id=inserted,
+            text=msg.get("text"),
+        )
     # 5. dashboard sort key, + one notification when a brand-new customer thread opens.
-    ts = event.get("timestamp")
-    convo.last_message_at = (
-        datetime.fromtimestamp(ts / 1000, tz=timezone.utc) if ts else datetime.now(timezone.utc)
-    )
+    if not convo_is_new:  # a new row was inserted with it
+        convo.last_message_at = last_message_at
     if convo_is_new and not is_echo:
         await create_notification(
             db,
@@ -374,7 +514,9 @@ async def ingest_event(
     return (convo.id, inserted) if inserted and not is_echo else None
 
 
-async def stamp_webhook_event(db: AsyncSession, platform: str, external_id: str, **extra) -> None:
+async def stamp_webhook_event(
+    db: AsyncSession, platform: str, external_id: str, **extra
+) -> None:
     """Note that Meta reached us for this account (any event: message, status, read…). The Channels
     page shows it as the live webhook check. An account that isn't ours is ignored."""
     account = (
@@ -393,7 +535,9 @@ async def stamp_webhook_event(db: AsyncSession, platform: str, external_id: str,
         }
 
 
-async def stamp_whatsapp_event(db: AsyncSession, phone_number_id: str, waba_id: str) -> None:
+async def stamp_whatsapp_event(
+    db: AsyncSession, phone_number_id: str, waba_id: str
+) -> None:
     """entry.id on a WhatsApp event is the WhatsApp Business Account id, which the Channels page
     needs to look up the webhook subscription."""
     await stamp_webhook_event(db, "whatsapp", phone_number_id, waba_id=waba_id)
@@ -407,29 +551,29 @@ async def ingest_whatsapp_message(
     The customer is keyed by wa_id (their phone number, digits only). WhatsApp puts the display
     name in the same payload (contacts[].profile.name), so there is no profile fetch.
     """
-    account = (
-        await db.execute(
-            select(SocialAccount).where(
-                SocialAccount.platform == "whatsapp",
-                SocialAccount.external_account_id == phone_number_id,
-            )
-        )
-    ).scalar_one_or_none()
+    account = await _find_account(db, "whatsapp", phone_number_id)
     if account is None:
         return None
 
     # 2. customer
     wa_id = msg["from"]
     name = next(
-        ((c.get("profile") or {}).get("name") for c in contacts if c.get("wa_id") == wa_id), None
+        (
+            (c.get("profile") or {}).get("name")
+            for c in contacts
+            if c.get("wa_id") == wa_id
+        ),
+        None,
     )
     customer = (
         await db.execute(
             select(Customer).where(
-                Customer.tenant_id == account.tenant_id, Customer.external_user_id == wa_id
+                Customer.tenant_id == account.tenant_id,
+                Customer.external_user_id == wa_id,
             )
         )
     ).scalar_one_or_none()
+    customer_is_new = customer is None
     if customer is None:
         customer = Customer(
             tenant_id=account.tenant_id,
@@ -443,7 +587,15 @@ async def ingest_whatsapp_message(
     elif name and not customer.name:
         customer.name = name
 
-    convo, convo_is_new = await _get_or_create_conversation(db, account, customer)  # step 3
+    ts = msg.get("timestamp")
+    last_message_at = (
+        datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        if ts
+        else datetime.now(timezone.utc)
+    )
+    convo, convo_is_new = await _get_or_create_conversation(
+        db, account, customer, fresh=customer_is_new, last_message_at=last_message_at
+    )  # step 3
     if ref := referral_of(msg):  # opened from a click-to-WhatsApp ad
         await apply_referral(db, account, convo, ref)
 
@@ -471,10 +623,8 @@ async def ingest_whatsapp_message(
     )
 
     # 5. dashboard sort key + notification on a brand-new thread
-    ts = msg.get("timestamp")
-    convo.last_message_at = (
-        datetime.fromtimestamp(int(ts), tz=timezone.utc) if ts else datetime.now(timezone.utc)
-    )
+    if not convo_is_new:
+        convo.last_message_at = last_message_at
     if convo_is_new:
         await create_notification(
             db,
@@ -496,16 +646,15 @@ async def receive(
 ) -> dict:
     raw = await request.body()
 
-    log.info(">>> IG WEBHOOK HIT <<<")
-    log.info("Headers: %s", dict(request.headers))
-    log.info("Raw body: %s", raw.decode("utf-8", errors="replace"))
-
-    if not instagram.verify_webhook_signature(raw, request.headers.get("x-hub-signature-256", "")):
+    if not instagram.verify_webhook_signature(
+        raw, request.headers.get("x-hub-signature-256", "")
+    ):
         log.warning("Bad signature")
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bad signature")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Bad signature"
+        )
 
-    payload = json.loads(raw)
-    log.info("Parsed payload:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
+    payload = from_json(raw)
 
     obj = payload.get("object")
     if obj not in ("instagram", "page", "whatsapp_business_account"):
@@ -515,11 +664,15 @@ async def receive(
     try:
         for entry in payload.get("entry", []):
             if obj in ("instagram", "page"):
-                platform = "instagram" if obj == "instagram" else "facebook"  # entry.id = IG id / Page id
+                platform = (
+                    "instagram" if obj == "instagram" else "facebook"
+                )  # entry.id = IG id / Page id
                 if platform == "facebook":
                     await stamp_webhook_event(db, platform, str(entry.get("id", "")))
                 for event in entry.get("messaging", []):
-                    if job := await ingest_event(db, str(entry.get("id", "")), event, profile_jobs, platform):
+                    if job := await ingest_event(
+                        db, str(entry.get("id", "")), event, profile_jobs, platform
+                    ):
                         to_reply[job[0]] = job[1]
                 continue
             # WhatsApp: entry.changes[].value holds messages[] (inbound) and statuses[] (delivery
@@ -527,19 +680,26 @@ async def receive(
             # message when the UI needs sent/delivered/failed.
             for change in entry.get("changes", []):
                 value = change.get("value") or {}
-                phone_number_id = (value.get("metadata") or {}).get("phone_number_id", "")
-                await stamp_whatsapp_event(db, phone_number_id, str(entry.get("id", "")))
+                phone_number_id = (value.get("metadata") or {}).get(
+                    "phone_number_id", ""
+                )
+                await stamp_whatsapp_event(
+                    db, phone_number_id, str(entry.get("id", ""))
+                )
                 for msg in value.get("messages", []):
-                    if job := await ingest_whatsapp_message(db, phone_number_id, value.get("contacts", []), msg):
+                    if job := await ingest_whatsapp_message(
+                        db, phone_number_id, value.get("contacts", []), msg
+                    ):
                         to_reply[job[0]] = job[1]
         await db.commit()
     except Exception:  # noqa: BLE001 — log it, never make Meta retry forever
-        log.exception("%s webhook ingest failed", obj)
+        log_failure(log, "%s webhook ingest failed", obj)
         await db.rollback()
         return {"status": "ok"}
     for job in profile_jobs:
         bg.add_task(fill_customer_profile, *job)
-    for message_id in to_reply.values():  # after the commit: the task reads the stored rows
+    for (
+        message_id
+    ) in to_reply.values():  # after the commit: the task reads the stored rows
         bg.add_task(run_auto_reply, message_id)
     return {"status": "ok"}
-

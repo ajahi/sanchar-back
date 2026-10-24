@@ -21,6 +21,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.log import log_failure
 from app.core.security import decrypt_token
 from app.db.session import async_session_factory
 from app.models.conversation import Conversation
@@ -225,16 +226,25 @@ async def hand_over_photo(db: AsyncSession, convo, tenant, account, customer) ->
 
 
 async def auto_reply(db: AsyncSession, message_id) -> None:
-    msg = await db.get(Message, message_id)
-    if msg is None or msg.sender_type != "customer":
+    # One joined query, not five db.get round-trips (each costs ~0.5ms of CPU, and this runs per message).
+    row = (
+        await db.execute(
+            select(Message, Conversation, Tenant, SocialAccount, Customer)
+            .join(Conversation, Conversation.id == Message.conversation_id)
+            .join(Tenant, Tenant.id == Conversation.tenant_id)
+            .outerjoin(SocialAccount, SocialAccount.id == Conversation.social_account_id)
+            .outerjoin(Customer, Customer.id == Conversation.customer_id)
+            .where(Message.id == message_id)
+        )
+    ).first()
+    if row is None:
+        return
+    msg, convo, tenant, account, customer = row
+    if msg.sender_type != "customer":
         return
     is_photo = msg.message_type == "image"
     if not is_photo and not (msg.content or "").strip():
         return
-    convo = await db.get(Conversation, msg.conversation_id)
-    tenant = await db.get(Tenant, convo.tenant_id)
-    account = await db.get(SocialAccount, convo.social_account_id) if convo.social_account_id else None
-    customer = await db.get(Customer, convo.customer_id)
 
     # A photo is flagged for a person even when AI replies are off (nobody else will mark it).
     if is_photo:
@@ -319,4 +329,4 @@ async def run_auto_reply(message_id) -> None:
             await auto_reply(db, message_id)
             await db.commit()
     except Exception:  # noqa: BLE001
-        log.exception("auto-reply failed for message %s", message_id)
+        log_failure(log, "auto-reply failed for message %s", message_id)
