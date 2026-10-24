@@ -30,6 +30,7 @@ jobs:
         run: |
           cd "$APP_DIR"
           docker compose up -d --build api
+          docker image prune -f  # the previous build is left untagged on every deploy
 
       - name: Wait for /health
         run: |

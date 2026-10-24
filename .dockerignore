@@ -1,7 +1,8 @@
-.git
-.venv
-venv
-__pycache__
-*.pyc
-.env
-.pytest_cache
+# Allowlist: only what the api container runs. Anything else in the build folder
+# (venvs, db dumps, logs on the VPS) stays out of the image.
+*
+!app
+!scripts
+!alembic.ini
+!requirements.txt
+**/__pycache__
