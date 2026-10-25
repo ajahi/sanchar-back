@@ -67,6 +67,32 @@ def build_system_prompt(
     return SYSTEM_TEMPLATE.format(knowledge=knowledge.strip())
 
 
+_WORD = re.compile(r"[a-z0-9ऀ-ॿ]+")
+_FILLER = {"gift", "gifts", "box", "item", "items", "offer", "offers", "new", "the", "and", "for", "ko", "ma"}
+
+
+def photo_hint(user_text: str, photos: list[tuple[str | None, list[str]]]) -> str:
+    """A note for the model naming the photos whose tag (or name) the customer's message spells out, e.g. "bhai tika"
+    matches the tag "bhai-tika gifts", "tihar" matches "tihar". A tag matches when all its words (minus filler like
+    "gift", "box") are in the message. The model still decides; the note only stops it overlooking a photo listed
+    far below a long SHOP INFORMATION. ponytail: exact words only, no stemming or Nepali/English synonyms."""
+    words = set(_WORD.findall(user_text.lower()))
+    hits = []
+    for i, (title, tags) in enumerate(photos):
+        for phrase in [*tags, title or ""]:
+            needed = {w for w in _WORD.findall(phrase.lower()) if w not in _FILLER and len(w) > 1}
+            if needed and needed <= words:
+                hits.append(f"P{i + 1} {title or 'Untitled photo'} (matches '{phrase}')")
+                break
+    if not hits:
+        return ""
+    return (
+        "Note from the business, not the customer: these photos match words in the customer's message: "
+        + "; ".join(hits[:MAX_PHOTOS_PER_REPLY])
+        + ". If one shows what they are asking about, tell them about it and attach its label."
+    )
+
+
 def split_photos(reply: str, count: int) -> tuple[str, list[int]]:
     """Take the photo labels out of a reply: (text for the customer, 0-based indexes into the photo list).
     A label outside P1..P<count> is dropped, so the model can only pick photos it was given; repeats count once."""
@@ -76,7 +102,7 @@ def split_photos(reply: str, count: int) -> tuple[str, list[int]]:
         i = int(label.group(1)) - 1 if label else -1
         if 0 <= i < count and i not in picks:
             picks.append(i)
-    text = _PHOTO_TAG.sub("", reply)
+    text = re.sub(r"\s*\(\s*P\d{1,3}\s*\)", "", _PHOTO_TAG.sub("", reply))  # a label leaked into a sentence: "box (P1)"
     text = re.sub(r"[ \t]+(?=\n|$)", "", re.sub(r"[ \t]{2,}", " ", text)).strip()
     return text, picks[:MAX_PHOTOS_PER_REPLY]
 
@@ -104,10 +130,15 @@ def _devanagari(text: str) -> bool:
     return any("ऀ" <= c <= "ॿ" for c in text)
 
 
-async def generate_reply(system_prompt: str, history: list[tuple[str, str]], user_text: str) -> str:
-    """history = [("customer"|"assistant", text), ...] oldest first (the last ~6 is plenty)."""
+async def generate_reply(
+    system_prompt: str, history: list[tuple[str, str]], user_text: str, hint: str = ""
+) -> str:
+    """history = [("customer"|"assistant", text), ...] oldest first (the last ~6 is plenty).
+    hint: a per-message note (photo_hint), sent just before the customer's message so the cached prefix stays the same."""
     messages = [{"role": "system", "content": system_prompt}]
     messages += [{"role": "user" if r == "customer" else "assistant", "content": t} for r, t in history]
+    if hint:
+        messages.append({"role": "system", "content": hint})
     messages.append({"role": "user", "content": user_text})
 
     reply = await _chat(messages)

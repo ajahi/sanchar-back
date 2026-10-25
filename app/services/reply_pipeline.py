@@ -16,7 +16,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,7 +32,7 @@ from app.models.message import Message
 from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
-from app.services.auto_reply import build_system_prompt, generate_reply, split_photos
+from app.services.auto_reply import build_system_prompt, generate_reply, photo_hint, split_photos
 from app.services import campaigns
 from app.services.meta import CHANNELS
 from app.services.notifications import create_notification
@@ -94,14 +94,19 @@ async def build_knowledge(db: AsyncSession, tenant_id) -> str:
 
 
 async def sendable_photos(db: AsyncSession, tenant_id) -> list[ShopMedia]:
-    """In-stock photos with a name or tags, newest first: the list the model may pick photos from.
+    """In-stock photos an admin described, newest first: the list the model may pick photos from. An uploaded
+    photo counts once it has a name or tags; an imported Instagram post only once it is tagged, because its
+    automatic name is just the caption's first line ("Blue me away.") and most posts are not products.
     ponytail: newest MAX_PROMPT_PHOTOS only; a bigger catalogue needs a pre-filter on the customer's words."""
     rows = await db.execute(
         select(ShopMedia)
         .where(
             ShopMedia.tenant_id == tenant_id,
             ShopMedia.in_stock.is_(True),
-            or_(ShopMedia.title.isnot(None), func.cardinality(ShopMedia.tags) > 0),
+            or_(
+                func.cardinality(ShopMedia.tags) > 0,
+                and_(ShopMedia.source == "upload", ShopMedia.title.isnot(None)),
+            ),
         )
         .order_by(ShopMedia.created_at.desc())
         .limit(MAX_PROMPT_PHOTOS)
@@ -109,12 +114,12 @@ async def sendable_photos(db: AsyncSession, tenant_id) -> list[ShopMedia]:
     return list(rows.scalars())
 
 
-async def _generate(system: str, history: list[tuple[str, str]], text: str) -> str:
+async def _generate(system: str, history: list[tuple[str, str]], text: str, hint: str = "") -> str:
     """One retry: the API occasionally answers 400/5xx/timeouts, and the customer is waiting."""
     try:
-        return await generate_reply(system, history, text)
+        return await generate_reply(system, history, text, hint)
     except httpx.HTTPError:
-        return await generate_reply(system, history, text)
+        return await generate_reply(system, history, text, hint)
 
 
 async def _store_ai_message(db: AsyncSession, convo: Conversation, sent: dict, text: str) -> None:
@@ -313,15 +318,13 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     # Everything needed is in memory now. Commit hands the DB connection back to the pool (the loaded
     # rows stay usable: expire_on_commit=False) so the 1-3s LLM call below does not hold one.
     await db.commit()
+    listed = [(p.title, p.tags) for p in photos]
     try:
         reply = await _generate(
-            build_system_prompt(
-                knowledge,
-                campaigns.campaign_context(campaign) if campaign else "",
-                [(p.title, p.tags) for p in photos],
-            ),
+            build_system_prompt(knowledge, campaigns.campaign_context(campaign) if campaign else "", listed),
             history,
             msg.content,
+            photo_hint(msg.content, listed),
         )
     except Exception:  # noqa: BLE001 — stay quiet rather than send something wrong; a person can answer
         log.exception("LLM failed for conversation %s", convo.id)

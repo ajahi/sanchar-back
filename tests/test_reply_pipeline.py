@@ -36,7 +36,7 @@ async def _run(monkeypatch) -> None:
         sent.append((to, text))
         return {"message_id": f"wamid.ai{len(sent)}"}
 
-    async def fake_generate(system, history, text):
+    async def fake_generate(system, history, text, hint=""):
         seen.update(system=system, history=history, text=text)
         if hooks:
             await hooks.pop()()
@@ -170,7 +170,7 @@ def test_ai_sends_photos_it_picks(monkeypatch) -> None:
         images.append(url)
         return {"message_id": f"wamid.i-{run}-{len(images)}"}
 
-    async def fake_generate(system, history, text):
+    async def fake_generate(system, history, text, hint=""):
         seen.update(system=system, history=history)
         return script.pop(0)
 
@@ -194,6 +194,9 @@ def test_ai_sends_photos_it_picks(monkeypatch) -> None:
                 ShopMedia(tenant_id=shop.id, source="upload", url="https://s/chura.jpg", title="Two Row Chura Box",
                           tags=["bhai-tika gifts"], in_stock=False, created_at=ago(4)),  # sold out: never listed
                 ShopMedia(tenant_id=shop.id, source="upload", url="https://s/blank.jpg", created_at=ago(3)),  # no name/tags
+                # an imported Instagram post named only by its caption: not a product until an admin tags it
+                ShopMedia(tenant_id=shop.id, source="instagram", ig_media_id=f"ig-{run}", url="https://cdn.ig/x.jpg",
+                          title="Blue me away.", created_at=ago(2)),
                 ShopMedia(tenant_id=other.id, source="upload", url="https://s/theirs.jpg", title="Their Saree"),
             ])
             cust = Customer(tenant_id=shop.id, external_user_id=f"977-{run}")
@@ -215,7 +218,8 @@ def test_ai_sends_photos_it_picks(monkeypatch) -> None:
             assert "P1 Red Kurtha [red, kurtha, tihar]" in seen["system"]
             # the sold-out box is only named as sold out (build_knowledge), never offered as a photo
             assert "Two Row Chura Box [" not in seen["system"] and "SOLD OUT right now" in seen["system"]
-            assert "Their Saree" not in seen["system"] and "\nP2 " not in seen["system"]
+            assert "Their Saree" not in seen["system"] and "Blue me away" not in seen["system"]
+            assert "\nP2 " not in seen["system"]
             assert texts == ["Cha! Red Kurtha Rs 1800 ho."] and images == ["https://s/kurtha.jpg"]
             sent_photo = (
                 await db.execute(select(Message).where(Message.external_message_id == f"wamid.i-{run}-1"))

@@ -17,7 +17,7 @@ from app.schemas.knowledge import TestIn, TopicIn
 
 
 async def _run(monkeypatch) -> None:
-    async def fake_generate(system, history, text):
+    async def fake_generate(system, history, text, hint=""):
         assert "## Courses\nMBA - 2 years" in system  # the owner's own topic title and answers reach the bot
         return "MBA is 2 years."
 

@@ -43,5 +43,19 @@ def test_photo_list_in_prompt_and_labels_split_out():
     # unknown labels and links can't pick anything; repeats count once; our history marker is never echoed
     assert split("Here [photo:P9] [photo: http://x.y/a.jpg] [Photo : p1] [photo:P1] [sent photo: Red Kurtha]", 2) == ("Here", [0])
     assert split("[photo:P1]", 1) == ("", [0])  # a photo-only answer
+    assert split("Hamro chura box (P1) ramro cha. [photo:P1]", 1) == ("Hamro chura box ramro cha.", [0])  # leaked label
     assert split("a [photo:P1] b [photo:P2] c [photo:P3] d [photo:P4]", 4) == ("a b c d", [0, 1, 2])  # at most 3
     assert split("Line one\nLine two [photo:P1]", 1) == ("Line one\nLine two", [0])  # line breaks kept
+
+
+def test_photo_hint_points_at_tag_matches():
+    photos = [("box-refernce", ["two row chura box", "tihar", "bhai-tika gifts"]),
+              ("Mountain Bike (Giant, 21-speed)", ["mountain bike", "giant"]),
+              ("Blue me away.", [])]
+    hint = auto_reply.photo_hint
+    assert "P1 box-refernce" in hint("hajur ko dokan ma bhai tika ma kai xa hola ?", photos)  # "bhai-tika gifts"
+    assert "P1 box-refernce" in hint("Tihar ko lagi ke cha?", photos)
+    assert "P2 Mountain Bike" in hint("mountain bike ko photo dekhau", photos)
+    assert hint("electric bike kati ho?", photos) == ""  # "bike" alone is not the tag "mountain bike"
+    assert hint("hi", photos) == "" and hint("blue", photos) == ""  # filler and partial names don't match
+    assert "Note from the business" in hint("tihar", photos)  # framed as ours, not the customer's words
