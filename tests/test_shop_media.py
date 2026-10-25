@@ -76,3 +76,76 @@ def test_post_to_instagram(monkeypatch) -> None:
             await db.rollback()
 
     asyncio.run(run())
+
+
+def test_clean_tags_and_vision_parse() -> None:
+    from app.schemas.shop_media import MAX_TAGS, ShopMediaPatch, clean_tags
+    from app.services.vision import parse
+
+    assert clean_tags(["Red", " #Matte ", "red", "", "Gold  Plated"]) == ["red", "matte", "gold plated"]
+    assert len(clean_tags([f"t{i}" for i in range(20)])) == MAX_TAGS
+    assert ShopMediaPatch(tags=["Lipstick", "LIPSTICK"]).tags == ["lipstick"]
+    assert ShopMediaPatch(title="x").tags is None  # not sent = left alone
+
+    # a reasoning model's thinking and chatter around the JSON are ignored
+    answer = '<think>looks like {lipstick}</think>Sure! {"title": "  Red Matte  Lipstick ", "tags": ["Lipstick", "red", 5]}'
+    assert parse(answer) == {"title": "Red Matte Lipstick", "tags": ["lipstick", "red", "5"]}
+    assert parse('{"title": 3, "tags": "red"}') == {"title": None, "tags": []}  # wrong types dropped, not trusted
+    for bad in ("no json here", "[1, 2]", "{broken"):
+        try:
+            parse(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"parse accepted {bad!r}")
+
+
+def test_suggest_then_confirm_tags(monkeypatch) -> None:
+    """Suggest sends the shop's existing tags to the model and saves nothing; PATCH saves the admin's pick.
+    Runs in a rolled-back transaction."""
+    import asyncio
+
+    import pytest
+    from fastapi import HTTPException
+
+    from app.api.v1 import shop_media as api
+    from app.db.session import async_session_factory
+    from app.models.shop_media import ShopMedia
+    from app.models.tenant import Tenant
+    from app.schemas.shop_media import ShopMediaPatch
+
+    seen: list[tuple] = []
+
+    async def fake_suggest(url, vocabulary):
+        seen.append((url, sorted(vocabulary)))
+        return {"title": "Red Matte Lipstick", "tags": ["lipstick", "red"]}
+
+    monkeypatch.setattr(api.vision, "suggest", fake_suggest)
+    monkeypatch.setattr(api.settings, "groq_api_key", "test-key")
+
+    async def run() -> None:
+        async with async_session_factory() as db:
+            db.commit = db.flush  # stay inside the rolled-back transaction
+            t, other = Tenant(name="Tag T"), Tenant(name="Other T")
+            db.add_all([t, other])
+            await db.flush()
+            tagged = ShopMedia(tenant_id=t.id, source="upload", url="https://s/1.jpg", tags=["kajal", "black"])
+            new = ShopMedia(tenant_id=t.id, source="upload", url="https://s/2.jpg")
+            theirs = ShopMedia(tenant_id=other.id, source="upload", url="https://s/3.jpg", tags=["secret"])
+            db.add_all([tagged, new, theirs])
+            await db.flush()
+
+            got = await api.suggest_tags(new.id, t, db)
+            assert got["tags"] == ["lipstick", "red"]
+            assert seen == [("https://s/2.jpg", ["black", "kajal"])]  # only this shop's tags, never another's
+            await db.refresh(new)
+            assert new.tags == [] and new.title is None  # a suggestion is not saved
+
+            with pytest.raises(HTTPException) as e:  # another shop's photo
+                await api.suggest_tags(theirs.id, t, db)
+            assert e.value.status_code == 404
+
+            saved = await api.update_media(new.id, ShopMediaPatch(title="Red Lipstick", tags=["Lipstick", "Matte"]), t, db)
+            assert (saved.title, saved.tags) == ("Red Lipstick", ["lipstick", "matte"])
+            await db.rollback()
+
+    asyncio.run(run())

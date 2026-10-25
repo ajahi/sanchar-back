@@ -12,18 +12,19 @@ from typing import Annotated
 
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from sqlalchemy import case, select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.security import decrypt_token
 from app.core.tenant import CurrentTenant, require_role
 from app.db.session import get_db
 from app.api.v1.campaigns import own_campaign
 from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
-from app.schemas.shop_media import PostIn, ShopMediaOut, ShopMediaPatch
-from app.services import storage
+from app.schemas.shop_media import PostIn, ShopMediaOut, ShopMediaPatch, TagSuggestion
+from app.services import storage, vision
 from app.services.meta import instagram
 
 log = logging.getLogger(__name__)
@@ -222,6 +223,35 @@ async def post_to_instagram(
     await db.commit()
     await db.refresh(row)
     return row
+
+
+@router.post(
+    "/{media_id}/suggest",
+    response_model=TagSuggestion,
+    dependencies=[Depends(require_role("owner", "admin"))],
+)
+async def suggest_tags(
+    media_id: uuid.UUID, tenant: CurrentTenant, db: Annotated[AsyncSession, Depends(get_db)]
+) -> dict:
+    """The vision model's name + tags for one photo (the tagging modal). Saves nothing: the admin keeps what
+    fits and confirms it with PATCH. Owner/admin only, as each call costs a model request."""
+    if not settings.groq_api_key:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="AI tagging is not configured")
+    row = await own_media(db, tenant.id, media_id)
+    # The shop's own words, so the model reuses them; ponytail: first 60, rank by use count if shops outgrow it
+    vocabulary = (
+        await db.execute(
+            select(func.unnest(ShopMedia.tags)).where(ShopMedia.tenant_id == tenant.id).distinct().limit(60)
+        )
+    ).scalars().all()
+    await db.commit()  # don't hold a DB connection through the model call
+    try:
+        return await vision.suggest(row.url, list(vocabulary))
+    except (httpx.HTTPError, ValueError, KeyError):
+        log.warning("tag suggestion failed for media %s", media_id, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="AI could not tag this photo. Add the tags by hand."
+        )
 
 
 @router.patch("/{media_id}", response_model=ShopMediaOut)

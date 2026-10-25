@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     llm_model: str = "openai/gpt-oss-120b"
     groq_url: str = "https://api.groq.com/openai/v1/chat/completions"  # overridable for load tests
+    # Suggests a name + tags for uploaded shop photos (same Groq key). Any Groq model that takes images.
+    vision_model: str = "qwen/qwen3.8-27b"
     # After a person replies in a chat, the bot stays quiet this long (refreshed by every reply of theirs).
     human_pause_minutes: int = 10
 
