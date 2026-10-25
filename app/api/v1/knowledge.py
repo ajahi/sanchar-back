@@ -18,8 +18,8 @@ from app.db.session import get_db
 from app.models.knowledge import KnowledgeDocument
 from app.schemas.knowledge import KnowledgeOut, Suggestion, TestIn, TestOut, TopicIn, TopicOut
 from app.services.audit import record_audit
-from app.services.auto_reply import build_system_prompt, generate_reply
-from app.services.reply_pipeline import build_knowledge
+from app.services.auto_reply import build_system_prompt, generate_reply, split_photos
+from app.services.reply_pipeline import build_knowledge, sendable_photos
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"], dependencies=[Depends(require_role("owner", "admin"))])
 
@@ -154,8 +154,12 @@ async def test_bot(
     knowledge = await build_knowledge(db, tenant.id)
     if not knowledge:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Add some shop information first.")
+    photos = await sendable_photos(db, tenant.id)
     try:
-        reply = await generate_reply(build_system_prompt(knowledge), [], body.message)
+        reply = await generate_reply(build_system_prompt(knowledge, photos=[(p.title, p.tags) for p in photos]), [], body.message)
     except httpx.HTTPError:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="The AI service is not responding. Try again.")
-    return TestOut(reply=reply)
+    # Nothing is sent here: name the photos the bot would attach, so the admin can check its picks.
+    reply, picks = split_photos(reply, len(photos))
+    shown = [f"[would send photo: {photos[i].title or 'untitled'}]" for i in picks]
+    return TestOut(reply="\n".join(x for x in [reply, *shown] if x))

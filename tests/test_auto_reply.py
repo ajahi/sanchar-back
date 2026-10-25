@@ -31,3 +31,17 @@ def test_devanagari_drift_gets_one_rewrite(monkeypatch):
 def test_no_rewrite_when_reply_is_clean_or_customer_wrote_devanagari(monkeypatch):
     assert _run(monkeypatch, "price kati ho?", ["Rs 300 ho."]) == ("Rs 300 ho.", 1)
     assert _run(monkeypatch, "मूल्य कति हो?", ["रु ३०० हो।"]) == ("रु ३०० हो।", 1)
+
+
+def test_photo_list_in_prompt_and_labels_split_out():
+    p = auto_reply.build_system_prompt("Kurtha Rs 1800", photos=[("Red Kurtha", ["red", "tihar"]), (None, ["chura"])])
+    assert "P1 Red Kurtha [red, tihar]" in p and "P2 Untitled photo [chura]" in p and "[photo:P1]" in p
+    assert "PHOTOS YOU CAN SEND" not in auto_reply.build_system_prompt("Kurtha Rs 1800")  # no photos, no section
+
+    split = auto_reply.split_photos
+    assert split("Cha! Rs 1800. [photo:P2]", 2) == ("Cha! Rs 1800.", [1])
+    # unknown labels and links can't pick anything; repeats count once; our history marker is never echoed
+    assert split("Here [photo:P9] [photo: http://x.y/a.jpg] [Photo : p1] [photo:P1] [sent photo: Red Kurtha]", 2) == ("Here", [0])
+    assert split("[photo:P1]", 1) == ("", [0])  # a photo-only answer
+    assert split("a [photo:P1] b [photo:P2] c [photo:P3] d [photo:P4]", 4) == ("a b c d", [0, 1, 2])  # at most 3
+    assert split("Line one\nLine two [photo:P1]", 1) == ("Line one\nLine two", [0])  # line breaks kept

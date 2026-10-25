@@ -16,7 +16,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,7 +32,7 @@ from app.models.message import Message
 from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
-from app.services.auto_reply import build_system_prompt, generate_reply
+from app.services.auto_reply import build_system_prompt, generate_reply, split_photos
 from app.services import campaigns
 from app.services.meta import CHANNELS
 from app.services.notifications import create_notification
@@ -40,6 +40,7 @@ from app.services.notifications import create_notification
 log = logging.getLogger(__name__)
 
 HISTORY = 6  # previous messages given to the model
+MAX_PROMPT_PHOTOS = 40  # shop photos listed to the model (~20 tokens each)
 PHOTO_REASON = "customer_sent_image"
 PHOTO_HOLDING_REPLY = (
     "Tapai ko photo pauna payo. Hamro team le herera chadai reply garnu hunchha. "
@@ -92,6 +93,22 @@ async def build_knowledge(db: AsyncSession, tenant_id) -> str:
     return text
 
 
+async def sendable_photos(db: AsyncSession, tenant_id) -> list[ShopMedia]:
+    """In-stock photos with a name or tags, newest first: the list the model may pick photos from.
+    ponytail: newest MAX_PROMPT_PHOTOS only; a bigger catalogue needs a pre-filter on the customer's words."""
+    rows = await db.execute(
+        select(ShopMedia)
+        .where(
+            ShopMedia.tenant_id == tenant_id,
+            ShopMedia.in_stock.is_(True),
+            or_(ShopMedia.title.isnot(None), func.cardinality(ShopMedia.tags) > 0),
+        )
+        .order_by(ShopMedia.created_at.desc())
+        .limit(MAX_PROMPT_PHOTOS)
+    )
+    return list(rows.scalars())
+
+
 async def _generate(system: str, history: list[tuple[str, str]], text: str) -> str:
     """One retry: the API occasionally answers 400/5xx/timeouts, and the customer is waiting."""
     try:
@@ -122,16 +139,20 @@ async def _store_ai_message(db: AsyncSession, convo: Conversation, sent: dict, t
     convo.last_message_at = datetime.now(timezone.utc)
 
 
-async def _store_ai_image(db: AsyncSession, convo: Conversation, sent: dict, url: str, campaign_id) -> None:
-    """Like _store_ai_message, for a photo we sent. meta.campaign_id lets us skip resending it for a while."""
+async def _store_ai_image(
+    db: AsyncSession, convo: Conversation, sent: dict, url: str, meta: dict, content: str | None = None
+) -> None:
+    """Like _store_ai_message, for a photo we sent. meta.campaign_id lets us skip resending a campaign's photos
+    for a while; content ("[sent photo: name]") puts the photo in the model's history, so it knows it showed it."""
     stmt = pg_insert(Message).values(
         conversation_id=convo.id,
         external_message_id=sent.get("message_id"),
         sender_type="ai",
         message_type="image",
+        content=content,
         media_url=url,
         ai_generated=True,
-        meta={"campaign_id": str(campaign_id)},
+        meta=meta,
     )
     await db.execute(
         stmt.on_conflict_do_update(
@@ -169,7 +190,7 @@ async def share_campaign(db: AsyncSession, convo, campaign, account, customer) -
         except httpx.HTTPError as exc:
             log.warning("sending campaign photo %s failed for conversation %s: %s", media.id, convo.id, _meta_error(exc))
             break  # the rest would most likely fail the same way (expired url, window closed)
-        await _store_ai_image(db, convo, sent, media.url, campaign.id)
+        await _store_ai_image(db, convo, sent, media.url, {"campaign_id": str(campaign.id)})
         await db.commit()
 
 
@@ -272,6 +293,7 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     if not knowledge:
         log.info("auto-reply skipped: tenant %s has no shop context yet", tenant.id)
         return
+    photos = await sendable_photos(db, tenant.id)
 
     prior = (
         await db.execute(
@@ -293,12 +315,19 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     await db.commit()
     try:
         reply = await _generate(
-            build_system_prompt(knowledge, campaigns.campaign_context(campaign) if campaign else ""), history, msg.content
+            build_system_prompt(
+                knowledge,
+                campaigns.campaign_context(campaign) if campaign else "",
+                [(p.title, p.tags) for p in photos],
+            ),
+            history,
+            msg.content,
         )
     except Exception:  # noqa: BLE001 — stay quiet rather than send something wrong; a person can answer
         log.exception("LLM failed for conversation %s", convo.id)
         return
-    if not reply:
+    reply, picks = split_photos(reply or "", len(photos))
+    if not reply and not picks:
         return
 
     # A person usually jumps in DURING the second or two of generation: re-check right before sending.
@@ -307,19 +336,28 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
         return
     await db.commit()  # release the connection again for the Graph send; _store_ai_message takes a fresh one
 
-    send_text = CHANNELS[account.platform].send_text
-    try:
-        sent = await send_text(
-            decrypt_token(account.access_token_encrypted),
-            account.external_account_id,
-            customer.external_user_id,
-            reply,
-        )
-    except httpx.HTTPError as exc:
-        log.exception("sending AI reply failed for conversation %s: %s", convo.id, _meta_error(exc))
-        return
+    channel = CHANNELS[account.platform]
+    token, acct, to = decrypt_token(account.access_token_encrypted), account.external_account_id, customer.external_user_id
+    if reply:  # the model may answer with only a photo label
+        try:
+            sent = await channel.send_text(token, acct, to, reply)
+        except httpx.HTTPError as exc:
+            log.exception("sending AI reply failed for conversation %s: %s", convo.id, _meta_error(exc))
+            return
+        await _store_ai_message(db, convo, sent, reply)
 
-    await _store_ai_message(db, convo, sent, reply)
+    # The photos the model picked, after the text: if one fails the customer still has the answer.
+    send_image = getattr(channel, "send_image", None)
+    for media in [photos[i] for i in picks] if send_image else []:
+        await db.commit()  # keep what is sent so far, and release the connection for the Graph call
+        try:
+            sent = await send_image(token, acct, to, media.url)
+        except httpx.HTTPError as exc:
+            log.warning("sending photo %s failed for conversation %s: %s", media.id, convo.id, _meta_error(exc))
+            break  # the rest would most likely fail the same way (expired url, window closed)
+        await _store_ai_image(
+            db, convo, sent, media.url, {"media_id": str(media.id)}, f"[sent photo: {media.title or 'photo'}]"
+        )
 
 
 async def run_auto_reply(message_id) -> None:

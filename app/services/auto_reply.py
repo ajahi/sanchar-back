@@ -8,6 +8,7 @@ needs retrieval (pgvector), not a bigger prompt.
 """
 import asyncio
 import logging
+import re
 
 from app.services import http_client
 
@@ -38,14 +39,46 @@ Example: customer "Simple chura ko price kati ho?" -> "Simple Plain Chura ko pri
 """
 
 
-def build_system_prompt(knowledge: str, campaign: str = "") -> str:
-    """campaign: one line about the item this chat's ad promotes (campaigns.campaign_context), or ''."""
+PHOTOS_TEMPLATE = """PHOTOS YOU CAN SEND (label, product name, tags)
+{lines}
+When the customer asks to see something, or asks whether you have something one of these photos shows (by its name, a tag, a colour or an occasion), say yes and put that photo's label at the very end of your reply, like [photo:P1]. At most 3 labels. Use only labels from this list and never write a link. The photo is sent right after your message. Prices still come only from SHOP INFORMATION."""
+
+MAX_PHOTOS_PER_REPLY = 3
+# Any [photo:...] or [sent photo:...] the model writes; only "P<n>" inside picks a photo, the rest is just removed.
+_PHOTO_TAG = re.compile(r"\[\s*(?:sent\s+)?photo\s*:([^\]]*)\]", re.IGNORECASE)
+
+
+def build_system_prompt(
+    knowledge: str, campaign: str = "", photos: list[tuple[str | None, list[str]]] | None = None
+) -> str:
+    """campaign: one line about the item this chat's ad promotes (campaigns.campaign_context), or ''.
+    photos: (name, tags) of the shop photos the bot may send, labelled P1, P2... in this order (split_photos)."""
     if campaign:
         knowledge = (
             f"{knowledge.strip()}\n\nTHIS CHAT IS ABOUT THIS ITEM (the customer came from its ad; answer about it "
             f"unless they ask about something else): {campaign}"
         )
+    if photos:
+        lines = "\n".join(
+            f"P{i} {title or 'Untitled photo'}" + (f" [{', '.join(tags)}]" if tags else "")
+            for i, (title, tags) in enumerate(photos, 1)
+        )
+        knowledge = f"{knowledge.strip()}\n\n{PHOTOS_TEMPLATE.format(lines=lines)}"
     return SYSTEM_TEMPLATE.format(knowledge=knowledge.strip())
+
+
+def split_photos(reply: str, count: int) -> tuple[str, list[int]]:
+    """Take the photo labels out of a reply: (text for the customer, 0-based indexes into the photo list).
+    A label outside P1..P<count> is dropped, so the model can only pick photos it was given; repeats count once."""
+    picks: list[int] = []
+    for tag in _PHOTO_TAG.finditer(reply):
+        label = re.fullmatch(r"p(\d{1,3})", tag.group(1).strip(), re.IGNORECASE)
+        i = int(label.group(1)) - 1 if label else -1
+        if 0 <= i < count and i not in picks:
+            picks.append(i)
+    text = _PHOTO_TAG.sub("", reply)
+    text = re.sub(r"[ \t]+(?=\n|$)", "", re.sub(r"[ \t]{2,}", " ", text)).strip()
+    return text, picks[:MAX_PHOTOS_PER_REPLY]
 
 
 async def _chat(messages: list[dict]) -> str:

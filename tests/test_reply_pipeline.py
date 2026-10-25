@@ -144,3 +144,98 @@ async def _run(monkeypatch) -> None:
 
 def test_reply_pipeline(monkeypatch) -> None:
     asyncio.run(_run(monkeypatch))
+
+
+def test_ai_sends_photos_it_picks(monkeypatch) -> None:
+    """The model sees this shop's in-stock named photos as P-labels; the labels it writes become photos sent after
+    its text. Unique ids (no clash with other test data); runs in a rolled-back transaction."""
+    import uuid
+
+    from app.models.shop_media import ShopMedia
+
+    run = uuid.uuid4().hex[:8]
+    texts: list[str] = []
+    images: list[str] = []
+    seen: dict = {}
+    script: list[str] = []
+    fail = {"images": False}
+
+    async def fake_send(token, account_id, to, text):
+        texts.append(text)
+        return {"message_id": f"wamid.t-{run}-{len(texts)}"}
+
+    async def fake_image(token, account_id, to, url):
+        if fail["images"]:
+            raise httpx.ConnectError("meta down")
+        images.append(url)
+        return {"message_id": f"wamid.i-{run}-{len(images)}"}
+
+    async def fake_generate(system, history, text):
+        seen.update(system=system, history=history)
+        return script.pop(0)
+
+    monkeypatch.setattr(whatsapp, "send_text", fake_send)
+    monkeypatch.setattr(whatsapp, "send_image", fake_image)
+    monkeypatch.setattr(reply_pipeline, "generate_reply", fake_generate)
+
+    async def go() -> None:
+        async with async_session_factory() as db:
+            db.commit = db.flush  # stay inside the rolled-back transaction
+            shop, other = Tenant(name="Photo shop", ai_auto_reply=True), Tenant(name="Other shop")
+            db.add_all([shop, other])
+            await db.flush()
+            db.add(KnowledgeDocument(tenant_id=shop.id, title="Shop", content="Red Kurtha Rs 1800"))
+            acct = SocialAccount(tenant_id=shop.id, platform="whatsapp", external_account_id=f"pn-{run}",
+                                 access_token_encrypted=encrypt_token("tok"))
+            db.add_all([
+                acct,
+                ShopMedia(tenant_id=shop.id, source="upload", url="https://s/kurtha.jpg", title="Red Kurtha",
+                          tags=["red", "kurtha", "tihar"], created_at=ago(5)),
+                ShopMedia(tenant_id=shop.id, source="upload", url="https://s/chura.jpg", title="Two Row Chura Box",
+                          tags=["bhai-tika gifts"], in_stock=False, created_at=ago(4)),  # sold out: never listed
+                ShopMedia(tenant_id=shop.id, source="upload", url="https://s/blank.jpg", created_at=ago(3)),  # no name/tags
+                ShopMedia(tenant_id=other.id, source="upload", url="https://s/theirs.jpg", title="Their Saree"),
+            ])
+            cust = Customer(tenant_id=shop.id, external_user_id=f"977-{run}")
+            db.add(cust)
+            await db.flush()
+            convo = Conversation(tenant_id=shop.id, customer_id=cust.id, social_account_id=acct.id, channel="whatsapp")
+            db.add(convo)
+            await db.flush()
+
+            async def ask(text: str, minutes: float):
+                m = Message(conversation_id=convo.id, sender_type="customer", content=text, created_at=ago(minutes))
+                db.add(m)
+                await db.flush()
+                await reply_pipeline.auto_reply(db, m.id)
+
+            # 1. text, then the picked photo; an unknown label sends nothing
+            script.append("Cha! Red Kurtha Rs 1800 ho. [photo:P1] [photo:P7]")
+            await ask("red kurtha cha?", 3)
+            assert "P1 Red Kurtha [red, kurtha, tihar]" in seen["system"]
+            # the sold-out box is only named as sold out (build_knowledge), never offered as a photo
+            assert "Two Row Chura Box [" not in seen["system"] and "SOLD OUT right now" in seen["system"]
+            assert "Their Saree" not in seen["system"] and "\nP2 " not in seen["system"]
+            assert texts == ["Cha! Red Kurtha Rs 1800 ho."] and images == ["https://s/kurtha.jpg"]
+            sent_photo = (
+                await db.execute(select(Message).where(Message.external_message_id == f"wamid.i-{run}-1"))
+            ).scalar_one()
+            assert (sent_photo.sender_type, sent_photo.message_type, sent_photo.content) == (
+                "ai", "image", "[sent photo: Red Kurtha]")
+            for m in (await db.execute(select(Message).where(Message.conversation_id == convo.id, Message.sender_type == "ai"))).scalars():
+                m.created_at = ago(2.5)  # the fake timeline is in the past; replies precede the next message
+
+            # 2. the model remembers it showed the photo; a photo-only answer sends no empty text
+            script.append("[photo:P1]")
+            await ask("feri dekhau na", 2)
+            assert ("assistant", "[sent photo: Red Kurtha]") in seen["history"]
+            assert len(texts) == 1 and images == ["https://s/kurtha.jpg"] * 2
+
+            # 3. the photo send fails -> the text is still delivered and stored
+            fail["images"] = True
+            script.append("Yo ho. [photo:P1]")
+            await ask("photo?", 1)
+            assert texts[-1] == "Yo ho." and len(images) == 2
+            await db.rollback()
+
+    asyncio.run(go())
