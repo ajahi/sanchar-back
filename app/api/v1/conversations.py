@@ -66,7 +66,7 @@ async def list_conversations(
     rows = await db.execute(
         select(
             Conversation, Customer, needs_attention.label("needs_attention"), SalesLead.phone,
-            Campaign.name, func.coalesce(CampaignLink.ad_title, CampaignLink.external_id),
+            SalesLead.meta["order"], SalesLead.status, Campaign.name, func.coalesce(CampaignLink.ad_title, CampaignLink.external_id),
             CampaignLink.kind, CampaignLink.external_id,
         )
         .join(Customer, Customer.id == Conversation.customer_id)
@@ -88,12 +88,15 @@ async def list_conversations(
             customer_name=cu.name,
             customer_username=cu.external_username,
             lead_phone=lead_phone,
+            lead_order=lead_order,
+            lead_status=lead_status,
             campaign_name=campaign_name,
             ad_title=ad_title,
             ad_kind=ad_kind,
             ad_code=ad_code,
         )
-        for c, cu, attention, lead_phone, campaign_name, ad_title, ad_kind, ad_code in rows.all()
+        for c, cu, attention, lead_phone, lead_order, lead_status, campaign_name, ad_title, ad_kind, ad_code
+        in rows.all()
     ]
 
 

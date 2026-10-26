@@ -68,3 +68,58 @@ async def _run(monkeypatch) -> None:
 
 def test_capture_lead_via_webhook(monkeypatch) -> None:
     asyncio.run(_run(monkeypatch))
+
+
+def test_bot_order_saved_on_lead_and_listed() -> None:
+    """The order the bot collected lands on the customer's lead (made if missing), pings staff once, repeats are
+    no-ops, a changed order goes back to new; the Orders list shows it and staff confirm it. Rolled back."""
+    import uuid
+
+    from app.api.v1.leads import list_leads, set_status
+    from app.models.conversation import Conversation
+    from app.models.notification import Notification
+    from app.schemas.lead import LeadPatch
+    from app.services.leads import save_order
+
+    run = uuid.uuid4().hex[:8]
+
+    async def go() -> None:
+        async with async_session_factory() as db:
+            db.commit = db.flush  # stay inside the rolled-back transaction
+            t, other = Tenant(name="Order shop"), Tenant(name="Other")
+            db.add_all([t, other])
+            await db.flush()
+            acct = SocialAccount(tenant_id=t.id, platform="facebook", external_account_id=f"pg-{run}")
+            cust = Customer(tenant_id=t.id, external_user_id=f"psid-{run}", name="ram.fb")
+            db.add_all([acct, cust])
+            await db.flush()
+            convo = Conversation(tenant_id=t.id, customer_id=cust.id, social_account_id=acct.id, channel="facebook")
+            db.add(convo)
+            await db.flush()
+            order = {"name": "Ram", "phone": "98-1234-5678", "address": "Baneshwor", "items": "2 chura box"}
+
+            async def save(o):
+                return await save_order(db, account=acct, convo=convo, customer=cust, order=o)
+
+            async def pings():
+                return (await db.execute(select(Notification).where(
+                    Notification.tenant_id == t.id, Notification.event == "order_received"))).scalars().all()
+
+            assert await save(order) is True
+            assert await save(dict(order)) is False  # the bot re-stated the same order: no second ping
+            assert len(await pings()) == 1
+            [row] = await list_leads(t, db, None)
+            assert (row.phone, row.status, row.customer_name, row.order) == ("+9779812345678", "new", "ram.fb", order)
+            assert cust.phone == "+9779812345678"
+
+            await set_status(row.id, LeadPatch(status="confirmed"), t, db)
+            assert await list_leads(t, db, "new") == []
+            assert await list_leads(other, db, None) == []  # another business never sees it
+
+            changed = {**order, "items": "3 chura box"}
+            assert await save(changed) is True
+            [row] = await list_leads(t, db, "new")  # back in the queue to confirm again
+            assert row.order == changed and len(await pings()) == 2
+            await db.rollback()
+
+    asyncio.run(go())

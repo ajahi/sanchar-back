@@ -59,3 +59,18 @@ def test_photo_hint_points_at_tag_matches():
     assert hint("electric bike kati ho?", photos) == ""  # "bike" alone is not the tag "mountain bike"
     assert hint("hi", photos) == "" and hint("blue", photos) == ""  # filler and partial names don't match
     assert "Note from the business" in hint("tihar", photos)  # framed as ours, not the customer's words
+
+
+def test_order_label_split_out():
+    assert "[order: name | phone | address | items]" in auto_reply.build_system_prompt("x")
+    text, order = auto_reply.split_order(
+        "Ram ji, 2 Chura Box Baneshwor ma. Hami call garera confirm garchau.\n"
+        "[order: Ram Shrestha | 9812345678 | Baneshwor, Kathmandu | 2 x Two Row Chura Box]"
+    )
+    assert text == "Ram ji, 2 Chura Box Baneshwor ma. Hami call garera confirm garchau."
+    assert order == {"name": "Ram Shrestha", "phone": "9812345678", "address": "Baneshwor, Kathmandu",
+                     "items": "2 x Two Row Chura Box"}
+    # an incomplete label is removed but is not an order; no label leaves the text alone
+    assert auto_reply.split_order("Thik cha. [ORDER: Ram | | Baneshwor | box]") == ("Thik cha.", None)
+    assert auto_reply.split_order("Naam pathaunus. [order: name | phone | address | 2 box]") == ("Naam pathaunus.", None)
+    assert auto_reply.split_order("Hajur [photo:P1]") == ("Hajur [photo:P1]", None)

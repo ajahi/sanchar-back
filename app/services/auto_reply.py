@@ -34,6 +34,12 @@ SYSTEM_TEMPLATE = """You are the chat assistant for the business described in SH
 SHOP INFORMATION
 {knowledge}
 
+ORDERS AND BOOKINGS (products, rentals, appointments, classes, services: any business)
+- When the customer wants to buy, order, book, reserve, apply or visit (e.g. "malai yo chahiyo", "order garna milcha?", "kasari book garne?", "I want to apply", or they ask about delivery or payment for an item), answer their question and in the same reply ask them to send their name, phone number, address (or location) and what they want (with quantity), all in one message. Do not ask customers who are only asking about prices or details.
+- Collect these across the whole conversation: what the customer already said earlier (the item, the quantity, the number) counts. Ask only for what is still missing.
+- Once you have all four (from this message and earlier ones), repeat them back in one or two lines, say the business will contact them to confirm, and put this at the very end of your reply, filled in with their details: [order: name | phone | address | items]. The customer does not see it. Never write it before you have all four.
+- Never say an order is confirmed, booked or paid: the business confirms it.
+
 REMINDER (applies to every reply): match the customer's script. Roman Nepali in -> Roman Nepali out, all of it, including the last sentence. Never add Devanagari to a Roman Nepali reply. No asterisks or markdown.
 Example: customer "Simple chura ko price kati ho?" -> "Simple Plain Chura ko price Rs 300 per set ho. Aru kehi chahiyo bhane sodhnus."
 """
@@ -105,6 +111,22 @@ def split_photos(reply: str, count: int) -> tuple[str, list[int]]:
     text = re.sub(r"\s*\(\s*P\d{1,3}\s*\)", "", _PHOTO_TAG.sub("", reply))  # a label leaked into a sentence: "box (P1)"
     text = re.sub(r"[ \t]+(?=\n|$)", "", re.sub(r"[ \t]{2,}", " ", text)).strip()
     return text, picks[:MAX_PHOTOS_PER_REPLY]
+
+
+_ORDER_TAG = re.compile(r"\[\s*order\s*:([^\]]*)\]", re.IGNORECASE)
+ORDER_FIELDS = (("name", 100), ("phone", 50), ("address", 300), ("items", 500))  # field, max length
+
+
+def split_order(reply: str) -> tuple[str, dict | None]:
+    """Take the [order: name | phone | address | items] label out of a reply: (text for the customer, the order
+    or None). A label without all four parts, or without a real number (the model sometimes copies the template
+    "[order: name | phone | ...]" while still asking), is still removed, but is not an order."""
+    order = None
+    for tag in _ORDER_TAG.finditer(reply):
+        parts = [p.strip() for p in tag.group(1).split("|")]
+        if len(parts) == len(ORDER_FIELDS) and all(parts) and len(re.sub(r"\D", "", parts[1])) >= 7:
+            order = {f: p[:cap] for (f, cap), p in zip(ORDER_FIELDS, parts)}
+    return _ORDER_TAG.sub("", reply).strip(), order
 
 
 async def _chat(messages: list[dict]) -> str:

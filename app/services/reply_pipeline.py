@@ -32,8 +32,9 @@ from app.models.message import Message
 from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
-from app.services.auto_reply import build_system_prompt, generate_reply, photo_hint, split_photos
+from app.services.auto_reply import build_system_prompt, generate_reply, photo_hint, split_order, split_photos
 from app.services import campaigns
+from app.services.leads import save_order
 from app.services.meta import CHANNELS
 from app.services.notifications import create_notification
 
@@ -329,7 +330,10 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     except Exception:  # noqa: BLE001 — stay quiet rather than send something wrong; a person can answer
         log.exception("LLM failed for conversation %s", convo.id)
         return
-    reply, picks = split_photos(reply or "", len(photos))
+    reply, order = split_order(reply or "")
+    reply, picks = split_photos(reply, len(photos))
+    if order:  # kept even if the reply is dropped below: the customer did give these details
+        await save_order(db, account=account, convo=convo, customer=customer, order=order)
     if not reply and not picks:
         return
 

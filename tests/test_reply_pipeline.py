@@ -240,6 +240,15 @@ def test_ai_sends_photos_it_picks(monkeypatch) -> None:
             script.append("Yo ho. [photo:P1]")
             await ask("photo?", 1)
             assert texts[-1] == "Yo ho." and len(images) == 2
+
+            # 4. the bot collected an order: the label never reaches the customer, the order lands on the lead
+            from app.models.sales_lead import SalesLead
+
+            script.append("Dhanyabad Sita ji! Hami call garera confirm garchau. [order: Sita | 9801234567 | Patan | 1 Red Kurtha]")
+            await ask("Sita, 9801234567, Patan, 1 red kurtha", 0.5)
+            assert texts[-1] == "Dhanyabad Sita ji! Hami call garera confirm garchau."
+            lead = (await db.execute(select(SalesLead).where(SalesLead.customer_id == cust.id))).scalar_one()
+            assert (lead.phone, lead.meta["order"]["items"]) == ("+9779801234567", "1 Red Kurtha")
             await db.rollback()
 
     asyncio.run(go())
