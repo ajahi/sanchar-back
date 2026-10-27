@@ -13,11 +13,11 @@ ponytail: FastAPI BackgroundTasks, so a server restart loses in-flight replies; 
 + worker if that ever matters.
 """
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import and_, func, or_, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -123,51 +123,53 @@ async def _generate(system: str, history: list[tuple[str, str]], text: str, hint
         return await generate_reply(system, history, text, hint)
 
 
-async def _store_ai_message(db: AsyncSession, convo: Conversation, sent: dict, text: str) -> None:
-    """Stored under Meta's message id so our own echo (Instagram sends one back) hits the unique index
-    and is not mistaken for a person replying. If the echo won the race, relabel its row as ours."""
-    stmt = pg_insert(Message).values(
-        conversation_id=convo.id,
-        external_message_id=sent.get("message_id"),
-        sender_type="ai",
-        message_type="text",
-        content=text,
-        ai_generated=True,
-        meta={"model": settings.llm_model},
-    )
-    await db.execute(
-        stmt.on_conflict_do_update(
-            index_elements=["external_message_id"],
-            index_where=Message.external_message_id.isnot(None),
-            set_={"sender_type": "ai", "ai_generated": True},
-        )
-    )
-    convo.last_message_at = datetime.now(timezone.utc)
-
-
-async def _store_ai_image(
-    db: AsyncSession, convo: Conversation, sent: dict, url: str, meta: dict, content: str | None = None
+async def _send_as_ai(
+    db: AsyncSession,
+    convo: Conversation,
+    send: Callable[[], Awaitable[dict]],
+    *,
+    message_type: str = "text",
+    content: str | None = None,
+    media_url: str | None = None,
+    meta: dict | None = None,
 ) -> None:
-    """Like _store_ai_message, for a photo we sent. meta.campaign_id lets us skip resending a campaign's photos
-    for a while; content ("[sent photo: name]") puts the photo in the model's history, so it knows it showed it."""
-    stmt = pg_insert(Message).values(
-        conversation_id=convo.id,
-        external_message_id=sent.get("message_id"),
-        sender_type="ai",
-        message_type="image",
-        content=content,
-        media_url=url,
-        ai_generated=True,
-        meta=meta,
+    """Store the bot's message, then send it, then give the row Meta's message id.
+
+    Instagram / Messenger echo every message the page sends back as a webhook, often BEFORE the send call
+    returns (always for a photo: Meta fetches it first). The row is committed before sending so that echo finds
+    it (webhooks.claim_own_echo) instead of being stored as a person replying, which would pause the bot.
+    If the echo was stored anyway (it beat the commit, or did not match), that row is relabelled as ours.
+    For a photo, meta.campaign_id lets campaigns skip resending its photos for a while, and content
+    ("[sent photo: name]") puts it in the model's history. Raises httpx.HTTPError if the send fails (row removed)."""
+    row = Message(
+        conversation_id=convo.id, sender_type="ai", message_type=message_type, content=content,
+        media_url=media_url, ai_generated=True, meta=meta or {},
     )
-    await db.execute(
-        stmt.on_conflict_do_update(
-            index_elements=["external_message_id"],
-            index_where=Message.external_message_id.isnot(None),
-            set_={"sender_type": "ai", "ai_generated": True},
+    db.add(row)
+    await db.commit()  # visible to the echo's transaction; also releases the connection for the Graph call
+    try:
+        sent = await send()
+    except httpx.HTTPError:
+        await db.delete(row)
+        await db.commit()
+        raise
+    mid = sent.get("message_id")
+    echo = (
+        await db.execute(
+            update(Message)
+            .where(Message.external_message_id == mid, Message.id != row.id)
+            .values(sender_type="ai", ai_generated=True)
+            .returning(Message.id)
         )
-    )
+    ).first() if mid else None
+    if echo:
+        await db.delete(row)
+    else:
+        await db.execute(
+            update(Message).where(Message.id == row.id, Message.external_message_id.is_(None)).values(external_message_id=mid)
+        )
     convo.last_message_at = datetime.now(timezone.utc)
+    await db.commit()
 
 
 async def share_campaign(db: AsyncSession, convo, campaign, account, customer) -> None:
@@ -181,23 +183,23 @@ async def share_campaign(db: AsyncSession, convo, campaign, account, customer) -
         else await campaigns.photos_for(db, campaign)
     )
     token, acct, to = decrypt_token(account.access_token_encrypted), account.external_account_id, customer.external_user_id
-    await db.commit()  # release the connection for the Graph calls
     try:
-        sent = await channel.send_text(token, acct, to, text)
+        await _send_as_ai(
+            db, convo, lambda: channel.send_text(token, acct, to, text), content=text, meta={"model": settings.llm_model}
+        )
     except httpx.HTTPError as exc:
         log.exception("sending campaign reply failed for conversation %s: %s", convo.id, _meta_error(exc))
         return
-    await _store_ai_message(db, convo, sent, text)
-    await db.commit()
     send_image = getattr(channel, "send_image", None)
     for media in photos if send_image else []:
         try:
-            sent = await send_image(token, acct, to, media.url)
+            await _send_as_ai(
+                db, convo, lambda: send_image(token, acct, to, media.url),
+                message_type="image", media_url=media.url, meta={"campaign_id": str(campaign.id)},
+            )
         except httpx.HTTPError as exc:
             log.warning("sending campaign photo %s failed for conversation %s: %s", media.id, convo.id, _meta_error(exc))
             break  # the rest would most likely fail the same way (expired url, window closed)
-        await _store_ai_image(db, convo, sent, media.url, {"campaign_id": str(campaign.id)})
-        await db.commit()
 
 
 async def hand_over_photo(db: AsyncSession, convo, tenant, account, customer) -> None:
@@ -239,17 +241,14 @@ async def hand_over_photo(db: AsyncSession, convo, tenant, account, customer) ->
         return
     await db.commit()  # keep the handover even if sending the holding reply blows up below
     send_text = CHANNELS[account.platform].send_text
+    token, acct, to = decrypt_token(account.access_token_encrypted), account.external_account_id, customer.external_user_id
     try:
-        sent = await send_text(
-            decrypt_token(account.access_token_encrypted),
-            account.external_account_id,
-            customer.external_user_id,
-            PHOTO_HOLDING_REPLY,
+        await _send_as_ai(
+            db, convo, lambda: send_text(token, acct, to, PHOTO_HOLDING_REPLY),
+            content=PHOTO_HOLDING_REPLY, meta={"model": settings.llm_model},
         )
     except httpx.HTTPError as exc:
         log.exception("sending photo holding reply failed for conversation %s: %s", convo.id, _meta_error(exc))
-        return
-    await _store_ai_message(db, convo, sent, PHOTO_HOLDING_REPLY)
 
 
 async def auto_reply(db: AsyncSession, message_id) -> None:
@@ -341,30 +340,28 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     if await human_active(db, convo.id):
         log.info("auto-reply dropped: a person took over conversation %s while generating", convo.id)
         return
-    await db.commit()  # release the connection again for the Graph send; _store_ai_message takes a fresh one
-
     channel = CHANNELS[account.platform]
     token, acct, to = decrypt_token(account.access_token_encrypted), account.external_account_id, customer.external_user_id
     if reply:  # the model may answer with only a photo label
         try:
-            sent = await channel.send_text(token, acct, to, reply)
+            await _send_as_ai(
+                db, convo, lambda: channel.send_text(token, acct, to, reply), content=reply, meta={"model": settings.llm_model}
+            )
         except httpx.HTTPError as exc:
             log.exception("sending AI reply failed for conversation %s: %s", convo.id, _meta_error(exc))
             return
-        await _store_ai_message(db, convo, sent, reply)
 
     # The photos the model picked, after the text: if one fails the customer still has the answer.
     send_image = getattr(channel, "send_image", None)
     for media in [photos[i] for i in picks] if send_image else []:
-        await db.commit()  # keep what is sent so far, and release the connection for the Graph call
         try:
-            sent = await send_image(token, acct, to, media.url)
+            await _send_as_ai(
+                db, convo, lambda: send_image(token, acct, to, media.url), message_type="image", media_url=media.url,
+                content=f"[sent photo: {media.title or 'photo'}]", meta={"media_id": str(media.id)},
+            )
         except httpx.HTTPError as exc:
             log.warning("sending photo %s failed for conversation %s: %s", media.id, convo.id, _meta_error(exc))
             break  # the rest would most likely fail the same way (expired url, window closed)
-        await _store_ai_image(
-            db, convo, sent, media.url, {"media_id": str(media.id)}, f"[sent photo: {media.title or 'photo'}]"
-        )
 
 
 async def run_auto_reply(message_id) -> None:

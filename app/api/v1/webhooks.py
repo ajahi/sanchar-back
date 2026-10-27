@@ -22,7 +22,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import (
@@ -399,6 +399,49 @@ async def fill_customer_profile(
         log_failure(log, "saving profile for customer %s failed", customer_id)
 
 
+def _event_kind(event: dict) -> str:
+    """One word or two for the log: what a Messenger / Instagram `messaging` event is. Never its text or
+    who sent it (the log is not a place for customer data)."""
+    msg = event.get("message")
+    if msg:
+        if msg.get("is_echo"):
+            return "echo (our side sent a message)"
+        kind = ((msg.get("attachments") or [{}])[0]).get("type", "text")
+        return "message deleted" if msg.get("is_deleted") else f"message ({kind})"
+    return next((k for k in ("read", "delivery", "reaction", "postback", "referral", "message_edit") if k in event), "other")
+
+
+OWN_ECHO_WINDOW = timedelta(minutes=2)
+
+
+async def claim_own_echo(db: AsyncSession, conversation_id, mid: str, message_type: str) -> bool:
+    """An echo of a message the bot is sending right now: reply_pipeline._send_as_ai stored the row before
+    sending, without Meta's id. Give the oldest such row of the same type this id and report True, so the
+    echo is not stored as a person replying (which pauses the bot).
+    ponytail: matches by type, not text; a person replying from the app in the same second as the bot
+    could take the bot's row (the bot's own echo then pauses it, as a person reply would)."""
+    pending = (
+        select(Message.id)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.sender_type == "ai",
+            Message.external_message_id.is_(None),
+            Message.message_type == message_type,
+            Message.created_at > func.now() - OWN_ECHO_WINDOW,
+        )
+        .order_by(Message.created_at)
+        .limit(1)
+        .scalar_subquery()
+    )
+    claimed = await db.execute(
+        update(Message)
+        .where(Message.id == pending, Message.external_message_id.is_(None))
+        .values(external_message_id=mid)
+        .returning(Message.id)
+    )
+    return claimed.first() is not None
+
+
 async def ingest_event(
     db: AsyncSession,
     ig_account_id: str,
@@ -415,8 +458,9 @@ async def ingest_event(
 
     Returns (conversation_id, message_id) when a NEW customer message was stored (the caller queues
     an auto-reply for it), else None. A NEW echo (a person answered from the Instagram app) is stored
-    as an 'agent' message, which pauses the bot for a while (see reply_pipeline.human_active); our own
-    replies echo back under the id we stored, so they are not stored twice and do not pause it.
+    as an 'agent' message, which pauses the bot for a while (see reply_pipeline.human_active); the bot's own
+    messages are stored before they are sent, and their echo is matched to that row (claim_own_echo) or hits
+    the id stored after the send, so they are not stored twice and do not pause it.
     """
     # 1. keep only real messages (an unsend, or a read/reaction, is not stored), and referral events:
     # a customer opening the chat from an ad / ref link, which can arrive without a message.
@@ -465,6 +509,8 @@ async def ingest_event(
     attachments = msg.get("attachments") or []
     first = attachments[0] if attachments else {}
     inserted = None
+    if is_echo and msg.get("mid") and await claim_own_echo(db, convo.id, msg["mid"], first.get("type", "text")):
+        return None  # the bot's own message, sent a moment ago: not a person replying
     if msg.get("mid"):
         inserted = await db.scalar(
             pg_insert(Message)
@@ -670,13 +716,14 @@ async def receive(
                 if platform == "facebook":
                     await stamp_webhook_event(db, platform, str(entry.get("id", "")))
                 for event in entry.get("messaging", []):
+                    log.info("%s event for %s: %s", platform, entry.get("id"), _event_kind(event))
                     if job := await ingest_event(
                         db, str(entry.get("id", "")), event, profile_jobs, platform
                     ):
                         to_reply[job[0]] = job[1]
                 continue
             # WhatsApp: entry.changes[].value holds messages[] (inbound) and statuses[] (delivery
-            # reports on our sends). ponytail: statuses are only logged above; store them on the
+            # reports on our sends). ponytail: statuses are only logged; store them on the
             # message when the UI needs sent/delivered/failed.
             for change in entry.get("changes", []):
                 value = change.get("value") or {}
@@ -686,7 +733,13 @@ async def receive(
                 await stamp_whatsapp_event(
                     db, phone_number_id, str(entry.get("id", ""))
                 )
+                for st in value.get("statuses", []):
+                    log.info(
+                        "whatsapp status for %s: %s %s", phone_number_id, st.get("status"),
+                        "; ".join(f"{e.get('code')} {e.get('title')}" for e in st.get("errors") or []),
+                    )
                 for msg in value.get("messages", []):
+                    log.info("whatsapp event for %s: message (%s)", phone_number_id, msg.get("type"))
                     if job := await ingest_whatsapp_message(
                         db, phone_number_id, value.get("contacts", []), msg
                     ):

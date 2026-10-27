@@ -252,3 +252,96 @@ def test_ai_sends_photos_it_picks(monkeypatch) -> None:
             await db.rollback()
 
     asyncio.run(go())
+
+
+def test_own_echo_does_not_pause_the_bot(monkeypatch) -> None:
+    """Instagram echoes the bot's own messages, often before the send call returns. That echo must not be
+    stored as a person replying (which pauses the bot): it takes the row stored before the send. An echo
+    stored anyway (no row to match) is relabelled as the bot's. Unique ids; rolled back."""
+    import uuid
+
+    from app.api.v1.webhooks import ingest_event
+    from app.models.shop_media import ShopMedia
+    from app.services.meta import instagram
+
+    run = uuid.uuid4().hex[:8]
+    script: list[str] = []
+    sent: list[str] = []
+
+    async def go() -> None:
+        async with async_session_factory() as db:
+            db.commit = db.flush  # stay inside the rolled-back transaction
+
+            def echo(mid, attachments=None):
+                return {"sender": {"id": f"biz-{run}"}, "recipient": {"id": f"cust-{run}"},
+                        "message": {"mid": mid, "is_echo": True, "text": None if attachments else "x",
+                                    **({"attachments": attachments} if attachments else {})}}
+
+            async def fake_text(token, acct, to, text):  # the echo arrives while the send call is in flight
+                mid = f"mid-t-{run}-{len(sent)}"
+                sent.append(text)
+                await ingest_event(db, f"biz-{run}", echo(mid))
+                return {"recipient_id": to, "message_id": mid}
+
+            async def fake_image(token, acct, to, url):
+                mid = f"mid-i-{run}-{len(sent)}"
+                sent.append(url)
+                await ingest_event(db, f"biz-{run}", echo(mid, [{"type": "image", "payload": {"url": "https://cdn.ig/e.jpg"}}]))
+                return {"recipient_id": to, "message_id": mid}
+
+            async def fake_generate(system, history, text, hint=""):
+                return script.pop(0)
+
+            async def no_profile(*_a, **_k):
+                return {}
+
+            monkeypatch.setattr(instagram, "send_text", fake_text)
+            monkeypatch.setattr(instagram, "send_image", fake_image)
+            monkeypatch.setattr(instagram, "fetch_customer_profile", no_profile)
+            monkeypatch.setattr(reply_pipeline, "generate_reply", fake_generate)
+
+            tenant = Tenant(name="Echo shop", ai_auto_reply=True)
+            db.add(tenant)
+            await db.flush()
+            db.add(KnowledgeDocument(tenant_id=tenant.id, title="Shop", content="Chura Rs 300"))
+            acct = SocialAccount(tenant_id=tenant.id, platform="instagram", external_account_id=f"biz-{run}",
+                                 access_token_encrypted=encrypt_token("tok"))
+            cust = Customer(tenant_id=tenant.id, external_user_id=f"cust-{run}", name="Sita")
+            db.add_all([acct, cust, ShopMedia(tenant_id=tenant.id, source="upload", url="https://s/c.jpg",
+                                              title="Chura", tags=["chura"])])
+            await db.flush()
+            convo = Conversation(tenant_id=tenant.id, customer_id=cust.id, social_account_id=acct.id, channel="instagram")
+            db.add(convo)
+            await db.flush()
+
+            async def ask(text):
+                m = Message(conversation_id=convo.id, sender_type="customer", content=text)
+                db.add(m)
+                await db.flush()
+                await reply_pipeline.auto_reply(db, m.id)
+
+            async def rows(sender):
+                return (await db.execute(select(Message).where(
+                    Message.conversation_id == convo.id, Message.sender_type == sender))).scalars().all()
+
+            script.append("Chura Rs 300 ho. [photo:P1]")
+            await ask("chura cha?")
+            assert len(sent) == 2 and await rows("agent") == []
+            assert sorted(m.external_message_id for m in await rows("ai")) == [f"mid-i-{run}-1", f"mid-t-{run}-0"]
+            assert not await reply_pipeline.human_active(db, convo.id)
+
+            # the echo was stored as a person's message before the bot's row could match it: relabelled as ours
+            async def stored_first(token, acct, to, text):
+                db.add(Message(conversation_id=convo.id, sender_type="agent", content=text,
+                               external_message_id=f"mid-late-{run}"))
+                await db.flush()
+                return {"message_id": f"mid-late-{run}"}
+
+            monkeypatch.setattr(instagram, "send_text", stored_first)
+            script.append("Aru kehi?")
+            await ask("ok")
+            assert await rows("agent") == [] and not await reply_pipeline.human_active(db, convo.id)
+            assert [m.content for m in await rows("ai")].count("Aru kehi?") == 1
+            await db.rollback()
+
+    asyncio.run(go())
