@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -156,20 +157,26 @@ async def _send_as_ai(
         await db.commit()
         raise
     mid = sent.get("message_id")
-    echo = (
-        await db.execute(
-            update(Message)
-            .where(Message.external_message_id == mid, Message.id != row.id)
-            .values(sender_type="ai", ai_generated=True)
-            .returning(Message.id)
-        )
-    ).first() if mid else None
-    if echo:
-        await db.delete(row)
-    else:
-        await db.execute(
-            update(Message).where(Message.id == row.id, Message.external_message_id.is_(None)).values(external_message_id=mid)
-        )
+    if mid:
+        try:
+            async with db.begin_nested():  # fails if the echo was stored under this id: adopted just below
+                await db.execute(
+                    update(Message)
+                    .where(Message.id == row.id, Message.external_message_id.is_(None))
+                    .values(external_message_id=mid)
+                )
+        except IntegrityError:
+            pass
+        echo = (
+            await db.execute(
+                update(Message)
+                .where(Message.external_message_id == mid, Message.id != row.id)
+                .values(sender_type="ai", ai_generated=True)
+                .returning(Message.id)
+            )
+        ).first()
+        if echo:
+            await db.delete(row)
     convo.last_message_at = datetime.now(timezone.utc)
     await db.commit()
 

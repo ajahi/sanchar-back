@@ -7,6 +7,7 @@ from typing import Annotated
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import exists, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decrypt_token
@@ -150,6 +151,30 @@ async def list_messages(
     return out
 
 
+async def _store_sent(db: AsyncSession, convo: Conversation, user, sent: dict, **values) -> Message:
+    """Store what a person sent from the dashboard under Meta's message id. Instagram / Messenger echo it back as a
+    webhook, often before the send call returns (always for a photo), so that echo may already be stored under this
+    id as an unattributed 'agent' message: take that row over (who sent it, our media url) instead of inserting a
+    second one, which would fail on the unique id."""
+    stmt = pg_insert(Message).values(
+        conversation_id=convo.id, external_message_id=sent.get("message_id"), sender_type="agent",
+        sender_agent_id=user.id, **values,
+    )
+    msg = (
+        await db.scalars(
+            stmt.on_conflict_do_update(
+                index_elements=["external_message_id"],
+                index_where=Message.external_message_id.isnot(None),
+                set_={"sender_agent_id": user.id, **({"media_url": values["media_url"]} if "media_url" in values else {})},
+            ).returning(Message),
+            execution_options={"populate_existing": True},
+        )
+    ).one()
+    convo.last_message_at = datetime.now(timezone.utc)
+    await db.commit()
+    return msg
+
+
 @router.post(
     "/{conversation_id}/messages",
     response_model=MessageOut,
@@ -186,17 +211,7 @@ async def reply(
             status_code=status.HTTP_502_BAD_GATEWAY, detail=f"{account.platform} unreachable"
         )
 
-    msg = Message(
-        conversation_id=convo.id,
-        external_message_id=sent.get("message_id"),
-        sender_type="agent",
-        sender_agent_id=user.id,
-        content=body.text,
-    )
-    db.add(msg)
-    convo.last_message_at = datetime.now(timezone.utc)
-    await db.commit()
-    await db.refresh(msg)
+    msg = await _store_sent(db, convo, user, sent, content=body.text)
     msg.sender_name = user.name
     return msg
 
@@ -239,17 +254,6 @@ async def send_media(
     except httpx.HTTPError:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"{account.platform} unreachable")
 
-    msg = Message(
-        conversation_id=convo.id,
-        external_message_id=sent.get("message_id"),
-        sender_type="agent",
-        sender_agent_id=user.id,
-        message_type="image",
-        media_url=media.url,
-    )
-    db.add(msg)
-    convo.last_message_at = datetime.now(timezone.utc)
-    await db.commit()
-    await db.refresh(msg)
+    msg = await _store_sent(db, convo, user, sent, message_type="image", media_url=media.url)
     msg.sender_name = user.name
     return msg

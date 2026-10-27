@@ -363,3 +363,63 @@ def test_own_echo_does_not_pause_the_bot(monkeypatch) -> None:
             await db.rollback()
 
     asyncio.run(go())
+
+
+def test_dashboard_send_takes_over_its_echo(monkeypatch) -> None:
+    """A person replies from the dashboard; Instagram's echo of it is stored first (it often beats the send call's
+    answer, always for a photo). The dashboard must take that row over, not insert a second one under the same
+    Meta id (which used to fail on the unique index after the customer already had the message). Rolled back."""
+    import uuid
+
+    from app.api.v1.conversations import reply, send_media
+    from app.api.v1.webhooks import ingest_event
+    from app.models.shop_media import ShopMedia
+    from app.models.user import User
+    from app.schemas.conversation import ReplyIn
+    from app.schemas.shop_media import SendMediaIn
+    from app.services.meta import instagram
+
+    run = uuid.uuid4().hex[:8]
+
+    async def go() -> None:
+        async with async_session_factory() as db:
+            db.commit = db.flush  # stay inside the rolled-back transaction
+
+            async def echo_first(mid, attachments=None):
+                event = {"sender": {"id": f"biz-{run}"}, "recipient": {"id": f"cust-{run}"},
+                         "message": {"mid": mid, "is_echo": True, "text": None if attachments else "Namaste!",
+                                     **({"attachments": attachments} if attachments else {})}}
+                await ingest_event(db, f"biz-{run}", event)
+                return {"recipient_id": f"cust-{run}", "message_id": mid}
+
+            async def no_profile(*_a, **_k):
+                return {}
+
+            monkeypatch.setattr(instagram, "send_text", lambda *a: echo_first(f"mid-d-{run}"))
+            monkeypatch.setattr(instagram, "send_image", lambda *a: echo_first(
+                f"mid-p-{run}", [{"type": "image", "payload": {"url": "https://cdn.ig/echo.jpg"}}]))
+            monkeypatch.setattr(instagram, "fetch_customer_profile", no_profile)
+
+            tenant = Tenant(name="Desk shop")
+            db.add(tenant)
+            await db.flush()
+            user = User(tenant_id=tenant.id, name="Asha", email=f"asha-{run}@x.np")
+            acct = SocialAccount(tenant_id=tenant.id, platform="instagram", external_account_id=f"biz-{run}",
+                                 access_token_encrypted=encrypt_token("tok"))
+            cust = Customer(tenant_id=tenant.id, external_user_id=f"cust-{run}", name="Sita")
+            photo = ShopMedia(tenant_id=tenant.id, source="upload", url="https://s/ours.jpg", title="Chura")
+            db.add_all([user, acct, cust, photo])
+            await db.flush()
+            convo = Conversation(tenant_id=tenant.id, customer_id=cust.id, social_account_id=acct.id, channel="instagram")
+            db.add(convo)
+            await db.flush()
+
+            text = await reply(convo.id, ReplyIn(text="Namaste!"), tenant, user, db)
+            pic = await send_media(convo.id, SendMediaIn(media_id=photo.id), tenant, user, db)
+            assert (text.external_message_id, text.sender_agent_id, text.sender_type) == (f"mid-d-{run}", user.id, "agent")
+            assert (pic.external_message_id, pic.sender_agent_id, pic.media_url) == (f"mid-p-{run}", user.id, "https://s/ours.jpg")
+            rows = (await db.execute(select(Message).where(Message.conversation_id == convo.id))).scalars().all()
+            assert len(rows) == 2
+            await db.rollback()
+
+    asyncio.run(go())
