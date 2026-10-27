@@ -74,3 +74,28 @@ def test_order_label_split_out():
     assert auto_reply.split_order("Thik cha. [ORDER: Ram | | Baneshwor | box]") == ("Thik cha.", None)
     assert auto_reply.split_order("Naam pathaunus. [order: name | phone | address | 2 box]") == ("Naam pathaunus.", None)
     assert auto_reply.split_order("Hajur [photo:P1]") == ("Hajur [photo:P1]", None)
+
+
+def test_picked_photo_grows_into_its_set():
+    # newest first, as sendable_photos lists them: the menu was uploaded page 1 -> page 3
+    photos = [
+        ("Menu page 3", ["menu", "drinks"]),
+        ("Chura box", ["tihar", "chura"]),
+        ("Menu page 2", ["menu", "momo"]),
+        ("Menu page 1", ["menu", "breakfast"]),
+        ("Lehenga red", ["lehenga", "wedding"]),
+        ("Lehenga blue", ["lehenga", "wedding"]),
+    ]
+    # the customer asked for the menu, the model picked one page: every "menu" photo, in upload order
+    assert auto_reply.expand_picks("menu pathaunu na", photos, [2]) == [3, 2, 0]
+    # no tag in their words: the photos tagged exactly alike form the set
+    assert auto_reply.expand_picks("dekhau na", photos, [4]) == [5, 4]
+    # a photo with its own tags stays alone; picks keep their order; never more than MAX_SET_PHOTOS
+    assert auto_reply.expand_picks("chura?", photos, [1, 0]) == [1, 0]
+    assert auto_reply.expand_picks("chura?", photos, [1]) == [1]
+    many = [(f"Menu {i}", ["menu"]) for i in range(15)]
+    assert len(auto_reply.expand_picks("menu", many, [0])) == auto_reply.MAX_SET_PHOTOS
+    assert auto_reply.sent_photos_note(["Menu", "Menu", "Menu"]) == "[sent 3 photos: Menu]"
+    assert auto_reply.sent_photos_note(["Chura box"]) == "[sent photo: Chura box]"
+    # the model copying a history note never reaches the customer
+    assert auto_reply.split_photos("Yo ho [sent 3 photos: Menu] [photo:P1]", 2) == ("Yo ho", [0])

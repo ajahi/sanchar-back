@@ -50,8 +50,9 @@ PHOTOS_TEMPLATE = """PHOTOS YOU CAN SEND (label, name, tags)
 These photos show what the business offers (products, services, classes, events, offers), and their names and tags (colours, occasions, festivals, uses, places) are business information too: answer from them like from the text above. When the customer asks to see something, or asks about anything that matches a photo's name or one of its tags (e.g. a question about a festival matches a photo tagged with that festival), say yes, name that item, and put its label at the very end of your reply, like [photo:P1]. Only attach a photo that shows what the customer asked about; if no photo matches (e.g. a price question about an item that has no photo), attach none. At most 3 labels. Use only labels from this list, never write a link, and never mention a label in your sentences (the customer does not see them). The photo is sent right after your message. Never invent a price or discount: use only what SHOP INFORMATION or the photo's name and tags say."""
 
 MAX_PHOTOS_PER_REPLY = 3
-# Any [photo:...] or [sent photo:...] the model writes; only "P<n>" inside picks a photo, the rest is just removed.
-_PHOTO_TAG = re.compile(r"\[\s*(?:sent\s+)?photo\s*:([^\]]*)\]", re.IGNORECASE)
+# Any [photo:...] or [sent photo:...] / [sent 3 photos:...] the model writes (it mimics its history); only "P<n>"
+# inside picks a photo, the rest is just removed.
+_PHOTO_TAG = re.compile(r"\[\s*(?:sent\s+(?:\d+\s+)?)?photos?\s*:([^\]]*)\]", re.IGNORECASE)
 
 
 def build_system_prompt(
@@ -75,6 +76,40 @@ def build_system_prompt(
 
 _WORD = re.compile(r"[a-z0-9ऀ-ॿ]+")
 _FILLER = {"gift", "gifts", "box", "item", "items", "offer", "offers", "new", "the", "and", "for", "ko", "ma"}
+MAX_SET_PHOTOS = 10  # a menu or catalogue split over several photos is sent whole, up to this many
+
+
+def _words(text: str) -> set[str]:
+    return set(_WORD.findall(text.lower()))
+
+
+def _needed(phrase: str) -> set[str]:
+    """The words of a tag or name that must be in a message for it to match (filler and 1-letter words dropped)."""
+    return {w for w in _WORD.findall(phrase.lower()) if w not in _FILLER and len(w) > 1}
+
+
+def expand_picks(user_text: str, photos: list[tuple[str | None, list[str]]], picks: list[int]) -> list[int]:
+    """Grow each photo the model picked into its set: a menu over 10 photos, each tagged "menu", goes out whole.
+    The set = the photos sharing the tag the customer's words matched ("menu pathaunus" -> every "menu" photo),
+    or, when none of its tags was in their words, the photos tagged exactly like it. In upload order (photos is
+    newest first), at most MAX_SET_PHOTOS in all."""
+    words, out = _words(user_text), []
+    for p in picks:
+        tags = set(photos[p][1])
+        asked = {t for t in tags if (n := _needed(t)) and n <= words}
+        if asked:
+            group = [i for i, (_, ts) in enumerate(photos) if asked & set(ts)]
+        else:
+            group = [i for i, (_, ts) in enumerate(photos) if tags and set(ts) == tags] or [p]
+        out += [i for i in sorted(group, reverse=True) if i not in out]
+    return out[:MAX_SET_PHOTOS]
+
+
+def sent_photos_note(titles: list[str]) -> str:
+    """The history line for the photos one reply sent, so the model knows it showed them."""
+    if len(titles) == 1:
+        return f"[sent photo: {titles[0]}]"
+    return f"[sent {len(titles)} photos: {', '.join(dict.fromkeys(titles))}]"
 
 
 def photo_hint(user_text: str, photos: list[tuple[str | None, list[str]]]) -> str:
@@ -82,11 +117,11 @@ def photo_hint(user_text: str, photos: list[tuple[str | None, list[str]]]) -> st
     matches the tag "bhai-tika gifts", "tihar" matches "tihar". A tag matches when all its words (minus filler like
     "gift", "box") are in the message. The model still decides; the note only stops it overlooking a photo listed
     far below a long SHOP INFORMATION. ponytail: exact words only, no stemming or Nepali/English synonyms."""
-    words = set(_WORD.findall(user_text.lower()))
+    words = _words(user_text)
     hits = []
     for i, (title, tags) in enumerate(photos):
         for phrase in [*tags, title or ""]:
-            needed = {w for w in _WORD.findall(phrase.lower()) if w not in _FILLER and len(w) > 1}
+            needed = _needed(phrase)
             if needed and needed <= words:
                 hits.append(f"P{i + 1} {title or 'Untitled photo'} (matches '{phrase}')")
                 break

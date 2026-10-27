@@ -249,6 +249,24 @@ def test_ai_sends_photos_it_picks(monkeypatch) -> None:
             assert texts[-1] == "Dhanyabad Sita ji! Hami call garera confirm garchau."
             lead = (await db.execute(select(SalesLead).where(SalesLead.customer_id == cust.id))).scalar_one()
             assert (lead.phone, lead.meta["order"]["items"]) == ("+9779801234567", "1 Red Kurtha")
+
+            # 5. a menu over 3 photos: the model picks one page, the customer gets all of them in page order,
+            # and the history gets one line for the lot
+            fail["images"] = False
+            db.add_all([
+                ShopMedia(tenant_id=shop.id, source="upload", url=f"https://s/menu{n}.jpg", title=f"Menu page {n}",
+                          tags=["menu", extra], created_at=ago(0.5 - n / 10))
+                for n, extra in ((1, "breakfast"), (2, "momo"), (3, "drinks"))
+            ])
+            await db.flush()
+            before = len(images)
+            script.append("Yo hamro menu ho. [photo:P2]")
+            await ask("menu pathaunus", 0.1)
+            assert images[before:] == ["https://s/menu1.jpg", "https://s/menu2.jpg", "https://s/menu3.jpg"]
+            notes = (await db.execute(select(Message.content).where(
+                Message.conversation_id == convo.id, Message.message_type == "image",
+                Message.media_url.like("https://s/menu%"), Message.content.isnot(None)))).scalars().all()
+            assert notes == ["[sent 3 photos: Menu page 1, Menu page 2, Menu page 3]"]
             await db.rollback()
 
     asyncio.run(go())

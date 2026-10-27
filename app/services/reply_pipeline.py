@@ -32,7 +32,9 @@ from app.models.message import Message
 from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
-from app.services.auto_reply import build_system_prompt, generate_reply, photo_hint, split_order, split_photos
+from app.services.auto_reply import (
+    build_system_prompt, expand_picks, generate_reply, photo_hint, sent_photos_note, split_order, split_photos,
+)
 from app.services import campaigns
 from app.services.leads import save_order
 from app.services.meta import CHANNELS
@@ -351,13 +353,17 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
             log.exception("sending AI reply failed for conversation %s: %s", convo.id, _meta_error(exc))
             return
 
-    # The photos the model picked, after the text: if one fails the customer still has the answer.
+    # The photos the model picked (each grown into its set, e.g. every page of a menu), after the text: if one
+    # fails the customer still has the answer. Only the first row carries the history note: the history holds
+    # the last HISTORY rows with content, and ten photo rows would push the conversation out of it.
     send_image = getattr(channel, "send_image", None)
-    for media in [photos[i] for i in picks] if send_image else []:
+    chosen = [photos[i] for i in expand_picks(msg.content, listed, picks)] if send_image else []
+    note = sent_photos_note([m.title or "photo" for m in chosen])
+    for n, media in enumerate(chosen):
         try:
             await _send_as_ai(
                 db, convo, lambda: send_image(token, acct, to, media.url), message_type="image", media_url=media.url,
-                content=f"[sent photo: {media.title or 'photo'}]", meta={"media_id": str(media.id)},
+                content=None if n else note, meta={"media_id": str(media.id)},
             )
         except httpx.HTTPError as exc:
             log.warning("sending photo %s failed for conversation %s: %s", media.id, convo.id, _meta_error(exc))
