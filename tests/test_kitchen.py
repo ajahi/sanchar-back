@@ -27,7 +27,9 @@ MENU = [
     {"_id": "m4", "name": "Chicken Fried Momo", "price": 200, "category": "mo:mo"},
     {"_id": "m5", "name": "Pizza Momo- Veg", "price": 290, "category": "mo:mo"},
     {"_id": "m6", "name": "Chicken & Egg Rice", "price": 450, "category": "rice"},
-    {"_id": "m7", "name": "Coke ice/lemon", "price": 100, "category": "other cold drinks"},
+    {"_id": "m7", "name": "Coke ice/lemon", "price": 150, "category": "other cold drinks"},
+    {"_id": "m8", "name": "Coke 250ml", "price": 100, "category": "other cold drinks"},
+    {"_id": "m9", "name": "Ramyun 2x Spicy", "price": 390, "category": "noodles"},
 ]
 AREAS = [{"address": "alumaila chowk", "rate": 80}, {"address": "bagale tole", "rate": 50}, {"address": "bagar", "rate": 90}]
 
@@ -39,6 +41,11 @@ def test_lines_match_the_menu_or_are_left_for_staff():
     assert m("duita veg sadeko momo") == ("Veg Sadheko Momo", 2)  # Nepali count, near spelling
     assert m("Veg Pizza Momo") == ("Pizza Momo- Veg", 1)  # any word order
     assert m("1 Chicken & Egg Rice") == ("Chicken & Egg Rice", 1)
+    assert m("Buff Jhol Momo x2") == ("Buff Jhol Momo", 2)  # how the bot writes it
+    assert m("2x Buff Jhol Momo") == m("Buff Jhol Momo ×2") == ("Buff Jhol Momo", 2)
+    assert m("1 Ramyun 2x Spicy") == ("Ramyun 2x Spicy", 1)  # a "2x" inside a name is not a count
+    assert m("Coke 250ml x3") == ("Coke 250ml", 3)
+    assert m("Coke x1")[0] is None  # 250ml or ice/lemon? asked, not guessed
     assert m("chicken momo")[0] is None  # steam or fried? never guessed into the kitchen
     assert m("2 plate")[0] is None
     plan = kitchen.plan({"items": "2 Buff Jhol Momo, 1 Coke ice/lemon and 1 chicken momo", "address": "Alumaila chowk, near the pump"},
@@ -62,7 +69,7 @@ def test_body_is_what_the_website_posts():
     assert body["data"] == {"fullName": "Ram", "address": "bagale tole", "phone": "9812345678", "email": "cafe@x.np",
                             "deliveryLocation": "bagale tole"}
     assert body["product"] == ["m1", "m7"] and body["item"][0]["quantity"] == 2
-    assert (body["deliveryOption"], body["deliveryCharge"], body["totalAmount"]) == ("bagale tole", 50, 2 * 250 + 100 + 50)
+    assert (body["deliveryOption"], body["deliveryCharge"], body["totalAmount"]) == ("bagale tole", 50, 2 * 250 + 150 + 50)
     pickup = kitchen.build_body(order, [(MENU[0], 1)], {"address": kitchen.PICKUP, "rate": 0}, None)
     assert (pickup["deliveryOption"], pickup["data"]["deliveryLocation"], pickup["totalAmount"]) == ("Pick up", "Pick-up", 250)
 

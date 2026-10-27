@@ -106,12 +106,26 @@ async def fresh(db: AsyncSession, integ: OrderIntegration) -> None:
         log.warning("kitchen menu sync failed for tenant %s", integ.tenant_id, exc_info=True)
 
 
+def _qty(word: str) -> int | None:
+    """A count: "2", "x2", "2x" (the bot writes "Veg Steam Momo x1"), "duita"."""
+    m = re.fullmatch(r"x?(\d{1,2})x?", word)
+    return (int(m.group(1)) or None) if m else _NUM_WORDS.get(word)
+
+
 def match_line(text: str, catalog: list[dict]) -> tuple[dict | None, int]:
     """(menu item or None, quantity) for one order line like "2 Buff Jhol Momo - Rs 250 each"."""
     words = _norm(re.sub(r"rs\.?\s*[\d,]+", " ", text, flags=re.IGNORECASE)).split()
-    qty = next((int(w) for w in words if w.isdigit() and 0 < int(w) < 100), None) or next(
-        (_NUM_WORDS[w] for w in words if w in _NUM_WORDS), 1)
-    name = [w for w in words if not w.isdigit() and w not in _NUM_WORDS and w not in _UNITS]
+    count = lambda ws: next((q for w in ws if (q := _qty(w))), 1)  # noqa: E731
+    # A menu name written out in full, the rest only a count or unit. First, because a name can itself look
+    # like a count ("Ramyun 2x Spicy" is an item, not 2 x "Ramyun Spicy").
+    for p in sorted(catalog, key=lambda p: -len(p["name"])):
+        n = _norm(p["name"]).split()
+        for i in range(len(words) - len(n) + 1):
+            rest = words[:i] + words[i + len(n):]
+            if words[i:i + len(n)] == n and all(_qty(w) or w in _UNITS for w in rest):
+                return p, count(rest)
+    qty = count(words)
+    name = [w for w in words if not _qty(w) and w not in _UNITS]
     if not name:
         return None, qty
     same = [p for p in catalog if sorted(_norm(p["name"]).split()) == sorted(name)]  # exact, any word order
