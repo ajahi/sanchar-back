@@ -30,6 +30,7 @@ from app.models.customer import Customer
 from app.models.handover import HandoverEvent
 from app.models.knowledge import KnowledgeDocument
 from app.models.message import Message
+from app.models.sales_lead import SalesLead
 from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
@@ -343,8 +344,8 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     if order:  # kept even if the reply is dropped below: the customer did give (and confirm) these details
         lead = await save_order(db, account=account, convo=convo, customer=customer, order=order)
         if lead is not None:  # new or changed: into the business's own order system, if it has one set to auto-send
-            await db.flush()
-            await kitchen.auto_send(db, lead)
+            await db.commit()  # the order is kept whatever happens to the kitchen send
+            await _send_to_kitchen(lead.id)
     if not reply and not picks:
         return
 
@@ -378,6 +379,19 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
         except httpx.HTTPError as exc:
             log.warning("sending photo %s failed for conversation %s: %s", media.id, convo.id, _meta_error(exc))
             break  # the rest would most likely fail the same way (expired url, window closed)
+
+
+async def _send_to_kitchen(lead_id) -> None:
+    """kitchen.auto_send in its own session: whatever fails there (the order system down, a table missing after
+    a deploy) never costs the customer their reply or the saved order."""
+    try:
+        async with async_session_factory() as s:
+            lead = await s.get(SalesLead, lead_id)
+            if lead is not None:
+                await kitchen.auto_send(s, lead)
+                await s.commit()
+    except Exception:  # noqa: BLE001
+        log_failure(log, "kitchen send failed for lead %s", lead_id)
 
 
 async def run_auto_reply(message_id) -> None:

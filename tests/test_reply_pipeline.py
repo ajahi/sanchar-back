@@ -241,8 +241,22 @@ def test_ai_sends_photos_it_picks(monkeypatch) -> None:
             await ask("photo?", 1)
             assert texts[-1] == "Yo ho." and len(images) == 2
 
-            # 4. the bot collected an order: the label never reaches the customer, the order lands on the lead
+            # 4. the bot collected an order: the label never reaches the customer, the order lands on the lead.
+            # The kitchen send blowing up (here: its table missing after a deploy) costs neither of them.
             from app.models.sales_lead import SalesLead
+
+            class KitchenDown:
+                async def __aenter__(self):
+                    raise RuntimeError('relation "order_integrations" does not exist')
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            async def kitchen_down(*_a, **_k):
+                raise RuntimeError('relation "order_integrations" does not exist')
+
+            monkeypatch.setattr(reply_pipeline, "async_session_factory", KitchenDown)
+            monkeypatch.setattr(reply_pipeline.kitchen, "auto_send", kitchen_down)
 
             script.append("Dhanyabad Sita ji! Hami call garera confirm garchau. [order: Sita | 9801234567 | Patan | 1 Red Kurtha]")
             await ask("Sita, 9801234567, Patan, 1 red kurtha", 0.5)
