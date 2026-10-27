@@ -9,6 +9,7 @@ from app.models.handover import HandoverEvent
 from app.models.knowledge import KnowledgeDocument
 from app.models.message import Message
 from app.models.notification import Notification
+from app.models.order_integration import OrderIntegration
 from app.models.permission import Permission, role_permissions
 from app.models.role import Role, user_roles
 from app.models.sales_lead import SalesLead
@@ -38,4 +39,5 @@ __all__ = [
     "CampaignLink",
     "AuditLog",
     "Notification",
+    "OrderIntegration",
 ]

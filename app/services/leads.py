@@ -84,10 +84,11 @@ async def capture_lead(
 
 async def save_order(
     db: AsyncSession, *, account: SocialAccount, convo: Conversation, customer: Customer, order: dict
-) -> bool:
+) -> SalesLead | None:
     """Put the order the bot collected (name, phone, address, items: auto_reply.split_order) on the customer's
     lead, creating the lead if needed. A new or changed order goes back to 'new' for staff to confirm and pings
-    them once; the same order repeated (the bot re-states it later in the chat) changes nothing. Adds, never commits."""
+    them once; the same order repeated (the bot re-states it later in the chat) changes nothing.
+    Returns the lead when the order is new or changed, else None. Adds, never commits."""
     phone = extract_phone(order["phone"]) or order["phone"]  # a landline or foreign number is kept as written
     lead = (
         await db.execute(
@@ -101,7 +102,7 @@ async def save_order(
         )
         db.add(lead)
     elif (lead.meta or {}).get("order") == order:
-        return False
+        return None
     lead.phone, lead.conversation_id, lead.status = phone, convo.id, "new"
     lead.meta = {**(lead.meta or {}), "order": order}  # a new dict, so the JSONB change is saved
     customer.phone = customer.phone or phone
@@ -115,4 +116,4 @@ async def save_order(
         message=order["items"],
         payload={"conversation_id": str(convo.id), "customer_id": str(customer.id), "phone": phone},
     )
-    return True
+    return lead

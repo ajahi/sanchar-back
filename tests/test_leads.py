@@ -105,8 +105,8 @@ def test_bot_order_saved_on_lead_and_listed() -> None:
                 return (await db.execute(select(Notification).where(
                     Notification.tenant_id == t.id, Notification.event == "order_received"))).scalars().all()
 
-            assert await save(order) is True
-            assert await save(dict(order)) is False  # the bot re-stated the same order: no second ping
+            assert await save(order) is not None
+            assert await save(dict(order)) is None  # the bot re-stated the same order: no second ping
             assert len(await pings()) == 1
             [row] = await list_leads(t, db, None)
             assert (row.phone, row.status, row.customer_name, row.order) == ("+9779812345678", "new", "ram.fb", order)
@@ -117,7 +117,7 @@ def test_bot_order_saved_on_lead_and_listed() -> None:
             assert await list_leads(other, db, None) == []  # another business never sees it
 
             changed = {**order, "items": "3 chura box"}
-            assert await save(changed) is True
+            assert await save(changed) is not None
             [row] = await list_leads(t, db, "new")  # back in the queue to confirm again
             assert row.order == changed and len(await pings()) == 2
             await db.rollback()

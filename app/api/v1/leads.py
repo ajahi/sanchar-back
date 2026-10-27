@@ -15,6 +15,7 @@ from app.db.session import get_db
 from app.models.customer import Customer
 from app.models.sales_lead import SalesLead
 from app.schemas.lead import LeadOut, LeadPatch, LeadStatus
+from app.services import kitchen
 
 router = APIRouter(prefix="/leads", tags=["leads"])
 
@@ -26,6 +27,8 @@ def _out(lead: SalesLead, customer: Customer) -> LeadOut:
         id=lead.id, status=lead.status, phone=lead.phone, channel=lead.channel,
         customer_name=customer.name or customer.external_username, conversation_id=lead.conversation_id,
         order=(lead.meta or {}).get("order"), updated_at=lead.updated_at,
+        kitchen=lead.meta["kitchen"] if kitchen.already_sent(lead) else None,
+        kitchen_error=(lead.meta or {}).get("kitchen_error"),
     )
 
 

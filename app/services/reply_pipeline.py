@@ -36,7 +36,7 @@ from app.models.tenant import Tenant
 from app.services.auto_reply import (
     build_system_prompt, expand_picks, generate_reply, photo_hint, sent_photos_note, split_order, split_photos,
 )
-from app.services import campaigns
+from app.services import campaigns, kitchen
 from app.services.leads import save_order
 from app.services.meta import CHANNELS
 from app.services.notifications import create_notification
@@ -340,8 +340,11 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
         return
     reply, order = split_order(reply or "")
     reply, picks = split_photos(reply, len(photos))
-    if order:  # kept even if the reply is dropped below: the customer did give these details
-        await save_order(db, account=account, convo=convo, customer=customer, order=order)
+    if order:  # kept even if the reply is dropped below: the customer did give (and confirm) these details
+        lead = await save_order(db, account=account, convo=convo, customer=customer, order=order)
+        if lead is not None:  # new or changed: into the business's own order system, if it has one set to auto-send
+            await db.flush()
+            await kitchen.auto_send(db, lead)
     if not reply and not picks:
         return
 
