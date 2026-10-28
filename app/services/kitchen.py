@@ -234,6 +234,9 @@ async def auto_send(db: AsyncSession, lead: SalesLead) -> None:
     integ = await db.get(OrderIntegration, lead.tenant_id)
     order = (lead.meta or {}).get("order")
     if integ is None or not (integ.send_enabled and integ.auto_send) or not order or already_sent(lead):
+        if integ is not None:  # this business has the kitchen set up: say why this order did not go
+            log.info("kitchen auto-send not run for lead %s: send %s, auto %s, already sent %s", lead.id,
+                     integ.send_enabled, integ.auto_send, already_sent(lead))
         return
     await fresh(db, integ)
     p = plan(order, integ)

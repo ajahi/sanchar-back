@@ -12,6 +12,15 @@ def test_prompt_carries_shop_context():
     assert "PRODUCT: X Rs 10" in p and "SHOP INFORMATION" in p
 
 
+def test_long_reply_goes_as_several_messages():
+    menu = "\n".join(f"Item {i} - Rs {i * 10}" for i in range(120))  # ~2000 chars, like a menu listing
+    parts = auto_reply.split_long(menu)
+    assert len(parts) == 3 and all(len(p) <= 1000 for p in parts)
+    assert "\n".join(parts) == menu  # cut at line breaks: nothing lost, no item split
+    assert auto_reply.split_long("short") == ["short"] and auto_reply.split_long("") == []
+    assert [len(p) for p in auto_reply.split_long("x" * 2500)] == [1000, 1000, 500]  # no break anywhere
+
+
 def _run(monkeypatch, user_text: str, answers: list[str]) -> tuple[str, int]:
     calls = []
 

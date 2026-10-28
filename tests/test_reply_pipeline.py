@@ -362,6 +362,18 @@ def test_own_echo_does_not_pause_the_bot(monkeypatch) -> None:
             assert sorted(m.external_message_id for m in await rows("ai")) == [f"mid-i-{run}-1", f"mid-t-{run}-0"]
             assert not await reply_pipeline.human_active(db, convo.id)
 
+            # a photo set: photo 1's echo arrives late, after photo 2's row is waiting. It is already stored:
+            # it must not take photo 2's row (that id is unique: the whole event failed)
+            nxt = Message(conversation_id=convo.id, sender_type="ai", message_type="image", ai_generated=True)
+            db.add(nxt)
+            await db.flush()
+            img = [{"type": "image", "payload": {"url": "https://cdn.ig/e.jpg"}}]
+            assert await ingest_event(db, f"biz-{run}", echo(f"mid-i-{run}-1", img)) is None
+            await db.refresh(nxt)
+            assert nxt.external_message_id is None and await rows("agent") == []
+            await db.delete(nxt)
+            await db.flush()
+
             # the echo was stored as a person's message before the bot's row could match it: relabelled as ours
             async def stored_first(token, acct, to, text):
                 db.add(Message(conversation_id=convo.id, sender_type="agent", content=text,

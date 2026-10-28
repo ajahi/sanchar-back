@@ -433,9 +433,12 @@ async def claim_own_echo(db: AsyncSession, conversation_id, mid: str, message_ty
         .limit(1)
         .scalar_subquery()
     )
+    # A late echo of a photo the bot already gave its id (a photo set: the next photo's row is pending by then)
+    # must not take that row: the id exists, so nothing is claimed and the insert below skips it.
+    stored = select(Message.id).where(Message.external_message_id == mid).exists()
     claimed = await db.execute(
         update(Message)
-        .where(Message.id == pending, Message.external_message_id.is_(None))
+        .where(Message.id == pending, Message.external_message_id.is_(None), ~stored)
         .values(external_message_id=mid)
         .returning(Message.id)
     )

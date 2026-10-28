@@ -35,7 +35,8 @@ from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
 from app.services.auto_reply import (
-    build_system_prompt, expand_picks, generate_reply, photo_hint, sent_photos_note, split_order, split_photos,
+    build_system_prompt, expand_picks, generate_reply, photo_hint, sent_photos_note, split_long, split_order,
+    split_photos,
 )
 from app.services import campaigns, kitchen
 from app.services.leads import save_order
@@ -355,14 +356,15 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
         return
     channel = CHANNELS[account.platform]
     token, acct, to = decrypt_token(account.access_token_encrypted), account.external_account_id, customer.external_user_id
-    if reply:  # the model may answer with only a photo label
-        try:
+    try:  # the model may answer with only a photo label (no text); a long answer goes as several messages
+        for part in split_long(reply):
             await _send_as_ai(
-                db, convo, lambda: channel.send_text(token, acct, to, reply), content=reply, meta={"model": settings.llm_model}
+                db, convo, lambda part=part: channel.send_text(token, acct, to, part), content=part,
+                meta={"model": settings.llm_model},
             )
-        except httpx.HTTPError as exc:
-            log.exception("sending AI reply failed for conversation %s: %s", convo.id, _meta_error(exc))
-            return
+    except httpx.HTTPError as exc:
+        log.exception("sending AI reply failed for conversation %s: %s", convo.id, _meta_error(exc))
+        return
 
     # The photos the model picked (each grown into its set, e.g. every page of a menu), after the text: if one
     # fails the customer still has the answer. Only the first row carries the history note: the history holds

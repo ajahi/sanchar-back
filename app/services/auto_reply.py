@@ -168,6 +168,24 @@ def split_order(reply: str) -> tuple[str, dict | None]:
     return _ORDER_TAG.sub("", reply).strip(), order
 
 
+MAX_MESSAGE = 1000  # Instagram refuses a longer DM (Messenger 2000, WhatsApp 4096: the smallest fits all)
+
+
+def split_long(text: str, limit: int = MAX_MESSAGE) -> list[str]:
+    """A reply longer than one message, as several: cut at a blank line, else a line break, else a space."""
+    parts = []
+    while len(text) > limit:
+        for sep in ("\n\n", "\n", " "):
+            cut = text.rfind(sep, 0, limit)
+            if cut > limit // 2:
+                break
+        else:
+            cut = limit
+        parts.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    return [*parts, text] if text else parts
+
+
 async def _chat(messages: list[dict]) -> str:
     async with _LLM_SLOTS:
         body = await http_client.request_json(
