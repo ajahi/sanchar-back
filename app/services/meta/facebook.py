@@ -63,7 +63,11 @@ async def exchange_code_for_long_lived_token(code: str) -> str:
 
 
 async def fetch_user_pages(user_token: str) -> list[dict]:
-    """[{id, name, access_token}] for the Pages the admin granted. ponytail: first 100, no paging."""
+    """[{id, name, access_token}] for the Pages the admin granted. ponytail: first 100, no paging.
+
+    /me/accounts leaves out a Page the person reaches through a Business portfolio (listing those needs
+    business_management, which we don't ask for), even when they ticked it in the popup. Such a Page is
+    still in the token's granular scopes (Meta's record of the grant) and gives its token when asked by id."""
     async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.get(
             f"{GRAPH_BASE}/{API_VERSION}/me/accounts",
@@ -71,7 +75,22 @@ async def fetch_user_pages(user_token: str) -> list[dict]:
             headers=_auth(user_token),
         )
         resp.raise_for_status()
-        return resp.json().get("data", [])
+        pages = resp.json().get("data", [])
+        grant = await client.get(
+            f"{GRAPH_BASE}/{API_VERSION}/debug_token",
+            params={"input_token": user_token, "access_token": f"{settings.facebook_app_id}|{settings.meta_app_secret}"},
+        )
+        scopes = grant.json().get("data", {}).get("granular_scopes", []) if grant.is_success else []
+        granted = next((s.get("target_ids", []) for s in scopes if s.get("scope") == "pages_show_list"), [])
+        for page_id in set(granted) - {p.get("id") for p in pages}:
+            page = await client.get(
+                f"{GRAPH_BASE}/{API_VERSION}/{page_id}", params={"fields": "id,name,access_token"}, headers=_auth(user_token)
+            )
+            if page.is_success:
+                pages.append(page.json())
+            else:
+                log.warning("facebook page %s was granted but not readable: %s", page_id, page.text[:300])
+        return pages
 
 
 def _auth(token: str) -> dict:

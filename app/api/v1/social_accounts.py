@@ -669,6 +669,8 @@ async def facebook_callback(
         return _redirect_to_frontend(fb_error="invalid_state")
     user = await db.get(User, user_id) if user_id else None
     if user is None or user.status != "active" or user.tenant_id is None:
+        log.warning("facebook connect refused for user %s: %s", user_id,
+                    "no such user" if user is None else f"status {user.status}, workspace {user.tenant_id}")
         return _redirect_to_frontend(fb_error="invalid_session")
 
     try:
@@ -677,11 +679,16 @@ async def facebook_callback(
         body = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
         log.error("facebook token exchange failed: %r %s", exc, body)
         return _redirect_to_frontend(fb_error="token_exchange_failed")
+    # Empty: no Page was ticked in the popup, or the Pages are reached only through a Business portfolio
+    # (that needs business_management, which we don't ask for)
+    log.info("facebook connect for user %s (workspace %s): Facebook granted %d page(s): %s", user.id,
+             user.tenant_id, len(pages), [(p.get("id"), p.get("name"), bool(p.get("access_token"))) for p in pages])
 
     linked = 0
     for page in pages:
         page_id, token = page.get("id"), page.get("access_token")
         if not page_id or not token:
+            log.warning("facebook page %s skipped: no page token (the person has no full control of it)", page_id)
             continue
         try:
             account = await _page_row(db, page_id, user.tenant_id)
