@@ -177,7 +177,10 @@ def build_body(order: dict, lines: list[tuple[dict, int]], location: dict, email
     return {
         "data": {"fullName": order["name"], "address": order["address"], "phone": phone, "email": email or "",
                  "deliveryLocation": "Pick-up" if pickup else location["address"]},
-        "item": [{**p, "quantity": q, "selectedSize": None, "selectedColor": None, "requests": None} for p, q in lines],
+        # the site has no note for the whole order, only one per item (its "special requests" box): on every line,
+        # so whoever makes each item sees it
+        "item": [{**p, "quantity": q, "selectedSize": None, "selectedColor": None, "requests": order.get("requests")}
+                 for p, q in lines],
         "product": [p["_id"] for p, _ in lines],
         "deliveryOption": PICKUP if pickup else location["address"],
         "totalAmount": sum(int(p["price"]) * q for p, q in lines) + charge,
@@ -203,8 +206,13 @@ async def send(db: AsyncSession, integ: OrderIntegration, lead: SalesLead, body:
     """Place the order on the site; record it on the lead. Raises httpx.HTTPError (or ValueError if the site
     answers without success). Commits before the network call (no DB connection held while it runs)."""
     await db.commit()
+    url = f"{integ.base_url.rstrip('/')}/order/placeorder"
+    log.info("kitchen POST %s for lead %s: %s, area %s, total %s, request %s", url, lead.id,
+             [(i["name"], i["quantity"]) for i in body["item"]], body["deliveryOption"], body["totalAmount"],
+             body["item"][0]["requests"])
     async with httpx.AsyncClient(timeout=20, verify=SSL_CTX, headers=_HEADERS) as client:
-        resp = await client.post(f"{integ.base_url.rstrip('/')}/order/placeorder", json=body)
+        resp = await client.post(url, json=body)
+        log.info("kitchen POST for lead %s answered %s: %s", lead.id, resp.status_code, resp.text[:300])
         resp.raise_for_status()
         answer = resp.json()
     if not answer.get("success"):
@@ -234,9 +242,9 @@ async def auto_send(db: AsyncSession, lead: SalesLead) -> None:
     integ = await db.get(OrderIntegration, lead.tenant_id)
     order = (lead.meta or {}).get("order")
     if integ is None or not (integ.send_enabled and integ.auto_send) or not order or already_sent(lead):
-        if integ is not None:  # this business has the kitchen set up: say why this order did not go
-            log.info("kitchen auto-send not run for lead %s: send %s, auto %s, already sent %s", lead.id,
-                     integ.send_enabled, integ.auto_send, already_sent(lead))
+        log.info("kitchen auto-send not run for lead %s (tenant %s): set up %s, send %s, auto %s, already sent %s",
+                 lead.id, lead.tenant_id, integ is not None, integ and integ.send_enabled, integ and integ.auto_send,
+                 already_sent(lead))
         return
     await fresh(db, integ)
     p = plan(order, integ)

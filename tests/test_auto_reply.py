@@ -71,7 +71,12 @@ def test_photo_hint_points_at_tag_matches():
 
 
 def test_order_label_split_out():
-    assert "[order: name | phone | address | items]" in auto_reply.build_system_prompt("x")
+    assert "[order: name | phone | address | items | special request, or none]" in auto_reply.build_system_prompt("x")
+    # a special request rides along; "none" (or no fifth part) means there is none
+    _, order = auto_reply.split_order("Dhanyabad! [order: Ram | 9812345678 | Bagar | 2 Buff Jhol Momo | piro kam, chado garnus]")
+    assert order["requests"] == "piro kam, chado garnus" and order["items"] == "2 Buff Jhol Momo"
+    for none in ("| none]", "| Chaina.]", "| ]", "]"):
+        assert "requests" not in auto_reply.split_order(f"[order: Ram | 9812345678 | Bagar | 1 Momo {none}")[1]
     text, order = auto_reply.split_order(
         "Ram ji, 2 Chura Box Baneshwor ma. Hami call garera confirm garchau.\n"
         "[order: Ram Shrestha | 9812345678 | Baneshwor, Kathmandu | 2 x Two Row Chura Box]"

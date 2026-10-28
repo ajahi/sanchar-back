@@ -344,6 +344,8 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     reply, picks = split_photos(reply, len(photos))
     if order:  # kept even if the reply is dropped below: the customer did give (and confirm) these details
         lead = await save_order(db, account=account, convo=convo, customer=customer, order=order)
+        log.info("order confirmed in conversation %s (tenant %s): %s", convo.id, tenant.id,
+                 "new or changed" if lead else "same as before, not sent again")
         if lead is not None:  # new or changed: into the business's own order system, if it has one set to auto-send
             await db.commit()  # the order is kept whatever happens to the kitchen send
             await _send_to_kitchen(lead.id)

@@ -113,7 +113,7 @@ async def save_order(
         source_table="conversations",
         entity_id=convo.id,
         subject=f"New order from {order['name']}",
-        message=order["items"],
+        message=order["items"] + (f" (request: {order['requests']})" if order.get("requests") else ""),
         payload={"conversation_id": str(convo.id), "customer_id": str(customer.id), "phone": phone},
     )
     return lead

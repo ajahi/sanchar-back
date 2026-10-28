@@ -72,6 +72,9 @@ def test_body_is_what_the_website_posts():
     assert (body["deliveryOption"], body["deliveryCharge"], body["totalAmount"]) == ("bagale tole", 50, 2 * 250 + 150 + 50)
     pickup = kitchen.build_body(order, [(MENU[0], 1)], {"address": kitchen.PICKUP, "rate": 0}, None)
     assert (pickup["deliveryOption"], pickup["data"]["deliveryLocation"], pickup["totalAmount"]) == ("Pick up", "Pick-up", 250)
+    assert body["item"][0]["requests"] is None  # no request: as before
+    noted = kitchen.build_body({**order, "requests": "hold the chillies"}, [(MENU[0], 2), (MENU[6], 1)], AREAS[1], None)
+    assert [i["requests"] for i in noted["item"]] == ["hold the chillies"] * 2  # the site's per-item box, every line
 
 
 def test_only_listed_hosts():
