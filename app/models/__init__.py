@@ -5,6 +5,7 @@ from app.models.campaign import Campaign, CampaignLink
 from app.models.audit_log import AuditLog
 from app.models.conversation import Conversation
 from app.models.customer import Customer
+from app.models.funnel import Funnel, FunnelSubmission
 from app.models.handover import HandoverEvent
 from app.models.knowledge import KnowledgeDocument
 from app.models.message import Message
@@ -40,4 +41,6 @@ __all__ = [
     "AuditLog",
     "Notification",
     "OrderIntegration",
+    "Funnel",
+    "FunnelSubmission",
 ]

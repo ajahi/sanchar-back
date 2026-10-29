@@ -34,12 +34,11 @@ from app.models.sales_lead import SalesLead
 from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
+from app.models.funnel import FunnelSubmission
 from app.services.auto_reply import (
-    build_system_prompt, expand_picks, generate_reply, photo_hint, sent_photos_note, split_long, split_order,
-    split_photos,
+    build_system_prompt, expand_picks, generate_reply, photo_hint, sent_photos_note, split_long, split_photos,
 )
-from app.services import campaigns, kitchen
-from app.services.leads import save_order
+from app.services import campaigns, funnels, kitchen
 from app.services.meta import CHANNELS
 from app.services.notifications import create_notification
 
@@ -310,6 +309,7 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
         log.info("auto-reply skipped: tenant %s has no shop context yet", tenant.id)
         return
     photos = await sendable_photos(db, tenant.id)
+    funnel = await funnels.for_tenant(db, tenant)
 
     prior = (
         await db.execute(
@@ -332,7 +332,8 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     listed = [(p.title, p.tags) for p in photos]
     try:
         reply = await _generate(
-            build_system_prompt(knowledge, campaigns.campaign_context(campaign) if campaign else "", listed),
+            build_system_prompt(knowledge, campaigns.campaign_context(campaign) if campaign else "", listed,
+                                funnels.prompt_block(funnel)),
             history,
             msg.content,
             photo_hint(msg.content, listed),
@@ -340,15 +341,16 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     except Exception:  # noqa: BLE001 — stay quiet rather than send something wrong; a person can answer
         log.exception("LLM failed for conversation %s", convo.id)
         return
-    reply, order = split_order(reply or "")
+    reply, collected = await funnels.finish_reply(db, tenant.id, funnel, reply or "")
     reply, picks = split_photos(reply, len(photos))
-    if order:  # kept even if the reply is dropped below: the customer did give (and confirm) these details
-        lead = await save_order(db, account=account, convo=convo, customer=customer, order=order)
-        log.info("order confirmed in conversation %s (tenant %s): %s", convo.id, tenant.id,
-                 "new or changed" if lead else "same as before, not sent again")
-        if lead is not None:  # new or changed: into the business's own order system, if it has one set to auto-send
-            await db.commit()  # the order is kept whatever happens to the kitchen send
-            await _send_to_kitchen(lead.id)
+    if collected:  # kept even if the reply is dropped below: the customer did give (and confirm) these details
+        sub = await funnels.record(db, funnel=funnel, account=account, convo=convo, customer=customer, fields=collected)
+        log.info("%s confirmed in conversation %s (tenant %s, funnel %s v%s): %s", funnel.label, convo.id, tenant.id,
+                 funnel.key, funnel.version, "saved" if sub else "same as just before, not saved again")
+        if sub is not None:
+            await db.commit()  # kept whatever happens to the website send
+            if "website_post" in funnel.triggers and sub.lead_id:  # into the business's own order system
+                await _send_to_kitchen(sub.lead_id, sub.id)
     if not reply and not picks:
         return
 
@@ -385,14 +387,42 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
             break  # the rest would most likely fail the same way (expired url, window closed)
 
 
-async def _send_to_kitchen(lead_id) -> None:
+async def preview_reply(
+    db: AsyncSession, tenant: Tenant, message: str, history: list[tuple[str, str]] | None = None, funnel=None
+) -> str | None:
+    """What the bot would answer `message` after `history` right now, with the photos it would attach and what it
+    would save written out after it. Nothing is sent or stored. funnel: try one other than the tenant's.
+    None when the tenant has no shop context. Raises httpx.HTTPError when the model is down."""
+    knowledge = await build_knowledge(db, tenant.id)
+    if not knowledge:
+        return None
+    photos = await sendable_photos(db, tenant.id)
+    funnel = funnel or await funnels.for_tenant(db, tenant)
+    listed = [(p.title, p.tags) for p in photos]
+    reply = await generate_reply(
+        build_system_prompt(knowledge, photos=listed, funnel=funnels.prompt_block(funnel)),
+        history or [], message, photo_hint(message, listed),
+    )
+    reply, collected = await funnels.finish_reply(db, tenant.id, funnel, reply)
+    reply, picks = split_photos(reply, len(photos))
+    shown = [f"[would send photo: {photos[i].title or 'untitled'}]" for i in expand_picks(message, listed, picks)]
+    if collected:
+        shown.append(f"[would save {funnel.label}: " + " | ".join(collected.values()) + "]")
+    return "\n".join(x for x in [reply, *shown] if x)
+
+
+async def _send_to_kitchen(lead_id, submission_id) -> None:
     """kitchen.auto_send in its own session: whatever fails there (the order system down, a table missing after
-    a deploy) never costs the customer their reply or the saved order."""
+    a deploy) never costs the customer their reply or the saved order. The outcome goes on the submission."""
     try:
         async with async_session_factory() as s:
             lead = await s.get(SalesLead, lead_id)
             if lead is not None:
-                await kitchen.auto_send(s, lead)
+                outcome = await kitchen.auto_send(s, lead)
+                sub = await s.get(FunnelSubmission, submission_id)
+                if sub is not None and outcome != "off":
+                    sub.status = outcome
+                    sub.result = {k: lead.meta[k] for k in ("kitchen", "kitchen_error") if k in (lead.meta or {})}
                 await s.commit()
     except Exception:  # noqa: BLE001
         log_failure(log, "kitchen send failed for lead %s", lead_id)

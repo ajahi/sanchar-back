@@ -18,10 +18,7 @@ from app.db.session import get_db
 from app.models.knowledge import KnowledgeDocument
 from app.schemas.knowledge import KnowledgeOut, Suggestion, TestIn, TestOut, TopicIn, TopicOut
 from app.services.audit import record_audit
-from app.services.auto_reply import (
-    build_system_prompt, expand_picks, generate_reply, photo_hint, split_order, split_photos,
-)
-from app.services.reply_pipeline import build_knowledge, sendable_photos
+from app.services.reply_pipeline import preview_reply
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"], dependencies=[Depends(require_role("owner", "admin"))])
 
@@ -153,21 +150,10 @@ async def test_bot(
     body: TestIn, tenant: CurrentTenant, db: Annotated[AsyncSession, Depends(get_db)]
 ) -> TestOut:
     """What the bot would answer a customer right now, from the saved shop context. Nothing is sent or stored."""
-    knowledge = await build_knowledge(db, tenant.id)
-    if not knowledge:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Add some shop information first.")
-    photos = await sendable_photos(db, tenant.id)
     try:
-        listed = [(p.title, p.tags) for p in photos]
-        reply = await generate_reply(
-            build_system_prompt(knowledge, photos=listed), [], body.message, photo_hint(body.message, listed)
-        )
+        reply = await preview_reply(db, tenant, body.message)
     except httpx.HTTPError:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="The AI service is not responding. Try again.")
-    # Nothing is sent or saved here: name the photos it would attach and the order it would save, to check them.
-    reply, order = split_order(reply)
-    reply, picks = split_photos(reply, len(photos))
-    shown = [f"[would send photo: {photos[i].title or 'untitled'}]" for i in expand_picks(body.message, listed, picks)]
-    if order:
-        shown.append("[would save order: " + " | ".join(order.values()) + "]")
-    return TestOut(reply="\n".join(x for x in [reply, *shown] if x))
+    if reply is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Add some shop information first.")
+    return TestOut(reply=reply)

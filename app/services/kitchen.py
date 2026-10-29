@@ -236,24 +236,33 @@ def already_sent(lead: SalesLead) -> bool:
     return bool(k) and k.get("order") == (lead.meta or {}).get("order")
 
 
-async def auto_send(db: AsyncSession, lead: SalesLead) -> None:
+async def auto_send(db: AsyncSession, lead: SalesLead) -> str:
     """Right after the customer confirmed: send it if this business turned sending and auto-send on, and every
-    line and the area matched. Anything else waits in Orders for staff. Never raises."""
+    line and the area matched. Anything else waits in Orders for staff, who are pinged. Never raises.
+    Returns "sent", "needs_staff" (not matched, or the site refused it) or "off" (not set up or not auto)."""
     integ = await db.get(OrderIntegration, lead.tenant_id)
     order = (lead.meta or {}).get("order")
     if integ is None or not (integ.send_enabled and integ.auto_send) or not order or already_sent(lead):
         log.info("kitchen auto-send not run for lead %s (tenant %s): set up %s, send %s, auto %s, already sent %s",
                  lead.id, lead.tenant_id, integ is not None, integ and integ.send_enabled, integ and integ.auto_send,
                  already_sent(lead))
-        return
+        return "sent" if order and already_sent(lead) else "off"
     await fresh(db, integ)
     p = plan(order, integ)
-    if p["location"] is None or any(line["product_id"] is None for line in p["lines"]):
-        log.info("kitchen auto-send skipped for lead %s: a line or the area needs staff", lead.id)
-        return
+    unmatched = [line["text"] for line in p["lines"] if line["product_id"] is None]
+    if p["location"] is None or unmatched:
+        why = ", ".join([*(f'"{t}" not on the menu' for t in unmatched), *(["delivery area not found"] if p["location"] is None else [])])
+        log.info("kitchen auto-send skipped for lead %s: needs staff (%s)", lead.id, why)
+        await create_notification(
+            db, event="kitchen_needs_staff", tenant_id=lead.tenant_id, source_table="sales_leads", entity_id=lead.id,
+            subject=f"Order from {order['name']} needs you before it can go to the kitchen",
+            message=f"{why}. Open Orders, pick it from the list and send it.", payload={"lead_id": str(lead.id)},
+        )
+        return "needs_staff"
     try:
         lines, loc = resolve(integ, [(line["product_id"], line["quantity"]) for line in p["lines"]], p["location"])
         await send(db, integ, lead, build_body(order, lines, loc, integ.email))
+        return "sent"
     except (httpx.HTTPError, ValueError) as exc:
         detail = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else str(exc)[:300]
         log.warning("kitchen auto-send failed for lead %s: %s", lead.id, detail)
@@ -263,3 +272,4 @@ async def auto_send(db: AsyncSession, lead: SalesLead) -> None:
             subject=f"Order from {order['name']} did not reach the kitchen",
             message="Open Orders and send it again, or call the cafe.", payload={"lead_id": str(lead.id)},
         )
+        return "needs_staff"

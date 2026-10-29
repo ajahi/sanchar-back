@@ -84,11 +84,11 @@ async def capture_lead(
 
 async def save_order(
     db: AsyncSession, *, account: SocialAccount, convo: Conversation, customer: Customer, order: dict
-) -> SalesLead | None:
-    """Put the order the bot collected (name, phone, address, items: auto_reply.split_order) on the customer's
-    lead, creating the lead if needed. A new or changed order goes back to 'new' for staff to confirm and pings
-    them once; the same order repeated (the bot re-states it later in the chat) changes nothing.
-    Returns the lead when the order is new or changed, else None. Adds, never commits."""
+) -> SalesLead:
+    """Put the order the bot collected (name, phone, address, items: a funnel's confirmed label) on the customer's
+    lead, creating the lead if needed: back to 'new' for staff to confirm, staff pinged. Each call is a new order
+    (funnels.record drops the bot re-stating one), so what the kitchen was sent before is cleared: the same dish
+    ordered again tomorrow is sent again. Adds, never commits."""
     phone = extract_phone(order["phone"]) or order["phone"]  # a landline or foreign number is kept as written
     lead = (
         await db.execute(
@@ -101,10 +101,9 @@ async def save_order(
             social_account_id=account.id, channel=account.platform, phone=phone, meta={},
         )
         db.add(lead)
-    elif (lead.meta or {}).get("order") == order:
-        return None
     lead.phone, lead.conversation_id, lead.status = phone, convo.id, "new"
-    lead.meta = {**(lead.meta or {}), "order": order}  # a new dict, so the JSONB change is saved
+    kept = {k: v for k, v in (lead.meta or {}).items() if k not in ("kitchen", "kitchen_error")}
+    lead.meta = {**kept, "order": order}  # a new dict, so the JSONB change is saved
     customer.phone = customer.phone or phone
     await create_notification(
         db,

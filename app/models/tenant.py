@@ -24,3 +24,5 @@ class Tenant(UUIDPKMixin, TimestampMixin, Base):
     ai_auto_reply: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), nullable=False
     )
+    # The conversation funnel the bot follows (funnels.key, its active version); None = the built-in order steps.
+    funnel_key: Mapped[Optional[str]] = mapped_column(String(50))

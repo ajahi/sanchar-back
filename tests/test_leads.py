@@ -105,8 +105,7 @@ def test_bot_order_saved_on_lead_and_listed() -> None:
                 return (await db.execute(select(Notification).where(
                     Notification.tenant_id == t.id, Notification.event == "order_received"))).scalars().all()
 
-            assert await save(order) is not None
-            assert await save(dict(order)) is None  # the bot re-stated the same order: no second ping
+            assert await save(order) is not None  # (the bot re-stating an order is dropped before this: test_funnels)
             assert len(await pings()) == 1
             [row] = await list_leads(t, db, None)
             assert (row.phone, row.status, row.customer_name, row.order) == ("+9779812345678", "new", "ram.fb", order)
