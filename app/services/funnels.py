@@ -60,37 +60,66 @@ def prompt_block(funnel: Funnel) -> str:
     return funnel_block(funnel.steps, funnel.label, funnel.fields)
 
 
-async def total_line(db: AsyncSession, tenant_id, draft: dict) -> str:
-    """"Total: Rs 460 (delivery Rs 80 included)" for a summary's items and area, priced from the business's synced
-    website menu, the way the website will price it. "" when there is no menu, or a line or the area doesn't match
-    (then staff finish the order from Orders, as before): a total is never guessed."""
-    integ = await db.get(OrderIntegration, tenant_id)
-    if integ is None or not integ.catalog or not draft.get("items") or not draft.get("address"):
-        return ""
-    p = kitchen.plan(draft, integ)
-    if p["location"] is None or any(line["product_id"] is None for line in p["lines"]):
-        log.info("summary total left out for tenant %s: %s, area %s", tenant_id,
-                 [(line["text"], line["product_id"] is not None) for line in p["lines"]], p["location"])
-        return ""
-    lines, loc = kitchen.resolve(integ, [(line["product_id"], line["quantity"]) for line in p["lines"]], p["location"])
-    body = kitchen.build_body(draft, lines, loc, None)
-    charge = body["deliveryCharge"]
-    return f"Total: Rs {body['totalAmount']}" + (f" (delivery Rs {charge} included)" if charge else "")
+CONFIRM = "Yo order thik cha? Kei special request bhaye (jastai piro kam, chado chahiyo) pani bhannus."
+
+
+def order_summary(draft: dict, integ: OrderIntegration | None) -> str:
+    """The order summary the customer confirms, always in one layout (the model only writes the label). With the
+    business's website menu: each line priced from it, the delivery charge and the total, the way the website will
+    charge it; a line or area that doesn't match is shown and asked about, never dropped, and then no total."""
+    pickup = bool(re.search(r"\bpick ?up\b", draft["address"], re.IGNORECASE))
+    out, problems = ["Tapai ko order:"], []
+    if integ is None:
+        out += [t.strip() for t in re.split(r"[,;\n]", draft["items"]) if t.strip()]
+        out.append("Pick up" if pickup else "Delivery")
+    else:
+        p, by_id = kitchen.plan(draft, integ), {x["_id"]: x for x in integ.catalog}
+        for line in p["lines"]:
+            item = by_id.get(line["product_id"])
+            out.append(f"{line['quantity']} x {item['name'].strip()} - Rs {item['price']}" if item
+                       else f"{line['text']} - menu ma bhetiyena")
+            if item is None:
+                problems.append(f'"{line["text"]}" menu ma bhetiyena. Kun item bhannu bhayeko ho?')
+        if pickup:
+            out.append("Pick up (cafe bata)")
+        elif p["location"] is not None:
+            loc = next(a for a in integ.locations if a["address"] == p["location"])
+            out.append(f"Delivery: {loc['address'].title()} (Rs {loc['rate']})")
+        else:
+            areas = ", ".join(f"{a['address'].title()} (Rs {a['rate']})" for a in integ.locations)
+            out.append("Delivery: area thaha bhayena")
+            problems.append(f"Delivery kun area ma garne? {areas}")
+        if not problems:
+            lines, loc = kitchen.resolve(integ, [(x["product_id"], x["quantity"]) for x in p["lines"]], p["location"])
+            out.append(f"Total: Rs {kitchen.build_body(draft, lines, loc, None)['totalAmount']}")
+    out += ["", *(f"{label}: {draft[k]}" for k, label in (("name", "Naam"), ("phone", "Phone")) if draft.get(k))]
+    if not pickup:
+        out.append(f"Address: {draft['address']}")
+    if draft.get("requests"):
+        out.append(f"Special request: {draft['requests']}")
+    return "\n".join([*out, "", *(problems or [CONFIRM])])
+
+
+def plain_summary(funnel: Funnel, draft: dict) -> str:
+    """Any other funnel's summary: one "Field: value" line each, then the question."""
+    lines = [f"{f['label'].split(',')[0].strip().capitalize()}: {draft[f['key']]}" for f in funnel.fields if f["key"] in draft]
+    return "\n".join([*lines, "", "Yo thik cha?"])
 
 
 async def finish_reply(db: AsyncSession, tenant_id, funnel: Funnel, reply: str) -> tuple[str, dict | None]:
-    """The model's reply -> (text for the customer, the fields it collected or None): the summary label (written at
-    the end, where the model writes labels reliably) is taken out and, for website_post funnels, the total goes in
-    above the summary's last line (its "Yo order thik cha?"); the confirmed label is taken out."""
+    """The model's reply -> (text for the customer, the fields it collected or None). A complete summary label
+    becomes the whole reply, written here (order_summary / plain_summary) so it reads the same every time; an
+    incomplete one is just removed. The confirmed label is taken out."""
     m = _SUMMARY.search(reply)
     if m:
         _, draft = split_label(m.group(0).strip(), "summary", funnel.fields)
-        line = await total_line(db, tenant_id, draft) if draft and "website_post" in funnel.triggers else ""
-        reply = re.sub(r"\n{3,}", "\n\n", _SUMMARY.sub("", reply)).strip()
-        if line:
-            lines = reply.split("\n")
-            lines.insert(len(lines) - 1, line) if len(lines) > 1 else lines.append(line)
-            reply = "\n".join(lines)
+        if draft is None:
+            reply = re.sub(r"\n{3,}", "\n\n", _SUMMARY.sub("", reply)).strip()
+        elif {"items", "address"} <= draft.keys():
+            integ = await db.get(OrderIntegration, tenant_id) if "website_post" in funnel.triggers else None
+            reply = order_summary(draft, integ if integ is not None and integ.catalog else None)
+        else:
+            reply = plain_summary(funnel, draft)
     return split_label(reply, funnel.label, funnel.fields)
 
 

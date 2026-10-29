@@ -132,14 +132,14 @@ async def _chat(monkeypatch) -> None:
                 await db.flush()
                 await reply_pipeline.auto_reply(db, m.id)
 
-            # 1. the summary: the label is swapped for the total the website will charge (items + delivery)
+            # 1. the summary: written from the label in one layout (whatever else the model wrote), priced like the website
             await say("duita buff jhol momo ra euta coke 250ml, alumaila chowk delivery, Ram 9812345678",
-                      "Order summary:\n2 x Buff Jhol Momo - Rs 250\n1 x Coke 250ml - Rs 100\nDelivery: Alumaila Chowk (Rs 80)\n"
-                      "Ram, 9812345678\nYo order thik cha? "
+                      "Thik cha! Ram | 9812345678 | delivery\n"
                       "[summary: Ram | 9812345678 | Alumaila Chowk, near the pump | 2 x Buff Jhol Momo, 1 x Coke 250ml | none]")
             assert "RESTAURANT ORDERS" in seen["system"]  # the tenant's funnel reached the model
-            assert "Total: Rs 680 (delivery Rs 80 included)" in sent[-1] and "[summary" not in sent[-1]
-            assert sent[-1].index("Ram, 9812345678") < sent[-1].index("Total") < sent[-1].index("Yo order thik cha?")
+            assert sent[-1] == (
+                "Tapai ko order:\n2 x Buff Jhol Momo - Rs 250\n1 x Coke 250ml - Rs 100\nDelivery: Alumaila Chowk (Rs 80)\n"
+                "Total: Rs 680\n\nNaam: Ram\nPhone: 9812345678\nAddress: Alumaila Chowk, near the pump\n\n" + funnels.CONFIRM)
 
             # 2. "thik xa": the label is saved as a submission and the order goes to the website
             order_label = "[order: Ram | 9812345678 | Alumaila Chowk, near the pump | 2 x Buff Jhol Momo, 1 x Coke 250ml | piro kam]"
@@ -162,9 +162,10 @@ async def _chat(monkeypatch) -> None:
             await say("pheri same order garnu paryo, thik xa", f"Dhanyabad! {order_label}")
             assert len(posted) == 2
 
-            # 5. an item the website doesn't sell: no total in the summary, and after "thik xa" staff are asked
-            await say("euta sowrma, pick up", "1 x Sowrma\nYo order thik cha?\n[summary: Ram | 9812345678 | Pick up | 1 x Sowrma | none]")
-            assert "Total" not in sent[-1] and "[summary" not in sent[-1]
+            # 5. an item the website doesn't sell: kept in the summary and asked about, no total; after "thik xa" staff are asked
+            await say("euta sowrma, pick up", "[summary: Ram | 9812345678 | Pick up | 1 x Sowrma | none]")
+            assert sent[-1] == ('Tapai ko order:\n1 x Sowrma - menu ma bhetiyena\nPick up (cafe bata)\n\nNaam: Ram\n'
+                                'Phone: 9812345678\n\n"1 x Sowrma" menu ma bhetiyena. Kun item bhannu bhayeko ho?')
             await say("thik xa", "Dhanyabad! [order: Ram | 9812345678 | Pick up | 1 x Sowrma | none]")
             sowrma = (await db.execute(select(FunnelSubmission).where(
                 FunnelSubmission.tenant_id == tenant.id, FunnelSubmission.fields["items"].astext == "1 x Sowrma"))).scalar_one()
@@ -175,3 +176,15 @@ async def _chat(monkeypatch) -> None:
 
 def test_restaurant_chat_end_to_end(monkeypatch):
     asyncio.run(_chat(monkeypatch))
+
+
+def test_summary_layout_without_menu_and_with_an_unknown_area():
+    draft = {"name": "Sita", "phone": "9801234567", "address": "Lakeside, gate 2", "items": "2 x Momo, 1 x Coke",
+             "requests": "piro kam"}
+    assert funnels.order_summary(draft, None) == (  # no website menu: lines as the bot wrote them, no prices or total
+        "Tapai ko order:\n2 x Momo\n1 x Coke\nDelivery\n\nNaam: Sita\nPhone: 9801234567\nAddress: Lakeside, gate 2\n"
+        "Special request: piro kam\n\n" + funnels.CONFIRM)
+    menu = OrderIntegration(catalog=MENU, locations=AREAS)
+    got = funnels.order_summary({**draft, "items": "2 x Buff Jhol Momo"}, menu)  # Lakeside is not a delivery area
+    assert "Delivery: area thaha bhayena" in got and "Total" not in got
+    assert got.endswith("Delivery kun area ma garne? Alumaila Chowk (Rs 80)")
