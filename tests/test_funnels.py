@@ -79,7 +79,7 @@ async def _chat(monkeypatch) -> None:
         return {"message_id": f"wamid.f{uuid.uuid4().hex[:8]}"}
 
     async def fake_generate(system, history, text, hint=""):
-        seen["system"] = system
+        seen["system"], seen["hint"] = system, hint
         return script.pop(0)
 
     async def fake_post(db, integ, lead, body):  # the restaurant's website, accepting the order
@@ -170,6 +170,18 @@ async def _chat(monkeypatch) -> None:
             sowrma = (await db.execute(select(FunnelSubmission).where(
                 FunnelSubmission.tenant_id == tenant.id, FunnelSubmission.fields["items"].astext == "1 x Sowrma"))).scalar_one()
             assert sowrma.status == "needs_staff" and len(posted) == 2
+
+            # 6. closed (here: every day): the model is told, and a summary or order it writes anyway is refused
+            tenant.opening_hours = {"mon": None}
+            await db.flush()
+            subs = len((await db.execute(select(FunnelSubmission).where(FunnelSubmission.tenant_id == tenant.id))).all())
+            await say("duita buff jhol momo, pick up, Ram 9812345678", "[summary: Ram | 9812345678 | Pick up | 2 x Buff Jhol Momo | none]")
+            assert "CLOSED" in seen["hint"] and sent[-1] == "Hami ahile banda chau, order lina sakdainau."
+            await say("thik xa", "Dhanyabad! [order: Ram | 9812345678 | Pick up | 2 x Buff Jhol Momo | none]")
+            assert sent[-1] == "Hami ahile banda chau, order lina sakdainau." and len(posted) == 2
+            assert len((await db.execute(select(FunnelSubmission).where(FunnelSubmission.tenant_id == tenant.id))).all()) == subs
+            await say("momo kati ho?", "Buff Jhol Momo Rs 250.")  # questions are still answered
+            assert sent[-1] == "Buff Jhol Momo Rs 250."
         finally:
             await db.rollback()
 

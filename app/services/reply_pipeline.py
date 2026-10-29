@@ -38,7 +38,7 @@ from app.models.funnel import FunnelSubmission
 from app.services.auto_reply import (
     build_system_prompt, expand_picks, generate_reply, photo_hint, sent_photos_note, split_long, split_photos,
 )
-from app.services import campaigns, funnels, kitchen
+from app.services import campaigns, funnels, hours, kitchen
 from app.services.meta import CHANNELS
 from app.services.notifications import create_notification
 
@@ -310,6 +310,7 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
         return
     photos = await sendable_photos(db, tenant.id)
     funnel = await funnels.for_tenant(db, tenant)
+    closed = hours.closed_message(tenant.opening_hours)
 
     prior = (
         await db.execute(
@@ -336,12 +337,12 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
                                 funnels.prompt_block(funnel)),
             history,
             msg.content,
-            photo_hint(msg.content, listed),
+            _hint(msg.content, listed, closed),
         )
     except Exception:  # noqa: BLE001 — stay quiet rather than send something wrong; a person can answer
         log.exception("LLM failed for conversation %s", convo.id)
         return
-    reply, collected = await funnels.finish_reply(db, tenant.id, funnel, reply or "")
+    reply, collected = await funnels.finish_reply(db, tenant.id, funnel, reply or "", closed)
     reply, picks = split_photos(reply, len(photos))
     if collected:  # kept even if the reply is dropped below: the customer did give (and confirm) these details
         sub = await funnels.record(db, funnel=funnel, account=account, convo=convo, customer=customer, fields=collected)
@@ -387,6 +388,11 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
             break  # the rest would most likely fail the same way (expired url, window closed)
 
 
+def _hint(text: str, listed: list[tuple[str | None, list[str]]], closed: str | None) -> str:
+    """The per-message note for the model: matching photos, and that the business is closed."""
+    return "\n\n".join(x for x in [photo_hint(text, listed), hours.closed_note(closed) if closed else ""] if x)
+
+
 async def preview_reply(
     db: AsyncSession, tenant: Tenant, message: str, history: list[tuple[str, str]] | None = None, funnel=None
 ) -> str | None:
@@ -398,12 +404,13 @@ async def preview_reply(
         return None
     photos = await sendable_photos(db, tenant.id)
     funnel = funnel or await funnels.for_tenant(db, tenant)
+    closed = hours.closed_message(tenant.opening_hours)
     listed = [(p.title, p.tags) for p in photos]
     reply = await generate_reply(
         build_system_prompt(knowledge, photos=listed, funnel=funnels.prompt_block(funnel)),
-        history or [], message, photo_hint(message, listed),
+        history or [], message, _hint(message, listed, closed),
     )
-    reply, collected = await funnels.finish_reply(db, tenant.id, funnel, reply)
+    reply, collected = await funnels.finish_reply(db, tenant.id, funnel, reply, closed)
     reply, picks = split_photos(reply, len(photos))
     shown = [f"[would send photo: {photos[i].title or 'untitled'}]" for i in expand_picks(message, listed, picks)]
     if collected:
