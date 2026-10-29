@@ -26,10 +26,21 @@ jobs:
           git checkout -B "$BRANCH" "origin/$BRANCH"
           git log --oneline -1
 
-      - name: Build and restart the api container
+      - name: Build the api image
         run: |
           cd "$APP_DIR"
-          docker compose up -d --build api
+          docker compose build api
+
+      # Before the new code goes live: code reading a column its migration hasn't created takes the whole api down.
+      - name: Run database migrations
+        run: |
+          cd "$APP_DIR"
+          docker compose run --rm --no-deps api alembic upgrade head
+
+      - name: Restart the api container
+        run: |
+          cd "$APP_DIR"
+          docker compose up -d api
           docker image prune -f  # the previous build is left untagged on every deploy
 
       - name: Wait for /health

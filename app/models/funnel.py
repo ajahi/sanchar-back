@@ -27,6 +27,8 @@ class Funnel(UUIDPKMixin, TimestampMixin, Base):
     fields: Mapped[list] = mapped_column(JSONB, nullable=False)
     # run in order after a confirmation: "save_order", "notify", "website_post" (services/funnels.TRIGGERS)
     triggers: Mapped[list] = mapped_column(JSONB, server_default=text("'[]'::jsonb"), nullable=False)
+    # run before each reply: [{"type": "opening_hours", "message": "... {opens} ..."}] (services/funnels.CHECKS)
+    checks: Mapped[list] = mapped_column(JSONB, server_default=text("'[]'::jsonb"), nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, server_default=text("false"), nullable=False)
 
 

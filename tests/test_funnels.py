@@ -79,7 +79,7 @@ async def _chat(monkeypatch) -> None:
         return {"message_id": f"wamid.f{uuid.uuid4().hex[:8]}"}
 
     async def fake_generate(system, history, text, hint=""):
-        seen["system"] = system
+        seen["system"], seen["hint"] = system, hint
         return script.pop(0)
 
     async def fake_post(db, integ, lead, body):  # the restaurant's website, accepting the order
@@ -91,6 +91,13 @@ async def _chat(monkeypatch) -> None:
     monkeypatch.setattr(reply_pipeline, "generate_reply", fake_generate)
     monkeypatch.setattr(kitchen, "send", fake_post)
     monkeypatch.setattr(kitchen, "fresh", lambda *a: asyncio.sleep(0))  # no menu re-sync from the real site
+    hours_read: list[str] = []
+
+    async def fake_hours(messages):  # the model reading the hours out of Shop Info: closed every day
+        hours_read.append(messages[-1]["content"])
+        return '{"mon": null, "tue": null, "wed": null, "thu": null, "fri": null, "sat": null, "sun": null}'
+
+    monkeypatch.setattr(funnels.hours.auto_reply, "chat", fake_hours)
 
     async with async_session_factory() as db:
         db.commit = db.flush  # stay inside the rolled-back transaction
@@ -170,6 +177,20 @@ async def _chat(monkeypatch) -> None:
             sowrma = (await db.execute(select(FunnelSubmission).where(
                 FunnelSubmission.tenant_id == tenant.id, FunnelSubmission.fields["items"].astext == "1 x Sowrma"))).scalar_one()
             assert sowrma.status == "needs_staff" and len(posted) == 2
+            assert hours_read == []  # this funnel has no opening_hours check: hours never looked at
+
+            # 6. the restaurant check on, Shop Info says closed: the model is told, and a summary or order it
+            # writes anyway is refused; questions are still answered
+            funnel.checks = [{"type": "opening_hours", "message": "Hami ahile banda chau, {opens} dekhi order lina sakchau."}]
+            await db.flush()
+            subs = len((await db.execute(select(FunnelSubmission).where(FunnelSubmission.tenant_id == tenant.id))).all())
+            await say("duita buff jhol momo, pick up, Ram 9812345678", "[summary: Ram | 9812345678 | Pick up | 2 x Buff Jhol Momo | none]")
+            assert "CLOSED" in seen["hint"] and sent[-1] == "Hami ahile banda chau." and len(hours_read) == 1
+            await say("thik xa", "Dhanyabad! [order: Ram | 9812345678 | Pick up | 2 x Buff Jhol Momo | none]")
+            assert sent[-1] == "Hami ahile banda chau." and len(posted) == 2
+            assert len((await db.execute(select(FunnelSubmission).where(FunnelSubmission.tenant_id == tenant.id))).all()) == subs
+            await say("momo kati ho?", "Buff Jhol Momo Rs 250.")
+            assert sent[-1] == "Buff Jhol Momo Rs 250." and len(hours_read) == 1  # read once, kept while Shop Info is unchanged
         finally:
             await db.rollback()
 

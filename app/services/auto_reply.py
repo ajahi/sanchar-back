@@ -250,6 +250,9 @@ async def _chat(messages: list[dict]) -> str:
     return body["choices"][0]["message"]["content"].strip()
 
 
+chat = _chat  # one call, no reply rules: reading data out of text (hours.for_tenant)
+
+
 def _devanagari(text: str) -> bool:
     return any("ऀ" <= c <= "ॿ" for c in text)
 

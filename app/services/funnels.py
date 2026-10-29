@@ -5,6 +5,7 @@ runs once the customer confirms. The bot keeps no step counter: each reply, the 
 steps. Code only acts on the labels it writes:
   [summary: ...]  with the summary: replaced by the order total, worked out here from the website menu
   [<label>: ...]  once they confirm: saved as a funnel_submission, then the triggers run
+Its checks run before each reply: opening_hours keeps a restaurant from taking orders while it is closed.
 
 A tenant without a funnel (or whose funnel has no active version) gets DEFAULT, the built-in order steps.
 """
@@ -22,7 +23,7 @@ from app.models.funnel import Funnel, FunnelSubmission
 from app.models.order_integration import OrderIntegration
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
-from app.services import kitchen
+from app.services import hours, kitchen
 from app.services.auto_reply import ORDER_FIELDS, ORDER_STEPS, funnel_block, split_label
 from app.services.leads import save_order
 from app.services.notifications import create_notification
@@ -32,13 +33,15 @@ log = logging.getLogger(__name__)
 # save_order: onto the customer's sales lead (the Orders screen) and ping staff. notify: only ping staff.
 # website_post: into the business's own order system (kitchen.py), when it has one set to auto-send.
 TRIGGERS = ("save_order", "notify", "website_post")
+# opening_hours: closed (hours read from Shop Info, services/hours.py) -> no orders; its "message" says when it opens.
+CHECKS = ("opening_hours",)
 # The same fields confirmed again in the same chat within this window is the bot re-stating the order, not a
 # new one. ponytail: time-based; an identical second order inside 3 hours of the first is not sent again.
 REPEAT_WINDOW = timedelta(hours=3)
 
 DEFAULT = SimpleNamespace(  # a Funnel's shape, never stored
     key="general", version=0, name="General (orders and bookings)", label="order", steps=ORDER_STEPS,
-    fields=list(ORDER_FIELDS), triggers=["save_order", "website_post"], active=True,
+    fields=list(ORDER_FIELDS), triggers=["save_order", "website_post"], checks=[], active=True,
 )
 
 _SUMMARY = re.compile(r"[ \t]*\[\s*summary\s*:[^\]]*\]", re.IGNORECASE)
@@ -58,6 +61,17 @@ async def for_tenant(db: AsyncSession, tenant: Tenant) -> Funnel:
 
 def prompt_block(funnel: Funnel) -> str:
     return funnel_block(funnel.steps, funnel.label, funnel.fields)
+
+
+async def closed_message(db: AsyncSession, tenant: Tenant, funnel: Funnel, knowledge: str) -> str | None:
+    """Run the funnel's checks: what to tell a customer who wants to order now (the business is closed), or None."""
+    for check in funnel.checks:
+        if check.get("type") == "opening_hours":
+            table = await hours.for_tenant(db, tenant, knowledge)
+            message = hours.closed_message(table, check.get("message") or hours.DEFAULT_MESSAGE)
+            if message:
+                return message
+    return None
 
 
 CONFIRM = "Yo order thik cha? Kei special request bhaye (jastai piro kam, chado chahiyo) pani bhannus."
@@ -106,11 +120,17 @@ def plain_summary(funnel: Funnel, draft: dict) -> str:
     return "\n".join([*lines, "", "Yo thik cha?"])
 
 
-async def finish_reply(db: AsyncSession, tenant_id, funnel: Funnel, reply: str) -> tuple[str, dict | None]:
+async def finish_reply(
+    db: AsyncSession, tenant_id, funnel: Funnel, reply: str, closed: str | None = None
+) -> tuple[str, dict | None]:
     """The model's reply -> (text for the customer, the fields it collected or None). A complete summary label
     becomes the whole reply, written here (order_summary / plain_summary) so it reads the same every time; an
-    incomplete one is just removed. The confirmed label is taken out."""
+    incomplete one is just removed. The confirmed label is taken out.
+    closed: a check failed (closed_message): a summary or an order the model wrote anyway becomes that message,
+    and nothing is collected."""
     m = _SUMMARY.search(reply)
+    if closed and (m or split_label(reply, funnel.label, funnel.fields)[1]):
+        return closed, None
     if m:
         _, draft = split_label(m.group(0).strip(), "summary", funnel.fields)
         if draft is None:

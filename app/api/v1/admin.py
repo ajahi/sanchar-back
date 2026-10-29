@@ -45,6 +45,7 @@ class FunnelIn(BaseModel):
     steps: str = Field(min_length=20, max_length=20_000)
     fields: list[FunnelField] = Field(min_length=1, max_length=15)
     triggers: list[str] = []
+    checks: list[dict] = []  # [{"type": "opening_hours", "message": "... {opens} ..."}]
 
 
 class TenantFunnel(BaseModel):
@@ -174,7 +175,7 @@ async def set_tenant_ai(
 
 def _funnel_out(f: Funnel) -> dict:
     return {"id": f.id, "key": f.key, "version": f.version, "name": f.name, "label": f.label, "steps": f.steps,
-            "fields": f.fields, "triggers": f.triggers, "active": f.active, "created_at": f.created_at}
+            "fields": f.fields, "triggers": f.triggers, "checks": f.checks, "active": f.active, "created_at": f.created_at}
 
 
 @router.get("/funnels")
@@ -194,6 +195,8 @@ async def save_funnel(body: FunnelIn, admin: CurrentUser, db: Annotated[AsyncSes
         raise HTTPException(status_code=422, detail='"summary" is the summary label; pick another label name.')
     if unknown := set(body.triggers) - set(funnels.TRIGGERS):
         raise HTTPException(status_code=422, detail=f"Unknown trigger(s): {', '.join(sorted(unknown))}.")
+    if unknown := {str(c.get("type")) for c in body.checks} - set(funnels.CHECKS):
+        raise HTTPException(status_code=422, detail=f"Unknown check(s): {', '.join(sorted(unknown))}.")
     keys = [f.key for f in body.fields]
     if len(set(keys)) != len(keys):
         raise HTTPException(status_code=422, detail="Two fields have the same key.")
