@@ -106,17 +106,11 @@ def plain_summary(funnel: Funnel, draft: dict) -> str:
     return "\n".join([*lines, "", "Yo thik cha?"])
 
 
-async def finish_reply(
-    db: AsyncSession, tenant_id, funnel: Funnel, reply: str, closed: str | None = None
-) -> tuple[str, dict | None]:
+async def finish_reply(db: AsyncSession, tenant_id, funnel: Funnel, reply: str) -> tuple[str, dict | None]:
     """The model's reply -> (text for the customer, the fields it collected or None). A complete summary label
     becomes the whole reply, written here (order_summary / plain_summary) so it reads the same every time; an
-    incomplete one is just removed. The confirmed label is taken out.
-    closed: the business is closed (hours.closed_message): a summary or an order the model wrote anyway becomes
-    that message, and nothing is collected."""
+    incomplete one is just removed. The confirmed label is taken out."""
     m = _SUMMARY.search(reply)
-    if closed and (m or split_label(reply, funnel.label, funnel.fields)[1]):
-        return closed, None
     if m:
         _, draft = split_label(m.group(0).strip(), "summary", funnel.fields)
         if draft is None:

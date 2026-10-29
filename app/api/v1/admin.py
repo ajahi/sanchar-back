@@ -18,7 +18,7 @@ from app.models.knowledge import KnowledgeDocument
 from app.models.message import Message
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
-from app.services import funnels, hours
+from app.services import funnels
 from app.services.audit import record_audit
 from app.services.reply_pipeline import preview_reply
 
@@ -49,10 +49,6 @@ class FunnelIn(BaseModel):
 
 class TenantFunnel(BaseModel):
     funnel_key: str | None
-
-
-class TenantHours(BaseModel):
-    opening_hours: dict | None  # {"sun": ["10:00", "21:00"], ..., "sat": null}, Nepal time; null = always open
 
 
 class TryIn(BaseModel):
@@ -109,7 +105,6 @@ async def list_tenants(db: Annotated[AsyncSession, Depends(get_db)]) -> list[dic
             "status": t.status,
             "ai_auto_reply": t.ai_auto_reply,
             "funnel_key": t.funnel_key,
-            "opening_hours": t.opening_hours,
             "has_knowledge": t.id in knowledge,
             "channels": sorted(set(accounts.get(t.id, []))),
             "customers": custs.get(t.id, 0),
@@ -245,23 +240,6 @@ async def set_tenant_funnel(
                        entity_type="tenant", entity_id=tenant.id, meta={"funnel_key": body.funnel_key})
     await db.commit()
     return {"id": tenant.id, "funnel_key": tenant.funnel_key}
-
-
-@router.patch("/tenants/{tenant_id}/hours")
-async def set_tenant_hours(
-    tenant_id: uuid.UUID, body: TenantHours, admin: CurrentUser, db: Annotated[AsyncSession, Depends(get_db)]
-) -> dict:
-    """When the tenant's bot may take orders. While closed it answers questions but not orders (services/hours.py)."""
-    tenant = await db.get(Tenant, tenant_id)
-    if tenant is None:
-        raise HTTPException(status_code=404, detail="Tenant not found")
-    if body.opening_hours is not None and not hours.valid(body.opening_hours):
-        raise HTTPException(status_code=422, detail='Use {"sun": ["10:00", "21:00"], ..., "sat": null}: days sun..sat, 24-hour HH:MM.')
-    tenant.opening_hours = body.opening_hours
-    await record_audit(db, tenant_id=tenant.id, actor_id=admin.id, actor_type="super_admin", action="opening_hours_set",
-                       entity_type="tenant", entity_id=tenant.id, meta={"opening_hours": body.opening_hours})
-    await db.commit()
-    return {"id": tenant.id, "opening_hours": tenant.opening_hours, "open_now": hours.is_open(tenant.opening_hours)}
 
 
 @router.post("/funnels/try")

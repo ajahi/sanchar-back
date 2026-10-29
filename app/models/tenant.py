@@ -2,7 +2,6 @@
 from typing import Optional
 
 from sqlalchemy import Boolean, String, Text, text
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPKMixin
@@ -27,5 +26,3 @@ class Tenant(UUIDPKMixin, TimestampMixin, Base):
     )
     # The conversation funnel the bot follows (funnels.key, its active version); None = the built-in order steps.
     funnel_key: Mapped[Optional[str]] = mapped_column(String(50))
-    # {"sun": ["10:00", "21:00"], ..., "sat": null} Nepal time (services/hours.py); None = always open.
-    opening_hours: Mapped[Optional[dict]] = mapped_column(JSONB)
