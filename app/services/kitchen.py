@@ -158,6 +158,19 @@ def match_location(address: str, locations: list[dict]) -> dict | None:
     return best[1]
 
 
+def area_hint(text: str, locations: list[dict]) -> str:
+    """A note for the model naming the delivery area the customer's message spells out ("srijana chowk" ->
+    sirjana chowk). Alone, the model misses a near spelling among 60-odd areas, then keeps refusing it."""
+    loc = match_location(text, locations)
+    if loc is None or loc["address"] == PICKUP:
+        return ""
+    return (
+        f"Note from the business, not the customer: the customer's message names our delivery area "
+        f"'{loc['address']}' (delivery charge Rs {loc['rate']}), maybe spelt differently. We deliver there, "
+        "even if an earlier reply said otherwise."
+    )
+
+
 def plan(order: dict, integ: OrderIntegration) -> dict:
     """The lines and area Sanchar would send for this order, before anyone edits them."""
     lines = []

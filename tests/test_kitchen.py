@@ -63,6 +63,16 @@ def test_delivery_area_from_the_address():
     assert loc("Baneshwor, Kathmandu") is None  # not a delivery area: staff pick
 
 
+def test_area_hint_names_the_area_however_spelt():
+    areas = [*AREAS, {"address": "sirjana chowk", "rate": 80}]
+    # the real chat: the model refused "srijana chowk", then the exact name too
+    assert "'sirjana chowk' (delivery charge Rs 80)" in kitchen.area_hint("Delivery area srijana chowk. Name ram 9898989898", areas)
+    assert "'sirjana chowk'" in kitchen.area_hint("Sirjana chowk vanera xa khas ma spelling", areas)
+    assert kitchen.area_hint("Veg burger please", areas) == ""
+    assert kitchen.area_hint("pick up garchu", areas) == ""  # pickup is not a delivery area
+    assert kitchen.area_hint("Baneshwor", []) == ""  # no order system: no areas
+
+
 def test_body_is_what_the_website_posts():
     order = {"name": "Ram", "phone": "+9779812345678", "address": "bagale tole", "items": "2 Buff Jhol Momo"}
     body = kitchen.build_body(order, [(MENU[0], 2), (MENU[6], 1)], AREAS[1], "cafe@x.np")

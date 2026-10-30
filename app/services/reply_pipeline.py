@@ -30,6 +30,7 @@ from app.models.customer import Customer
 from app.models.handover import HandoverEvent
 from app.models.knowledge import KnowledgeDocument
 from app.models.message import Message
+from app.models.order_integration import OrderIntegration
 from app.models.sales_lead import SalesLead
 from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
@@ -311,6 +312,7 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     photos = await sendable_photos(db, tenant.id)
     funnel = await funnels.for_tenant(db, tenant)
     closed = await funnels.closed_message(db, tenant, funnel, knowledge)  # may re-read the hours: saved by the commit below
+    areas = await delivery_areas(db, tenant.id)
 
     prior = (
         await db.execute(
@@ -337,7 +339,7 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
                                 funnels.prompt_block(funnel)),
             history,
             msg.content,
-            _hint(msg.content, listed, closed),
+            _hint(msg.content, listed, closed, areas),
         )
     except Exception:  # noqa: BLE001 — stay quiet rather than send something wrong; a person can answer
         log.exception("LLM failed for conversation %s", convo.id)
@@ -398,9 +400,17 @@ async def _send_reply(db, convo, account, customer, msg, reply: str, picks: list
             break  # the rest would most likely fail the same way (expired url, window closed)
 
 
-def _hint(text: str, listed: list[tuple[str | None, list[str]]], closed: str | None) -> str:
-    """The per-message note for the model: matching photos, and that the business is closed."""
-    return "\n\n".join(x for x in [photo_hint(text, listed), hours.closed_note(closed) if closed else ""] if x)
+async def delivery_areas(db: AsyncSession, tenant_id) -> list[dict]:
+    """The delivery areas synced from the business's own order system ([] without one)."""
+    return (
+        await db.execute(select(OrderIntegration.locations).where(OrderIntegration.tenant_id == tenant_id))
+    ).scalar() or []
+
+
+def _hint(text: str, listed: list[tuple[str | None, list[str]]], closed: str | None, areas: list[dict]) -> str:
+    """The per-message note for the model: matching photos, the delivery area named, and that the business is closed."""
+    notes = [photo_hint(text, listed), kitchen.area_hint(text, areas), hours.closed_note(closed) if closed else ""]
+    return "\n\n".join(x for x in notes if x)
 
 
 async def preview_reply(
@@ -415,10 +425,11 @@ async def preview_reply(
     photos = await sendable_photos(db, tenant.id)
     funnel = funnel or await funnels.for_tenant(db, tenant)
     closed = await funnels.closed_message(db, tenant, funnel, knowledge)
+    areas = await delivery_areas(db, tenant.id)
     listed = [(p.title, p.tags) for p in photos]
     reply = await generate_reply(
         build_system_prompt(knowledge, photos=listed, funnel=funnels.prompt_block(funnel)),
-        history or [], message, _hint(message, listed, closed),
+        history or [], message, _hint(message, listed, closed, areas),
     )
     reply, collected = await funnels.finish_reply(db, tenant.id, funnel, reply, closed)
     reply, picks = split_photos(reply, len(photos))
