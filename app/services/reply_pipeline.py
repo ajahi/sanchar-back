@@ -344,6 +344,7 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
         return
     reply, collected = await funnels.finish_reply(db, tenant.id, funnel, reply or "", closed)
     reply, picks = split_photos(reply, len(photos))
+    kitchen_job = None
     if collected:  # kept even if the reply is dropped below: the customer did give (and confirm) these details
         sub = await funnels.record(db, funnel=funnel, account=account, convo=convo, customer=customer, fields=collected)
         log.info("%s confirmed in conversation %s (tenant %s, funnel %s v%s): %s", funnel.label, convo.id, tenant.id,
@@ -351,7 +352,16 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
         if sub is not None:
             await db.commit()  # kept whatever happens to the website send
             if "website_post" in funnel.triggers and sub.lead_id:  # into the business's own order system
-                await _send_to_kitchen(sub.lead_id, sub.id)
+                kitchen_job = (sub.lead_id, sub.id)
+    try:
+        await _send_reply(db, convo, account, customer, msg, reply, picks, photos, listed)
+    finally:  # after the reply: the customer isn't kept waiting on the order system (5 s and more)
+        if kitchen_job:
+            await _send_to_kitchen(*kitchen_job)
+
+
+async def _send_reply(db, convo, account, customer, msg, reply: str, picks: list[int], photos, listed) -> None:
+    """The reply text (split if long), then the photos the model picked."""
     if not reply and not picks:
         return
 

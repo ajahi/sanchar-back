@@ -16,7 +16,7 @@ from app.models.knowledge import KnowledgeDocument
 from app.models.message import Message
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
-from app.services import reply_pipeline
+from app.services import funnels, reply_pipeline
 from app.services.meta import whatsapp
 
 NOW = datetime.now(timezone.utc)
@@ -260,7 +260,7 @@ def test_ai_sends_photos_it_picks(monkeypatch) -> None:
 
             script.append("Dhanyabad Sita ji! Hami call garera confirm garchau. [order: Sita | 9801234567 | Patan | 1 Red Kurtha]")
             await ask("Sita, 9801234567, Patan, 1 red kurtha", 0.5)
-            assert texts[-1] == "Dhanyabad Sita ji! Hami call garera confirm garchau."
+            assert texts[-1] == funnels.THANKS  # the confirmation is written by code, whatever the model said
             lead = (await db.execute(select(SalesLead).where(SalesLead.customer_id == cust.id))).scalar_one()
             assert (lead.phone, lead.meta["order"]["items"]) == ("+9779801234567", "1 Red Kurtha")
 

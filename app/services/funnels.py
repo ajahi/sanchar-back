@@ -75,6 +75,8 @@ async def closed_message(db: AsyncSession, tenant: Tenant, funnel: Funnel, knowl
 
 
 CONFIRM = "Yo order thik cha? Kei special request bhaye (jastai piro kam, chado chahiyo) pani bhannus."
+THANKS = "Dhanyabad! Tapai ko order paayau. Order confirm garna hamro team le chadai call garnecha."
+THANKS_OTHER = "Dhanyabad! Hamro team le chadai samparka garnecha."
 
 
 def order_summary(draft: dict, integ: OrderIntegration | None) -> str:
@@ -140,7 +142,12 @@ async def finish_reply(
             reply = order_summary(draft, integ if integ is not None and integ.catalog else None)
         else:
             reply = plain_summary(funnel, draft)
-    return split_label(reply, funnel.label, funnel.fields)
+    text, collected = split_label(reply, funnel.label, funnel.fields)
+    if collected:  # written here like the summary: the model sometimes writes only the label, and the customer got nothing
+        text = THANKS if funnel.label == "order" else THANKS_OTHER
+        if collected.get("requests"):
+            text += " Tapai ko special request pani team lai pathayau."
+    return text, collected
 
 
 async def record(

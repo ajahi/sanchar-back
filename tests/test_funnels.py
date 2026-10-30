@@ -70,12 +70,14 @@ def funnel_block_for(fields):
 
 async def _chat(monkeypatch) -> None:
     sent: list[str] = []
+    order_of_events: list[str] = []
     script: list[str] = []
     posted: list[dict] = []
     seen: dict = {}
 
     async def fake_send(token, account_id, to, text):
         sent.append(text)
+        order_of_events.append("reply")
         return {"message_id": f"wamid.f{uuid.uuid4().hex[:8]}"}
 
     async def fake_generate(system, history, text, hint=""):
@@ -84,6 +86,7 @@ async def _chat(monkeypatch) -> None:
 
     async def fake_post(db, integ, lead, body):  # the restaurant's website, accepting the order
         posted.append(body)
+        order_of_events.append("website")
         lead.meta = {**lead.meta, "kitchen": {"order": lead.meta["order"], "total": body["totalAmount"]}}
         return lead.meta["kitchen"]
 
@@ -148,10 +151,12 @@ async def _chat(monkeypatch) -> None:
                 "Tapai ko order:\n2 x Buff Jhol Momo - Rs 250\n1 x Coke 250ml - Rs 100\nDelivery: Alumaila Chowk (Rs 80)\n"
                 "Total: Rs 680\n\nNaam: Ram\nPhone: 9812345678\nAddress: Alumaila Chowk, near the pump\n\n" + funnels.CONFIRM)
 
-            # 2. "thik xa": the label is saved as a submission and the order goes to the website
+            # 2. "thik xa": the model writes only the label (it does): the customer still gets the thanks, before the
+            # order goes to the website; the label is saved as a submission
             order_label = "[order: Ram | 9812345678 | Alumaila Chowk, near the pump | 2 x Buff Jhol Momo, 1 x Coke 250ml | piro kam]"
-            await say("thik xa, piro kam", f"Dhanyabad! Hamro team le chadai call garnecha. {order_label}")
-            assert sent[-1] == "Dhanyabad! Hamro team le chadai call garnecha."
+            await say("thik xa, piro kam", order_label)
+            assert sent[-1] == funnels.THANKS + " Tapai ko special request pani team lai pathayau."
+            assert order_of_events[-2:] == ["reply", "website"]
             [sub] = (await db.execute(select(FunnelSubmission).where(FunnelSubmission.tenant_id == tenant.id))).scalars()
             assert (sub.funnel_key, sub.status, sub.fields["requests"]) == (funnel.key, "sent", "piro kam")
             assert [(i["name"], i["quantity"]) for i in posted[-1]["item"]] == [("Buff Jhol Momo", 2), ("Coke 250ml", 1)]
