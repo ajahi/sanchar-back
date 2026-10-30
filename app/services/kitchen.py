@@ -160,14 +160,16 @@ def match_location(address: str, locations: list[dict]) -> dict | None:
 
 def area_hint(text: str, locations: list[dict]) -> str:
     """A note for the model naming the delivery area the customer's message spells out ("srijana chowk" ->
-    sirjana chowk). Alone, the model misses a near spelling among 60-odd areas, then keeps refusing it."""
+    sirjana chowk). Alone, the model misses a near spelling among 60-odd areas, then keeps refusing it: a mild
+    note lost to its own earlier "chhaina" in the history (0/4 against the real model), this wording won 4/4."""
     loc = match_location(text, locations)
     if loc is None or loc["address"] == PICKUP:
         return ""
     return (
         f"Note from the business, not the customer: the customer's message names our delivery area "
-        f"'{loc['address']}' (delivery charge Rs {loc['rate']}), maybe spelt differently. We deliver there, "
-        "even if an earlier reply said otherwise."
+        f"'{loc['address']}' (delivery charge Rs {loc['rate']}); they may spell it differently. We DO deliver there. "
+        "If an earlier reply in this chat said we don't, that reply was wrong: say sorry for the mistake and carry "
+        "on with the order."
     )
 
 
