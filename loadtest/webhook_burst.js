@@ -22,8 +22,7 @@ import crypto from 'k6/crypto';
 import { check, sleep } from 'k6';
 import { Counter } from 'k6/metrics';
 
-const BASE_URL = __ENV.BASE_URL || 'http://
-:8005';
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:8005';
 const SECRET = __ENV.APP_SECRET || 'loadtest-secret';
 const PEAK = Number(__ENV.PEAK || 50);
 const HOT_SHARE = Number(__ENV.HOT_SHARE || 0.6);
