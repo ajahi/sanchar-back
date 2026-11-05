@@ -26,10 +26,10 @@ jobs:
           git checkout -B "$BRANCH" "origin/$BRANCH"
           git log --oneline -1
 
-      - name: Build the api image
+      - name: Build the api and worker images
         run: |
           cd "$APP_DIR"
-          docker compose build api
+          docker compose build api worker  # same Dockerfile; the worker sends the replies the api queues
 
       # Before the new code goes live: code reading a column its migration hasn't created takes the whole api down.
       - name: Run database migrations
@@ -37,10 +37,10 @@ jobs:
           cd "$APP_DIR"
           docker compose run --rm --no-deps api alembic upgrade head
 
-      - name: Restart the api container
+      - name: Restart the api and worker containers
         run: |
           cd "$APP_DIR"
-          docker compose up -d api
+          docker compose up -d api worker  # also starts rabbitmq (api and worker depend on it)
           docker image prune -f  # the previous build is left untagged on every deploy
 
       - name: Wait for /health
