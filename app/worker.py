@@ -3,8 +3,12 @@
 Consumes `replies`, runs process_reply_job per message and acks it. A failed job is republished with its try
 count to `replies.retry`, or to `replies.dead` after MAX_TRIES. A crash before the ack makes the broker
 redeliver, and process_reply_job drops a job that was already answered.
+
+It also consumes `tasks` (profile lookups, history sync, inbox backfill: reply_queue.run_later) on its own channel,
+TASK_CONCURRENCY at a time, so a long history sync never takes a reply slot. A task that raises goes to tasks.dead.
 """
 import asyncio
+import json
 import logging
 import uuid
 
@@ -16,8 +20,15 @@ from app.core.log import log_failure
 from app.db.session import engine
 from app.services import http_client, reply_queue
 from app.services.reply_pipeline import process_reply_job
+from app.api.v1.social_accounts import _after_login, _backfill
+from app.api.v1.webhooks import fill_customer_profile, run_history_sync
 
 log = logging.getLogger("app.worker")
+
+TASK_FNS = {f.__name__: f for f in (fill_customer_profile, run_history_sync, _backfill, _after_login)}
+# shortcut: fixed; a history sync pages Graph for up to a minute, so 5 at once is plenty. Make it a setting if
+# the tasks queue backs up.
+TASK_CONCURRENCY = 5
 
 
 async def handle(channel: aio_pika.abc.AbstractChannel, msg: aio_pika.abc.AbstractIncomingMessage) -> None:
@@ -32,6 +43,19 @@ async def handle(channel: aio_pika.abc.AbstractChannel, msg: aio_pika.abc.Abstra
     await msg.ack()  # after the republish: a crash in between means a duplicate job, never a lost one
 
 
+async def handle_task(channel: aio_pika.abc.AbstractChannel, msg: aio_pika.abc.AbstractIncomingMessage) -> None:
+    try:
+        job = json.loads(msg.body)
+        fn = TASK_FNS[job.pop("task")]
+        await fn(**{k: uuid.UUID(v) for k, v in job.items()})
+    except Exception:  # noqa: BLE001 — the tasks log their own failures; this is a bad body or a bug
+        log_failure(log, "task %s failed", msg.body[:200])
+        await channel.default_exchange.publish(
+            aio_pika.Message(msg.body, delivery_mode=aio_pika.DeliveryMode.PERSISTENT), routing_key=reply_queue.TASKS_DEAD
+        )
+    await msg.ack()
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", force=True)
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -42,15 +66,19 @@ async def main() -> None:
     channel = await conn.channel()
     await channel.set_qos(prefetch_count=settings.reply_concurrency)
     await reply_queue.declare(channel)
-    queue = await channel.get_queue(reply_queue.QUEUE)
+    task_channel = await conn.channel()  # its own prefetch: tasks never take a reply slot
+    await task_channel.set_qos(prefetch_count=TASK_CONCURRENCY)
     tasks: set[asyncio.Task] = set()
 
-    async def on_message(msg: aio_pika.abc.AbstractIncomingMessage) -> None:
-        task = asyncio.create_task(handle(channel, msg))  # prefetch bounds how many run at once
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
+    def consumer(handler, ch):
+        async def on_message(msg: aio_pika.abc.AbstractIncomingMessage) -> None:
+            task = asyncio.create_task(handler(ch, msg))  # prefetch bounds how many run at once
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        return on_message
 
-    await queue.consume(on_message)
+    await (await channel.get_queue(reply_queue.QUEUE)).consume(consumer(handle, channel))
+    await (await task_channel.get_queue(reply_queue.TASKS)).consume(consumer(handle_task, task_channel))
     log.info("reply worker up, concurrency %s", settings.reply_concurrency)
     try:
         await asyncio.Future()

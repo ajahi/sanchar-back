@@ -64,6 +64,8 @@ How the worker behaves:
   to look at. An LLM failure is retried; a failed Meta send is not (it may have gone out).
 - Delivery is at-least-once: a crash between sending and storing the reply can still send one duplicate.
 
+The same worker also runs the other background jobs from the `tasks` queue: customer name lookups, "Load older chats" (history sync) and the inbox backfill after an account connects. They run 5 at a time on their own channel, so a long history sync never takes a reply slot. A job carries ids only, never an access token. These jobs log their own failures and are not retried; a malformed one lands in `tasks.dead`. Without a broker they run in the API process as before.
+
 Shop knowledge is cached per process for `KNOWLEDGE_CACHE_SECONDS` (30), so an edit or sold-out toggle can take
 that long to reach the bot. All settings are in `.env.example`.
 
@@ -323,5 +325,5 @@ Kitchen setup without the UI: `insert into order_integrations (tenant_id, base_u
 - The bot can't read text in images. A "Read menu photo into Shop Info" button (vision model) was proposed.
 - A "Use this chat as an example" button (copy a staff conversation into Shop Info) was proposed.
 - WhatsApp *coexistence* (business app + API on one number) needs a different signup `featureType` + `smb_app_data` sync. Not built.
-- Background work uses FastAPI BackgroundTasks: a restart loses in-flight replies. Use a jobs table if that matters.
+- Without `RABBITMQ_URL`, replies and background jobs run as FastAPI BackgroundTasks: a restart loses the ones in flight. Emails always do.
 - Kitchen client speaks one storefront API (thecubeventure.com's). Another site needs its own client.

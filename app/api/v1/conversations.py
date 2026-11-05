@@ -26,6 +26,7 @@ from app.api.v1.webhooks import SYNC_LOCK_MINUTES, run_history_sync
 from app.schemas.conversation import ConversationOut, MessageOut, ReplyIn
 from app.schemas.shop_media import SendMediaIn
 from app.services.meta import CHANNELS
+from app.services import reply_queue
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -118,17 +119,18 @@ async def sync_history(
         )
     ).scalars().all()
     now = datetime.now(timezone.utc)
-    started = running = 0
+    started, running = [], 0
     for acc in accounts:
         since = (acc.meta or {}).get("history_syncing_at")
         if since and now - datetime.fromisoformat(since) < timedelta(minutes=SYNC_LOCK_MINUTES):
             running += 1
             continue
         acc.meta = {**(acc.meta or {}), "history_syncing_at": now.isoformat()}
-        bg.add_task(run_history_sync, acc.id)
-        started += 1
-    await db.commit()  # the lock is saved before the background task starts
-    return {"started": started, "already_running": running}
+        started.append(acc.id)
+    await db.commit()  # the lock is saved before the sync starts (on the worker it can start at once)
+    for account_id in started:
+        await reply_queue.run_later(bg, run_history_sync, account_id=account_id)
+    return {"started": len(started), "already_running": running}
 
 
 @router.get("/{conversation_id}/messages", response_model=list[MessageOut])

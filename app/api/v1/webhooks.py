@@ -367,11 +367,22 @@ CHAT_LABEL = {"instagram": "Instagram", "facebook": "Messenger"}
 _PROFILE_SLOTS = asyncio.Semaphore(20)
 
 
-async def fill_customer_profile(
-    customer_id, token: str, igsid: str, convo_id, platform: str = "instagram"
-) -> None:
-    """Background: the Graph name lookup the webhook no longer waits on (it held a DB connection
-    for the whole call). Own short session; also fixes the "from a customer" notification subject."""
+async def fill_customer_profile(customer_id, convo_id) -> None:
+    """Background (queue task): the Graph name lookup the webhook no longer waits on (it held a DB connection
+    for the whole call). Own short sessions, none open during the Graph call; also fixes the "from a customer"
+    notification subject. Takes ids only, so no token sits in the queue."""
+    async with async_session_factory() as db:
+        row = (
+            await db.execute(
+                select(Customer.external_user_id, SocialAccount.platform, SocialAccount.access_token_encrypted)
+                .join(Conversation, Conversation.customer_id == Customer.id)
+                .join(SocialAccount, SocialAccount.id == Conversation.social_account_id)
+                .where(Customer.id == customer_id, Conversation.id == convo_id)
+            )
+        ).first()
+    if row is None or not row.access_token_encrypted:  # gone, or disconnected since the webhook
+        return
+    igsid, platform, token = row.external_user_id, row.platform, decrypt_token(row.access_token_encrypted)
     async with _PROFILE_SLOTS:
         profile = await CHANNELS[platform].fetch_customer_profile(token, igsid)
     name, username = profile.get("name"), profile.get("username")
@@ -457,8 +468,8 @@ async def ingest_event(
     following the 5-step flow above. ig_account_id is the account's id on that platform (Instagram
     business id / Facebook Page id); the customer is keyed by its IGSID / PSID.
 
-    profile_jobs: pass a list to skip the slow Graph name lookup here; nameless customers are appended
-    as fill_customer_profile args for the caller to run after the commit. None = look it up inline.
+    profile_jobs: pass a list to skip the slow Graph name lookup here; a nameless customer's (customer id,
+    conversation id) is appended for the caller to queue fill_customer_profile after the commit. None = look it up inline.
 
     Returns (conversation_id, message_id) when a NEW customer message was stored (the caller queues
     an auto-reply for it), else None. A NEW echo (a person answered from the Instagram app) is stored
@@ -502,7 +513,7 @@ async def ingest_event(
         db, account, customer, fresh=customer_is_new, last_message_at=last_message_at
     )  # step 3
     if defer and customer.name is None and customer.external_username is None:
-        profile_jobs.append((customer.id, token, igsid, convo.id, platform))
+        profile_jobs.append((customer.id, convo.id))
 
     if referral and not is_echo:
         await apply_referral(
@@ -753,8 +764,8 @@ async def receive(
         log_failure(log, "%s webhook ingest failed", obj)
         await db.rollback()
         return {"status": "ok"}
-    for job in profile_jobs:
-        bg.add_task(fill_customer_profile, *job)
+    for customer_id, convo_id in profile_jobs:
+        await reply_queue.run_later(bg, fill_customer_profile, customer_id=customer_id, convo_id=convo_id)
     for (
         message_id
     ) in to_reply.values():  # after the commit: the job reads the stored rows
