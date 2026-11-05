@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     # Test each pooled connection with a round trip before use. The reply worker turns it off (DB_POOL_PRE_PING=false):
     # it costs ~2ms of CPU per reply, and a dead connection there just fails one job, which the queue retries.
     db_pool_pre_ping: bool = True
+    # Connections each process keeps open, and how many more it may open at a peak. Every uvicorn process and every
+    # reply worker has its own pool: keep the sum of (size + overflow) under Postgres max_connections (100), with room
+    # for migrations and a psql session. The defaults suit one process; docker-compose and manifest/ set smaller ones.
+    db_pool_size: int = 15
+    db_max_overflow: int = 5
 
     # RabbitMQ for the reply queue (e.g. amqp://guest:guest@localhost:5672/). Empty = replies run in-process.
     rabbitmq_url: str = ""

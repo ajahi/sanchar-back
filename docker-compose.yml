@@ -7,6 +7,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-nepsocial}:${POSTGRES_PASSWORD:-nepsocial}@postgres:5432/${POSTGRES_DB:-nepsocial}
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-nepsocial}:${RABBITMQ_PASSWORD:-nepsocial}@rabbitmq:5672/
+      # 4 uvicorn processes x (8 + 4) = 48 DB connections; with the worker's 15, well under Postgres' 100
+      DB_POOL_SIZE: "8"
+      DB_MAX_OVERFLOW: "4"
     ports:
       - "8005:8000"
     depends_on:
@@ -25,6 +28,8 @@ services:
     env_file: .env
     environment:
       DB_POOL_PRE_PING: "false"  # a dead pooled connection only fails one job, which the queue retries
+      DB_POOL_SIZE: "10"  # 15 connections per worker; a job lets go of its connection while it waits on the model
+      DB_MAX_OVERFLOW: "5"
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-nepsocial}:${POSTGRES_PASSWORD:-nepsocial}@postgres:5432/${POSTGRES_DB:-nepsocial}
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-nepsocial}:${RABBITMQ_PASSWORD:-nepsocial}@rabbitmq:5672/
     depends_on:

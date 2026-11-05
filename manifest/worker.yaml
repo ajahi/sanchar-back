@@ -26,6 +26,10 @@ spec:
           env:
             - name: DB_POOL_PRE_PING   # a dead pooled connection only fails one job, which the queue retries
               value: "false"
+            - name: DB_POOL_SIZE       # 10 + 5 = 15 DB connections; backend.yaml uses 48 of Postgres' 100
+              value: "10"
+            - name: DB_MAX_OVERFLOW
+              value: "5"
           resources:
             requests: { cpu: 250m, memory: 256Mi }
             limits: { memory: 512Mi }
