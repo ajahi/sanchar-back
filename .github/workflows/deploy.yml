@@ -12,7 +12,11 @@ concurrency:
   cancel-in-progress: false  # let a running deploy finish; the next push queues behind it
 
 jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
   deploy:
+    needs: test  # a red test run stops the deploy
     runs-on: [self-hosted, sanchar]
     timeout-minutes: 15
     env:
