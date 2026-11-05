@@ -17,3 +17,6 @@ postgres_data/
 
 # codegraph index (local, rebuildable)
 .codegraph/
+
+# load-test raw samples (cpu.txt alone is 10MB+); the numbers worth keeping go in docs/load-test-report.md
+loadtest/out/

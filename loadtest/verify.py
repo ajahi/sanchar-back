@@ -5,6 +5,9 @@
 Compare `customer messages` with k6's `messages_sent`: the webhook returns 200 even when ingest fails,
 so any gap is silently lost DMs. `ai replies` vs customer messages gap = bot stayed quiet or its LLM/Graph
 call failed. Reply latency = inbound stored -> AI reply stored, for conversations with a single customer message.
+With RABBITMQ_URL set it also prints how many jobs are still in each reply queue: `replies` > 0 after the drain
+wait means the workers are behind, `replies.dead` > 0 means jobs failed all their tries.
+A customer message with no AI reply is normal: only the newest message of a quick burst in a chat is answered.
 """
 import asyncio
 import json
@@ -12,7 +15,9 @@ import urllib.request
 
 from sqlalchemy import text
 
+from app.core.config import settings
 from app.db.session import async_session_factory
+from app.services import reply_queue
 
 COUNTS = """
 select m.sender_type, count(*) from messages m
@@ -33,6 +38,21 @@ select count(*), percentile_cont(0.5) within group (order by extract(epoch from 
 from per where n = 1 and ai is not null"""
 
 
+async def queue_depths() -> str | None:
+    if not settings.rabbitmq_url:
+        return None
+    import aio_pika
+
+    try:
+        async with await aio_pika.connect_robust(settings.rabbitmq_url, timeout=3) as conn:
+            channel = await conn.channel()
+            names = (reply_queue.QUEUE, reply_queue.RETRY, reply_queue.DEAD)
+            depths = [(await channel.declare_queue(n, passive=True)).declaration_result.message_count for n in names]
+        return "  ".join(f"{n}={d}" for n, d in zip(names, depths))
+    except Exception as exc:  # noqa: BLE001 — a diagnostic line, never fail the run over it
+        return f"unavailable ({exc!r})"
+
+
 async def main() -> None:
     async with async_session_factory() as db:
         counts = dict((await db.execute(text(COUNTS))).all())
@@ -41,6 +61,8 @@ async def main() -> None:
     print(f"ai replies stored:        {counts.get('ai', 0)}")
     if n:
         print(f"reply latency over {n} chats: p50={p50:.1f}s  p95={p95:.1f}s  p99={p99:.1f}s  max={worst:.1f}s")
+    if (depths := await queue_depths()) is not None:
+        print(f"jobs left in the queues:  {depths}")
     try:
         mock = json.load(urllib.request.urlopen("http://localhost:9000/stats", timeout=3))
         print(f"mock saw: {mock}")

@@ -4,6 +4,7 @@ The DB test runs in a transaction that is always rolled back.
     python -m pytest tests/test_campaigns.py
 """
 import asyncio
+import uuid
 
 from sqlalchemy import select
 
@@ -64,11 +65,11 @@ async def _run(monkeypatch) -> None:
 
     async def fake_text(token, acct, to, text):
         sent.append(("text", text))
-        return {"message_id": f"t{len(sent)}"}
+        return {"message_id": f"t-{uuid.uuid4()}"}  # unique, like Meta's: sent is cleared below
 
     async def fake_image(token, acct, to, url):
         sent.append(("image", url))
-        return {"message_id": f"i{len(sent)}"}
+        return {"message_id": f"i-{uuid.uuid4()}"}
 
     monkeypatch.setattr(instagram, "fetch_customer_profile", no_profile)
     monkeypatch.setattr(instagram, "send_text", fake_text)
@@ -118,28 +119,21 @@ async def _run(monkeypatch) -> None:
                                                   "timestamp": 1700000001000, "message": {"mid": "m1", "text": "Pp"}})
         assert first is not None
         await db.commit()  # the reply pipeline commits its own work; keep this test's rows visible to it
-        try:
-            await reply_pipeline.auto_reply(db, first[1])
-            assert sent == [("text", "Rs 3350 price, pure chinnon silk"), ("image", "http://x/2.jpg"), ("image", "http://x/0.jpg")]
+        await reply_pipeline.auto_reply(db, first[1])
+        assert sent == [("text", "Rs 3350 price, pure chinnon silk"), ("image", "http://x/2.jpg"), ("image", "http://x/0.jpg")]
 
-            # asking again soon: the price line again, but the photos are not resent into the same chat
-            sent.clear()
-            again = await ingest_event(db, "biz-c", {"sender": {"id": "cust-c"}, "recipient": {"id": "biz-c"},
-                                                      "timestamp": 1700000002000, "message": {"mid": "m2", "text": "price kati ho"}})
-            await db.commit()
-            await reply_pipeline.auto_reply(db, again[1])
-            assert sent == [("text", "Rs 3350 price, pure chinnon silk")]
+        # asking again soon: the price line again, but the photos are not resent into the same chat
+        sent.clear()
+        again = await ingest_event(db, "biz-c", {"sender": {"id": "cust-c"}, "recipient": {"id": "biz-c"},
+                                                  "timestamp": 1700000002000, "message": {"mid": "m2", "text": "price kati ho"}})
+        await db.commit()
+        await reply_pipeline.auto_reply(db, again[1])
+        assert sent == [("text", "Rs 3350 price, pure chinnon silk")]
 
-            stored = (await db.execute(select(Message.message_type, Message.sender_type)
-                                       .where(Message.conversation_id == convo.id)
-                                       .order_by(Message.created_at))).all()
-            assert [r for r in stored if r.sender_type == "ai" and r.message_type == "image"] and len(stored) >= 6
-        finally:  # committed above: remove both tenants (everything under them cascades)
-            for tid in (t.id, other.id):
-                tenant = await db.get(Tenant, tid)
-                if tenant is not None:
-                    await db.delete(tenant)
-            await db.commit()
+        stored = (await db.execute(select(Message.message_type, Message.sender_type)
+                                   .where(Message.conversation_id == convo.id)
+                                   .order_by(Message.created_at))).all()
+        assert [r for r in stored if r.sender_type == "ai" and r.message_type == "image"] and len(stored) >= 6
 
 
 def test_campaign_flow(monkeypatch) -> None:

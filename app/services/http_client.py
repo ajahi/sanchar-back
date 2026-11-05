@@ -14,9 +14,12 @@ DB connection sat idle in its transaction and the pool ran dry. Pass `verify=SSL
 """
 import asyncio
 import json as jsonlib
+import urllib.request
 
 import aiohttp
 import httpx
+
+from app.core.config import settings
 
 SSL_CTX = httpx.create_ssl_context()
 
@@ -27,12 +30,16 @@ def _new_session() -> aiohttp.ClientSession:
     # trust_env: honour HTTPS_PROXY / NO_PROXY like httpx did, so a proxied deployment keeps working.
     # The DNS cache stays at aiohttp's short default: reused connections make a longer one pointless, and a
     # retired IP would otherwise be retried for its whole TTL.
-    return aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=SSL_CTX, limit=100), trust_env=True)
+    # Only when a proxy variable is set: with trust_env aiohttp re-reads the whole environment on every request
+    # (urllib's getproxies_environment, ~10% of a reply's CPU in the profile), which is wasted when there is none.
+    return aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(ssl=SSL_CTX, limit=max(100, settings.reply_concurrency + 50)), trust_env=bool(urllib.request.getproxies())
+    )
 
 
 def start() -> None:
     """Open the shared session (app startup, inside the running loop).
-    ponytail: one connection pool for every host (100 total); split per host if a slow API starves the rest.
+    ponytail: one connection pool for every host (100 total, or REPLY_CONCURRENCY + 50 if higher: it caps the calls in flight); split per host if a slow API starves the rest.
 
     TLS (checked against graph.facebook.com, graph.instagram.com and api.groq.com): certificates verify with
     SSL_CTX; a reused connection costs ~1ms of CPU against ~4.5ms (and ~120ms of latency) for a new handshake;

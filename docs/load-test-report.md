@@ -47,9 +47,36 @@ The `p95` of about 33s is the pool's 30s wait plus the work itself. The pool (5 
 4. Drop the per-request body logging, or lower it to DEBUG.
 5. Fix `seed_tenants --cleanup` so the harness can be re-run on one database.
 
+## Update 2026-10-23: fixes applied, then the reply queue
+
+Most of the "Suggested fixes" above landed in earlier commits (connections released before slow calls, profile fetch moved after the ack, LLM and profile calls capped, pool 15 + 5, body logging removed). Then replies moved to RabbitMQ (`app/services/reply_queue.py`, `app/worker.py`).
+
+Setup: `bash loadtest/run_linux.sh` on one Linux box that also ran k6, the app, Postgres and the mock (LLM 2s, Graph 0.3s, keep-alive, no Groq rate limit). Peak 50 msgs/s, 20 tenants, one uvicorn process. "Slots" = `REPLY_CONCURRENCY`, the model calls in flight per process.
+
+| Replies | Stored / sent | AI replies | Reply latency p50 / p95 | Worker CPU per reply |
+|---|---|---|---|---|
+| In process, 20 slots (before the queue) | 9798 / 9798 | 2406 | 74s / 167s | n/a |
+| Queue, 2 workers x 20 slots | 9813 / 9814 | 4638 | 78s / 162s | not measured |
+| Queue, 6 workers x 20 slots | 9756 / 9756 | 8252 | 5.4s / 6.8s | not measured |
+| Queue, 1 worker x 130 slots (HTTP limit still 100) | 9725 / 9725 | 8022 | 16.3s / 28.8s | 17.8 ms |
+| same, after the CPU fixes below | 9818 / 9818 | 8048 | 16.3s / 28.7s | 15.1 ms |
+| same, HTTP limit raised with the slots | 9758 / 9758 | 8524 | 4.6s / 5.9s | 13.8 ms |
+
+- Webhook p95 stayed 35 to 80 ms in every run (target < 500 ms). The webhook is no longer the problem.
+- Fewer replies than messages is by design: only the newest message of a quick burst in a chat is answered.
+- **What capped one worker:** the shared HTTP session allowed 100 connections in total, so 130 slots could never run at once (about 36 replies/s against about 38/s arriving). The limit now follows `REPLY_CONCURRENCY`. Six workers avoided it only because each had its own session.
+- **CPU per reply** went from about 20 ms to about 13 ms in the per-reply benchmark: SQL statements 11 to 5 (stale checks and the human-active flag folded into the load query), shop knowledge cached for 30s, aiohttp no longer re-scanning the environment for proxy settings on every request (about 1 ms per request, also on the API's profile lookups), and no pool pre-ping on the worker (about 2 ms). One process tops out near 70 replies/s, so add worker processes only after raising slots.
+- **Durability:** in the 2-worker run the script stopped the workers while 4051 jobs were still queued, and they stayed in `replies`. With in-process replies those would have been lost.
+- Not resolved: in two runs 1 and 3 of about 9,700 messages were not stored although the webhook had answered (one failed 200 check each). No pool timeouts or errors were logged, and the cause was not found. The other runs lost none.
+- Not re-run with the queue: 200 msgs/s. The in-process run earlier the same day lost about half the messages (14% of webhook calls failed) at that rate, so the ingest ceiling is a separate question from reply speed.
+- Everything here is against mocks on one machine. Real Groq latency, its rate limits and real Meta responses are untested.
+
 ## Re-run
 
 ```
+bash loadtest/run_linux.sh 10 50                 # everything below in one go; LT_QUEUE=N adds RabbitMQ and N reply workers
+
+# or by hand:
 python -m loadtest.mock_external                 # add LLM_RPM=30 LLM_TPM=8000 for the limits test
 python -m loadtest.seed_tenants 20
 # app with INSTAGRAM_APP_SECRET=loadtest-secret INSTAGRAM_GRAPH_BASE=http://localhost:9000

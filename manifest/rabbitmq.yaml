@@ -1,0 +1,59 @@
+# RabbitMQ for the reply queue: one broker, its queues kept on a volume so a restart loses no queued reply.
+# Credentials come from the sanchar-back secret (RABBITMQ_USER, RABBITMQ_PASSWORD); put
+# RABBITMQ_URL=amqp://<user>:<password>@sanchar-rabbitmq:5672/ in the same secret for backend and worker.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sanchar-rabbitmq
+  namespace: sanchar
+spec:
+  serviceName: sanchar-rabbitmq
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sanchar-rabbitmq
+  template:
+    metadata:
+      labels:
+        app: sanchar-rabbitmq
+    spec:
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3.13-management
+          ports:
+            - containerPort: 5672
+          env:
+            - name: RABBITMQ_DEFAULT_USER
+              valueFrom: { secretKeyRef: { name: sanchar-back, key: RABBITMQ_USER } }
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom: { secretKeyRef: { name: sanchar-back, key: RABBITMQ_PASSWORD } }
+          readinessProbe:
+            exec: { command: ["rabbitmq-diagnostics", "-q", "ping"] }
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/rabbitmq
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+  volumeClaimTemplates:   # uses the cluster's default storage class
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests: { storage: 2Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sanchar-rabbitmq
+  namespace: sanchar
+spec:
+  selector:
+    app: sanchar-rabbitmq
+  ports:
+    - port: 5672
+      targetPort: 5672

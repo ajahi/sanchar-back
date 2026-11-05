@@ -22,6 +22,11 @@ spec:
           envFrom:
             - secretRef:
                 name: sanchar-back      # every key in the secret becomes an env var
+          env:                          # 4 uvicorn processes x (8 + 4) = 48 DB connections; worker.yaml adds 15
+            - name: DB_POOL_SIZE
+              value: "8"
+            - name: DB_MAX_OVERFLOW
+              value: "4"
           readinessProbe:               # "ready for traffic" once port 8000 accepts connections
             tcpSocket: { port: 8000 }
             initialDelaySeconds: 10
