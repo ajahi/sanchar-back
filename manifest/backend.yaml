@@ -1,0 +1,48 @@
+# Backend pods: keeps 1 copy of the FastAPI app running, replaces it if it dies.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sanchar-backend
+  namespace: sanchar
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sanchar-backend
+  template:
+    metadata:
+      labels:
+        app: sanchar-backend
+    spec:
+      containers:
+        - name: backend
+          image: 572824491336.dkr.ecr.ap-south-1.amazonaws.com/sanchar/backend:be258d8
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: sanchar-back      # every key in the secret becomes an env var
+          readinessProbe:               # "ready for traffic" once port 8000 accepts connections
+            tcpSocket: { port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:                # restart the container if it stops answering
+            tcpSocket: { port: 8000 }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { memory: 1Gi }     # 4 uvicorn workers; raise if you see OOMKilled
+---
+# Stable name "sanchar-backend" inside the cluster, port 8000.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sanchar-backend
+  namespace: sanchar
+spec:
+  selector:
+    app: sanchar-backend
+  ports:
+    - port: 8000
+      targetPort: 8000
