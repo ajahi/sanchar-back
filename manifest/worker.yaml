@@ -1,0 +1,31 @@
+# Reply worker pods: send the auto-replies the backend queues on RabbitMQ (python -m app.worker).
+# Same image and secret as the backend; the secret needs RABBITMQ_URL (see rabbitmq.yaml), or this pod exits
+# and the backend keeps replying in-process. Raise REPLY_CONCURRENCY before adding replicas.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sanchar-worker
+  namespace: sanchar
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sanchar-worker
+  template:
+    metadata:
+      labels:
+        app: sanchar-worker
+    spec:
+      containers:
+        - name: worker
+          image: 572824491336.dkr.ecr.ap-south-1.amazonaws.com/sanchar/backend:be258d8   # keep in step with backend.yaml
+          command: ["python", "-m", "app.worker"]
+          envFrom:
+            - secretRef:
+                name: sanchar-back
+          env:
+            - name: DB_POOL_PRE_PING   # a dead pooled connection only fails one job, which the queue retries
+              value: "false"
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 512Mi }
