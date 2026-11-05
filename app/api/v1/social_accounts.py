@@ -54,6 +54,7 @@ from app.services.audit import record_audit
 from app.api.v1.webhooks import backfill_recent_conversations
 from app.services.meta import facebook, instagram, whatsapp
 from app.services.rbac import get_roles_by_names
+from app.services import reply_queue
 
 router = APIRouter(prefix="/social-accounts", tags=["social-accounts"])
 
@@ -684,7 +685,7 @@ async def facebook_callback(
     log.info("facebook connect for user %s (workspace %s): Facebook granted %d page(s): %s", user.id,
              user.tenant_id, len(pages), [(p.get("id"), p.get("name"), bool(p.get("access_token"))) for p in pages])
 
-    linked = 0
+    linked = []
     for page in pages:
         page_id, token = page.get("id"), page.get("access_token")
         if not page_id or not token:
@@ -714,10 +715,11 @@ async def facebook_callback(
         account.meta = {**(account.meta or {}), "linked_instagram_id": ig_id}
         await db.flush()
         await _audit_facebook(db, user.tenant_id, user.id, account.id, page_id)
-        background_tasks.add_task(_backfill, account.id, token)
-        linked += 1
-    await db.commit()
-    return _redirect_to_frontend(**({"fb_connected": str(linked)} if linked else {"fb_error": "no_pages_linked"}))
+        linked.append(account.id)
+    await db.commit()  # before the backfill: on the worker it can start at once, and reads the stored token
+    for account_id in linked:
+        await reply_queue.run_later(background_tasks, _backfill, account_id=account_id)
+    return _redirect_to_frontend(**({"fb_connected": str(len(linked))} if linked else {"fb_error": "no_pages_linked"}))
 
 
 @router.post("/facebook", response_model=FacebookPageOut, status_code=status.HTTP_201_CREATED)
@@ -787,7 +789,7 @@ async def link_facebook(
     await _audit_facebook(db, tenant.id, user.id, account.id, body.page_id)
     await db.commit()
     await db.refresh(account)
-    background_tasks.add_task(_backfill, account.id, token)
+    await reply_queue.run_later(background_tasks, _backfill, account_id=account.id)
     return FacebookPageOut(
         page_id=account.external_account_id,
         name=account.account_name,
@@ -800,27 +802,31 @@ async def link_facebook(
     )
 
 
-async def _backfill(account_id: uuid.UUID, token: str) -> None:
-    """Seed the inbox from Graph. Best-effort; own DB session since the request's is closed."""
+async def _backfill(account_id: uuid.UUID) -> None:
+    """Seed the inbox from Graph. Best-effort (queue task); own DB session since the request's is closed."""
     try:
         async with async_session_factory() as db:
             account = await db.get(SocialAccount, account_id)
-            if account is not None:
-                await backfill_recent_conversations(db, account, token)
+            if account is not None and account.access_token_encrypted:
+                await backfill_recent_conversations(db, account, decrypt_token(account.access_token_encrypted))
                 await db.commit()
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).exception("conversation backfill failed for account %s", account_id)
 
 
-async def _after_login(account_id: uuid.UUID, token: str) -> None:
-    """Runs after the redirect is sent: webhook subscription, then inbox seed. Each step is
-    best-effort and independent."""
+async def _after_login(account_id: uuid.UUID) -> None:
+    """Runs after the redirect is sent (queue task): webhook subscription, then inbox seed. Each step is
+    best-effort and independent. Reads the token the login stored, so none sits in the queue."""
+    async with async_session_factory() as db:
+        encrypted = await db.scalar(select(SocialAccount.access_token_encrypted).where(SocialAccount.id == account_id))
+    if not encrypted:  # disconnected since
+        return
     try:
-        await instagram.subscribe_to_messages(token)
+        await instagram.subscribe_to_messages(decrypt_token(encrypted))
     except httpx.HTTPError as exc:
         body = exc.response.text if isinstance(exc, httpx.HTTPStatusError) else ""
         logging.getLogger(__name__).error("instagram webhook subscription failed: %r %s", exc, body)
-    await _backfill(account_id, token)
+    await _backfill(account_id)
 
 
 # Same look as the frontend's Loader. The browser keeps this page painted while /finish works.
@@ -921,7 +927,7 @@ async def instagram_finish(
 
     # After the redirect is sent: subscribe the account to DM webhooks (without it, new DMs never
     # arrive), then seed the inbox (Graph's conversations call takes ~5s; the 5s poll picks it up).
-    background_tasks.add_task(_after_login, account.id, long_lived["access_token"])
+    await reply_queue.run_later(background_tasks, _after_login, account_id=account.id)
 
     # Mint our own session and hand it to the dashboard via an httpOnly cookie.
     token = create_access_token(

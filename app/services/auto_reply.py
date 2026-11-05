@@ -18,8 +18,8 @@ log = logging.getLogger(__name__)
 
 GROQ_URL = settings.groq_url
 # At most this many model calls in flight per process; the rest wait here holding no DB connection.
-# ponytail: fixed cap, tune to the Groq plan's rate limit (or make it a setting) if replies queue too long.
-_LLM_SLOTS = asyncio.Semaphore(20)
+# REPLY_CONCURRENCY: raise it before adding processes (a call in flight is just a waiting socket); the Groq plan's rate limit is the ceiling.
+_LLM_SLOTS = asyncio.Semaphore(settings.reply_concurrency)
 
 SYSTEM_TEMPLATE = """You are the chat assistant for the business described in SHOP INFORMATION below (a shop, a rental, a consultancy, a restaurant or any other business), replying to customers on Instagram, Facebook Messenger or WhatsApp.
 

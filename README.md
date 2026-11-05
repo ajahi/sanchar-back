@@ -40,6 +40,46 @@ Labels removed → text sent → photos sent → order saved to the lead
         → (optional) order placed in the business's own system  app/services/kitchen.py
 ```
 
+## Auto-replies and the reply queue
+
+A customer message is stored by the webhook, which answers Meta right away. The AI reply is a separate job
+(`reply_pipeline.auto_reply`) that takes only the message id and reloads everything from the DB.
+
+- **Without `RABBITMQ_URL`** the job runs in the API process as a background task. A restart loses in-flight replies.
+- **With `RABBITMQ_URL`** the webhook publishes the id to a durable RabbitMQ queue (`replies`), and a separate
+  worker sends the reply. If the broker is down the webhook falls back to the in-process task, so nothing is lost.
+
+```bash
+docker compose up -d postgres rabbitmq     # broker on localhost:5672, management UI on :15672
+#   .env: RABBITMQ_URL=amqp://nepsocial:nepsocial@localhost:5672/
+python -m app.worker                       # or the compose `worker` service
+```
+
+How the worker behaves:
+- Handles `REPLY_CONCURRENCY` jobs at once (default 20). **Raise this before adding worker processes**: a call
+  waiting on the LLM costs no CPU. One process measured about 14 ms of CPU per reply, so it tops out near 70 replies/s.
+- Drops a job that is older than `REPLY_MAX_AGE_MINUTES` (10), already answered, or superseded by a newer
+  message in the same chat. A late or doubled DM is worse than none.
+- A failed job goes to `replies.retry` (waits `REPLY_RETRY_SECONDS`), and after 3 tries to `replies.dead` for a person
+  to look at. An LLM failure is retried; a failed Meta send is not (it may have gone out).
+- Delivery is at-least-once: a crash between sending and storing the reply can still send one duplicate.
+
+The same worker also runs the other background jobs from the `tasks` queue: customer name lookups, "Load older chats" (history sync) and the inbox backfill after an account connects. They run 5 at a time on their own channel, so a long history sync never takes a reply slot. A job carries ids only, never an access token. These jobs log their own failures and are not retried; a malformed one lands in `tasks.dead`. Without a broker they run in the API process as before.
+
+Shop knowledge is cached per process for `KNOWLEDGE_CACHE_SECONDS` (30), so an edit or sold-out toggle can take
+that long to reach the bot. All settings are in `.env.example`.
+
+### Load test
+
+`loadtest/run_linux.sh` starts a throwaway Postgres, the app, a mock Meta/Groq and k6. Needs docker, k6 and the venv.
+
+```bash
+bash loadtest/run_linux.sh 10 50                    # in-process replies at 10 and 50 msgs/s
+LT_QUEUE=1 REPLY_CONCURRENCY=130 bash loadtest/run_linux.sh 50   # replies via RabbitMQ, one worker
+```
+It prints stored messages vs sent, reply latency, DB connection use and the worker's CPU per reply.
+`RABBITMQ_URL=amqp://... LT_QUEUE=N` uses a broker you already run. Results land in `loadtest/out/<rate>/`.
+
 ---
 
 ## 1. Channels: Instagram, Messenger, WhatsApp
@@ -285,5 +325,5 @@ Kitchen setup without the UI: `insert into order_integrations (tenant_id, base_u
 - The bot can't read text in images. A "Read menu photo into Shop Info" button (vision model) was proposed.
 - A "Use this chat as an example" button (copy a staff conversation into Shop Info) was proposed.
 - WhatsApp *coexistence* (business app + API on one number) needs a different signup `featureType` + `smb_app_data` sync. Not built.
-- Background work uses FastAPI BackgroundTasks: a restart loses in-flight replies. Use a jobs table if that matters.
+- Without `RABBITMQ_URL`, replies and background jobs run as FastAPI BackgroundTasks: a restart loses the ones in flight. Emails always do.
 - Kitchen client speaks one storefront API (thecubeventure.com's). Another site needs its own client.

@@ -76,25 +76,18 @@ async def _run(monkeypatch) -> None:
         await db.commit()  # run_history_sync uses its own sessions, so this one must be committed
         acc_id, tenant_id = acc.id, t.id
 
-    try:
-        await webhooks.run_history_sync(acc_id)
-        await webhooks.run_history_sync(acc_id)  # second click starts from the top again: nothing doubles
-        async with async_session_factory() as db:
-            convos = (await db.execute(select(Conversation).where(Conversation.tenant_id == tenant_id))).scalars().all()
-            assert len(convos) == 2 and {c.channel for c in convos} == {"facebook"}
-            ids = (await db.execute(select(Message.external_message_id).join(Conversation).where(
-                Conversation.tenant_id == tenant_id))).scalars().all()
-            assert sorted(ids) == ["h1", "h2", "h3"]
-            lead = (await db.execute(select(SalesLead).where(SalesLead.tenant_id == tenant_id))).scalar_one()
-            assert lead.phone == "+9779812345678" and lead.channel == "facebook"  # found in an OLD message
-            account = await db.get(SocialAccount, acc_id)
-            assert "history_syncing_at" not in account.meta and account.meta["history_after"] is None
-    finally:  # committed data: remove the tenant (everything under it cascades)
-        async with async_session_factory() as db:
-            tenant = await db.get(Tenant, tenant_id)
-            if tenant is not None:
-                await db.delete(tenant)
-                await db.commit()
+    await webhooks.run_history_sync(acc_id)
+    await webhooks.run_history_sync(acc_id)  # second click starts from the top again: nothing doubles
+    async with async_session_factory() as db:
+        convos = (await db.execute(select(Conversation).where(Conversation.tenant_id == tenant_id))).scalars().all()
+        assert len(convos) == 2 and {c.channel for c in convos} == {"facebook"}
+        ids = (await db.execute(select(Message.external_message_id).join(Conversation).where(
+            Conversation.tenant_id == tenant_id))).scalars().all()
+        assert sorted(ids) == ["h1", "h2", "h3"]
+        lead = (await db.execute(select(SalesLead).where(SalesLead.tenant_id == tenant_id))).scalar_one()
+        assert lead.phone == "+9779812345678" and lead.channel == "facebook"  # found in an OLD message
+        account = await db.get(SocialAccount, acc_id)
+        assert "history_syncing_at" not in account.meta and account.meta["history_after"] is None
 
 
 def test_run_history_sync(monkeypatch) -> None:
