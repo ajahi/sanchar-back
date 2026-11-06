@@ -22,6 +22,10 @@ QUEUE, RETRY, DEAD = "replies", "replies.retry", "replies.dead"
 TASKS, TASKS_DEAD = "tasks", "tasks.dead"
 MAX_TRIES = 3
 _BACKOFF = 10  # seconds to leave a broker alone after a failed connect, so webhooks don't each wait on it
+# Publishes share one channel lock, so a saturated event loop queues them for minutes with a healthy broker. A
+# short timeout reads that as "broker down" and the in-process fallback then buries the loop (load test, 200 msgs/s).
+# A dead connection raises at once, so this only has to outlast overload: as long as a reply is worth sending.
+_PUBLISH_TIMEOUT = settings.reply_max_age_minutes * 60
 
 _conn: aio_pika.abc.AbstractRobustConnection | None = None
 _channel: aio_pika.abc.AbstractChannel | None = None
@@ -72,7 +76,7 @@ async def _publish(message: aio_pika.Message, queue: str) -> bool:
     if channel is None:
         return False
     try:
-        await channel.default_exchange.publish(message, routing_key=queue, timeout=5)
+        await channel.default_exchange.publish(message, routing_key=queue, timeout=_PUBLISH_TIMEOUT)
     except Exception:  # noqa: BLE001
         log.exception("publishing to %s failed: %s", queue, message.body[:200])
         return False

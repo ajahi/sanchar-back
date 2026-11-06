@@ -10,8 +10,8 @@ stays quiet; every human reply refreshes the window, and once they go idle the b
 mode to flip back and nothing to lose on a restart.
 
 With RABBITMQ_URL set, the webhook publishes the message id to RabbitMQ (reply_queue) and the worker
-(app/worker.py) runs process_reply_job; without it, or if the broker is down, it falls back to the
-in-process background task, which loses in-flight replies on a restart.
+(app/worker.py) runs process_reply_job; without it, or if the broker is down, dispatch_reply falls back to
+running the reply in-process, which loses in-flight replies on a restart.
 """
 import logging
 import time
@@ -42,7 +42,7 @@ from app.models.funnel import FunnelSubmission
 from app.services.auto_reply import (
     build_system_prompt, expand_picks, generate_reply, photo_hint, sent_photos_note, split_long, split_photos,
 )
-from app.services import campaigns, funnels, hours, kitchen
+from app.services import campaigns, funnels, hours, kitchen, reply_queue
 from app.services.meta import CHANNELS
 from app.services.notifications import create_notification
 
@@ -503,6 +503,12 @@ async def run_auto_reply(message_id) -> None:
             await db.commit()
     except Exception:  # noqa: BLE001
         log_failure(log, "auto-reply failed for message %s", message_id)
+
+
+async def dispatch_reply(message_id) -> None:
+    """Background-task entry: hand the reply to the queue; run it here only when the broker can't take it."""
+    if not await reply_queue.publish(message_id):
+        await run_auto_reply(message_id)
 
 
 def stale_reason(created_at: datetime, answered: bool, superseded: bool) -> str | None:

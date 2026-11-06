@@ -91,3 +91,20 @@ def test_stale_reason_rules() -> None:
 def test_publish_without_broker_returns_false(monkeypatch) -> None:
     monkeypatch.setattr(reply_queue.settings, "rabbitmq_url", "")
     assert asyncio.run(reply_queue.publish("anything")) is False
+
+
+def test_dispatch_reply_falls_back_only_when_publish_fails(monkeypatch) -> None:
+    ran: list = []
+
+    async def fake_run(message_id):
+        ran.append(message_id)
+
+    monkeypatch.setattr(reply_pipeline, "run_auto_reply", fake_run)
+    for published, expected in ((True, []), (False, ["m1"])):
+        async def fake_publish(message_id, ok=published):
+            return ok
+
+        monkeypatch.setattr(reply_queue, "publish", fake_publish)
+        ran.clear()
+        asyncio.run(reply_pipeline.dispatch_reply("m1"))
+        assert ran == expected

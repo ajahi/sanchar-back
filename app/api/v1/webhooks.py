@@ -38,6 +38,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic_core import from_json
 from sqlalchemy import case, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import TimeoutError as PoolTimeout
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -53,8 +54,7 @@ from app.services.meta import CHANNELS, instagram
 from app.services.campaigns import apply_referral, referral_of
 from app.services.leads import capture_lead
 from app.services.notifications import create_notification
-from app.services import reply_queue
-from app.services.reply_pipeline import run_auto_reply
+from app.services.reply_pipeline import dispatch_reply
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 log = logging.getLogger(__name__)
@@ -760,15 +760,17 @@ async def receive(
                     ):
                         to_reply[job[0]] = job[1]
         await db.commit()
+    except PoolTimeout:  # overload, not a bad event: a 200 would lose the message, Meta redelivers on 5xx (mid dedupes)
+        log_failure(log, "%s webhook ingest failed", obj)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Busy") from None
     except Exception:  # noqa: BLE001 — log it, never make Meta retry forever
         log_failure(log, "%s webhook ingest failed", obj)
         await db.rollback()
         return {"status": "ok"}
+    # After the commit (the job reads the stored rows) and after the ack: a busy broker channel must not hold the
+    # 200. Background tasks run in order, so replies go first: profile lookups can wait on Graph and on their slots.
+    for message_id in to_reply.values():
+        bg.add_task(dispatch_reply, message_id)
     for customer_id, convo_id in profile_jobs:
-        await reply_queue.run_later(bg, fill_customer_profile, customer_id=customer_id, convo_id=convo_id)
-    for (
-        message_id
-    ) in to_reply.values():  # after the commit: the job reads the stored rows
-        if not await reply_queue.publish(message_id):  # no broker configured, or it is down
-            bg.add_task(run_auto_reply, message_id)
+        bg.add_task(reply_queue.run_later, bg, fill_customer_profile, customer_id=customer_id, convo_id=convo_id)
     return {"status": "ok"}
