@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from app.models.customer import Customer
 from app.models.knowledge import KnowledgeDocument
+from app.models.notification import Notification
 from app.models.order_integration import OrderIntegration
 from app.models.sales_lead import SalesLead
 from app.models.tenant import Tenant
@@ -85,6 +86,22 @@ def test_body_is_what_the_website_posts():
     assert body["item"][0]["requests"] is None  # no request: as before
     noted = kitchen.build_body({**order, "requests": "hold the chillies"}, [(MENU[0], 2), (MENU[6], 1)], AREAS[1], None)
     assert [i["requests"] for i in noted["item"]] == ["hold the chillies"] * 2  # the site's per-item box, every line
+
+
+def test_an_unlisted_place_is_sent_with_a_note_for_staff():
+    integ = OrderIntegration(catalog=MENU, locations=AREAS)
+    assert kitchen.unlisted("Lakeside, gate 2", AREAS)
+    assert not kitchen.unlisted("bagale tole", AREAS) and not kitchen.unlisted("pick up", AREAS)
+    assert not kitchen.unlisted("Lakeside", [])  # no delivery areas known: nothing to compare against
+    with pytest.raises(ValueError):
+        kitchen.resolve(integ, [("m1", 1)], "Lakeside")  # staff sending by hand still pick from the list
+    _, loc = kitchen.resolve(integ, [("m1", 1)], "Lakeside", allow_unlisted=True)
+    order = {"name": "Sita", "phone": "9801234567", "address": "Lakeside", "items": "1 Buff Jhol Momo", "requests": "piro kam"}
+    body = kitchen.build_body(order, [(MENU[0], 1)], loc, None)
+    assert (body["deliveryOption"], body["data"]["deliveryLocation"], body["deliveryCharge"], body["totalAmount"]) == (
+        "Lakeside", "Lakeside", 0, 250)
+    assert body["item"][0]["requests"] == (
+        "DELIVERY AREA NOT IN OUR LIST (Lakeside): call the customer to confirm the place and delivery charge. piro kam")
 
 
 def test_only_listed_hosts():
@@ -162,6 +179,15 @@ def test_sync_then_auto_send(monkeypatch):
             assert plan.lines[0].product_id is None and plan.body is None and plan.sent is None
             await api.send_order(lead.id, SendIn(lines=[Line(product_id="m3", quantity=1)], location="alumaila chowk"), t, db)
             assert len(posted) == 2 and posted[1]["item"][0]["name"] == "Chicken Steam Momo"
+
+            # a place not in the delivery areas no longer holds the order: sent with charge 0 and a note, staff told to call
+            lead.meta = {"order": {**order, "address": "Lakeside, gate 2"}}
+            assert await kitchen.auto_send(db, lead) == "sent"
+            assert len(posted) == 3
+            assert (posted[2]["deliveryOption"], posted[2]["deliveryCharge"], posted[2]["totalAmount"]) == ("Lakeside, gate 2", 0, 500)
+            assert posted[2]["item"][0]["requests"].startswith("DELIVERY AREA NOT IN OUR LIST (Lakeside, gate 2)")
+            notes = (await db.execute(select(Notification).where(Notification.entity_id == lead.id))).scalars().all()
+            assert any("not in our list" in (n.subject or "") for n in notes)
             await db.rollback()
 
     asyncio.run(go())

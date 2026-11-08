@@ -14,7 +14,8 @@ env/
 .DS_Store
 *.swp
 postgres_data/
-
+out
+*.tar.gz
 # codegraph index (local, rebuildable)
 .codegraph/
 

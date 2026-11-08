@@ -82,7 +82,10 @@ def menu_text(integ: OrderIntegration) -> str:
         "The full menu, from our website (updated automatically). Use these exact item names when taking an order.\n"
         + "\n".join(f"{cat}: " + "; ".join(lines) for cat, lines in by_cat.items())
         + (f"\nDelivery areas and delivery charge: {areas}. Pick up from the cafe is free. When taking a delivery "
-           "order, ask which of these areas they are in and write that area in the address." if areas else "")
+           "order, ask which of these areas they are in and write that area in the address. If their place is not "
+           "one of these areas, never say we don't deliver there: say it is not in our listed delivery areas, so we "
+           "don't know its delivery charge yet, and that our staff will call them shortly about the place and the "
+           "delivery. Then carry on taking the order, with the place they gave as the address." if areas else "")
     )
 
 
@@ -158,6 +161,11 @@ def match_location(address: str, locations: list[dict]) -> dict | None:
     return best[1]
 
 
+def unlisted(address: str, locations: list[dict]) -> bool:
+    """A delivery to a place not in the business's delivery areas: still taken, staff call about the place and charge."""
+    return bool(locations) and match_location(address, locations) is None
+
+
 def area_hint(text: str, locations: list[dict]) -> str:
     """A note for the model naming the delivery area the customer's message spells out ("srijana chowk" ->
     sirjana chowk). Alone, the model misses a near spelling among 60-odd areas, then keeps refusing it: a mild
@@ -189,12 +197,16 @@ def build_body(order: dict, lines: list[tuple[dict, int]], location: dict, email
     charge = 0 if pickup else int(location["rate"])
     phone = re.sub(r"\D", "", order["phone"])
     phone = phone[3:] if phone.startswith("977") and len(phone) == 13 else phone  # the site takes 98XXXXXXXX
+    requests = order.get("requests")
+    if location.get("unlisted"):  # charge 0 and the customer's own place: staff confirm both on the call
+        note = f"DELIVERY AREA NOT IN OUR LIST ({location['address']}): call the customer to confirm the place and delivery charge."
+        requests = f"{note} {requests}" if requests else note
     return {
         "data": {"fullName": order["name"], "address": order["address"], "phone": phone, "email": email or "",
                  "deliveryLocation": "Pick-up" if pickup else location["address"]},
         # the site has no note for the whole order, only one per item (its "special requests" box): on every line,
         # so whoever makes each item sees it
-        "item": [{**p, "quantity": q, "selectedSize": None, "selectedColor": None, "requests": order.get("requests")}
+        "item": [{**p, "quantity": q, "selectedSize": None, "selectedColor": None, "requests": requests}
                  for p, q in lines],
         "product": [p["_id"] for p, _ in lines],
         "deliveryOption": PICKUP if pickup else location["address"],
@@ -203,8 +215,11 @@ def build_body(order: dict, lines: list[tuple[dict, int]], location: dict, email
     }
 
 
-def resolve(integ: OrderIntegration, picks: list[tuple[str, int]], location: str) -> tuple[list[tuple[dict, int]], dict]:
-    """Menu items and area for ids / an area name chosen by staff (or by plan). ValueError if one is not on the menu."""
+def resolve(
+    integ: OrderIntegration, picks: list[tuple[str, int]], location: str, allow_unlisted: bool = False
+) -> tuple[list[tuple[dict, int]], dict]:
+    """Menu items and area for ids / an area name chosen by staff (or by plan). ValueError if one is not on the menu.
+    allow_unlisted: a place not in the delivery areas is kept as the customer wrote it, charge 0 (staff call)."""
     by_id = {p["_id"]: p for p in integ.catalog}
     if not picks or any(pid not in by_id or not 0 < q < 100 for pid, q in picks):
         raise ValueError("Pick an item from the menu, with a quantity, for every line.")
@@ -212,6 +227,8 @@ def resolve(integ: OrderIntegration, picks: list[tuple[str, int]], location: str
         loc = {"address": PICKUP, "rate": 0}
     else:
         loc = next((a for a in integ.locations if a["address"] == location), None)
+        if loc is None and allow_unlisted and location.strip():
+            loc = {"address": location.strip()[:200], "rate": 0, "unlisted": True}
         if loc is None:
             raise ValueError("Pick the delivery area from the list.")
     return [(by_id[pid], q) for pid, q in picks], loc
@@ -265,8 +282,8 @@ async def auto_send(db: AsyncSession, lead: SalesLead) -> str:
     await fresh(db, integ)
     p = plan(order, integ)
     unmatched = [line["text"] for line in p["lines"] if line["product_id"] is None]
-    if p["location"] is None or unmatched:
-        why = ", ".join([*(f'"{t}" not on the menu' for t in unmatched), *(["delivery area not found"] if p["location"] is None else [])])
+    if unmatched:  # an unlisted delivery place does not hold the order: it is sent, and staff call (below)
+        why = ", ".join(f'"{t}" not on the menu' for t in unmatched)
         log.info("kitchen auto-send skipped for lead %s: needs staff (%s)", lead.id, why)
         await create_notification(
             db, event="kitchen_needs_staff", tenant_id=lead.tenant_id, source_table="sales_leads", entity_id=lead.id,
@@ -275,8 +292,16 @@ async def auto_send(db: AsyncSession, lead: SalesLead) -> str:
         )
         return "needs_staff"
     try:
-        lines, loc = resolve(integ, [(line["product_id"], line["quantity"]) for line in p["lines"]], p["location"])
+        picks = [(line["product_id"], line["quantity"]) for line in p["lines"]]
+        lines, loc = resolve(integ, picks, p["location"] or order["address"], allow_unlisted=True)
         await send(db, integ, lead, build_body(order, lines, loc, integ.email))
+        if loc.get("unlisted"):
+            await create_notification(
+                db, event="kitchen_needs_staff", tenant_id=lead.tenant_id, source_table="sales_leads", entity_id=lead.id,
+                subject=f"Call {order['name']}: delivery place not in our list",
+                message=f"The order was sent with delivery charge Rs 0 to \"{loc['address']}\". Call {order['phone']} "
+                "to confirm the place and the delivery charge.", payload={"lead_id": str(lead.id)},
+            )
         return "sent"
     except (httpx.HTTPError, ValueError) as exc:
         detail = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else str(exc)[:300]

@@ -71,6 +71,80 @@ Setup: `bash loadtest/run_linux.sh` on one Linux box that also ran k6, the app, 
 - Not re-run with the queue: 200 msgs/s. The in-process run earlier the same day lost about half the messages (14% of webhook calls failed) at that rate, so the ingest ceiling is a separate question from reply speed.
 - Everything here is against mocks on one machine. Real Groq latency, its rate limits and real Meta responses are untested.
 
+## Update 2026-11-05: server baseline, no queue
+
+The "before" numbers for the reply queue: the current app on the real server, with replies still running inside the API processes.
+
+Setup:
+
+- Server `vmi3189379`: 4 cores, 7.9 GB RAM. k6, the app, Postgres and the mock all ran on it, beside the live stack, so they competed for the same CPU.
+- `WORKERS=4 bash loadtest/run_linux.sh 10 20 30 40 50`, 05:28 to 05:50 UTC. Commit `0b8dffd`, the branch head at that time (the run did not record it). The queue merged at 06:26 UTC, after this run.
+- 4 uvicorn processes, each with a 15 + 5 DB pool (80 connections) and 20 LLM slots. Replies were FastAPI background tasks.
+- Mock LLM 2s and Graph 0.3s, no Groq rate limit. 20 tenants, 60% of traffic to one shop, Instagram only, default funnel, so the hours check, order saving and kitchen send did not run.
+- `webhook_burst.js` and `run_linux.sh` were corrected by hand for this run: the broken default URL, the orphaned `top`, and the pool-timeout search. Each peak ran 3.5 minutes plus a 40s drain.
+
+| Peak msgs/s | Sent / stored | AI replies | Ack p95 / p99 | Reply p50 / p95 / max | Pool timeouts | Dropped by k6 |
+|---|---|---|---|---|---|---|
+| 10 | 1978 / 1978 | 1978 | 917ms / 2.23s | 2.9s / 5.2s / 8.5s | 0 | 0 |
+| 20 | 3907 / 3906 | 3906 | 1.49s / 2.48s | 3.1s / 6.4s / 11.9s | 0 | 0 |
+| 30 | 5863 / 5824 | 5824 | 2.71s / 5.03s | 8.7s / 14.5s / 26.1s | 0 | 0 |
+| 40 | 7114 / 6692 | 5880 | 30.16s / 30.46s | 21.1s / 52.8s / 82.2s | 1879 | 565 |
+| 50 | 8960 / 8226 | 6861 | 30.21s / 30.44s | 24.8s / 58.7s / 89.8s | 3161 | 611 |
+
+The ack target (p95 < 500 ms, p99 < 1.5 s) failed at every peak. Replies at 40 and 50 are a lower bound: the slowest replies took 82 to 90s and the script verified after 40s.
+
+**Where the messages went:**
+
+| Peak | Lost | k6 saw a failure | Silent (200 sent, not stored) |
+|---|---|---|---|
+| 10 | 0 | 0 | 0 |
+| 20 | 1 | 1 | 0 |
+| 30 | 39 | 39 | 0 |
+| 40 | 422 (5.9%) | 7 | 415 |
+| 50 | 734 (8.2%) | 2 | 732 |
+
+- Up to 30 msgs/s every loss was visible: `connection reset by peer` or `EOF`, no 200, so Meta would redeliver. No pool timeouts were logged. The cause is not established; a reused keep-alive connection is one candidate (uvicorn closes idle ones after 5s).
+- From 40 msgs/s the DB pool wait reaches its 30s timeout and the handler catches the error, rolls back and still answers 200 (`app/api/v1/webhooks.py`), so Meta never redelivers. Ack p95 sits on 30s at the same peaks. This is the vanishing-message bug.
+
+**CPU and database** (sustained part of each run, seconds 61 to 180):
+
+| Peak | Server CPU idle | Seconds at zero idle | App CPU total | Busiest app process |
+|---|---|---|---|---|
+| 10 | 29% | 0 of 120 | 127% | 69% |
+| 20 | 13% | 3 of 120 | 176% | 76% |
+| 30 | 4% | 11 of 120 | 212% | 75% |
+| 40 | 4% | 23 of 120 | 210% | 78% |
+| 50 | 3% | 27 of 120 | 219% | 80% |
+
+- The server runs out of CPU at about 30 msgs/s. App CPU stops growing there and no process reaches 90%, so the limit is the whole machine, not one event loop. About half of the 400% went to k6, the mock, Postgres and whatever else ran on the box, so the app's own ceiling is probably higher; this run cannot say by how much.
+- Replies level off with it: 5824 at peak 30 against 5880 at peak 40.
+- Postgres and the disk were not the limit: about 2 active connections on average, I/O wait about 1%, and memory peaked at 5.5 GB of 7.9 GB.
+- No connection was held across a slow call: the longest idle transaction was 0.89s. Connections stayed busy because webhooks and reply tasks queued for the same pool on a CPU-starved machine, so a bigger pool would not help.
+- `BEGIN` and `;`, the two statements `pool_pre_ping` adds to every checkout, were about 40% of the idle-in-transaction samples in the top 12 at peak 40. That is where the app was waiting, not proof of what the ping costs.
+
+**Against the 7 October run** (same server, 4 workers, 5 + 10 pool per process, older code):
+
+| Peak | Ack p95, Oct -> Nov | Ack p99, Oct -> Nov | Reply p95, Oct -> Nov | Lost, Oct -> Nov | Most connections, Oct -> Nov |
+|---|---|---|---|---|---|
+| 10 | 130ms -> 917ms | 366ms -> 2.23s | 3.7s -> 5.2s | 0 -> 0 | 24 -> 79 |
+| 20 | 364ms -> 1.49s | 883ms -> 2.48s | 4.3s -> 6.4s | 0 -> 1 | 58 -> 80 |
+| 30 | 2.03s -> 2.71s | 4.7s -> 5.03s | 11.6s -> 14.5s | 111 -> 39 | 61 -> 81 |
+
+Ack and reply times got worse while losses at 30 fell. The cause is not established. The pool, the reply path and whatever else was running on the server all changed between the runs.
+
+**With the bot off** (same morning, k6 against the live app with `LT_AI=0`, so no reply work; other setup differs, so this is a rough guide):
+
+| Peak | Ack p95 / p99 | Requests failed |
+|---|---|---|
+| 10 | 112ms / 301ms | 0 of 2060 |
+| 20 | 255ms / 613ms | 1 of 4085 |
+
+At 10 msgs/s all 1979 messages were stored. The stored count at 20 was not captured. Compared with the table above, ack was about 6 to 8 times slower with replies running in the same processes, which is the work the queue moves out.
+
+Not measured: real Groq latency and rate limits, real Meta traffic (echoes, delivery statuses), Messenger and WhatsApp, and the bot-off run at 30 to 50 msgs/s, which `aio_pika` being missing from the server's `.venv` stopped.
+
+To compare the queue with this baseline: `DRAIN=900 WORKERS=4 LT_QUEUE=1 bash loadtest/run_linux.sh 10 20 30 40 50`. It should show zero silent losses at 40 and 50, ack p95 under 500 ms, and zero chats with no AI reply once the queues are empty.
+
 ## Re-run
 
 ```

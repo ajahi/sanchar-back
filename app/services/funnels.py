@@ -77,14 +77,19 @@ async def closed_message(db: AsyncSession, tenant: Tenant, funnel: Funnel, knowl
 CONFIRM = "Yo order thik cha? Kei special request bhaye (jastai piro kam, chado chahiyo) pani bhannus."
 THANKS = "Dhanyabad! Tapai ko order paayau. Order confirm garna hamro team le chadai call garnecha."
 THANKS_OTHER = "Dhanyabad! Hamro team le chadai samparka garnecha."
+# A delivery place not in the website's delivery areas: the order is still taken and sent, staff call about it.
+UNLISTED_AREA = ("Yo thau hamro delivery area ko list ma chhaina, tesaile yesko delivery charge ahile thaha chhaina. "
+                 "Order confirm garepachi hamro staff le thau ra delivery charge bare chadai call garnecha.")
+UNLISTED_THANKS = "Tapai ko thau hamro delivery list ma chhaina, tara hamro staff le thau ko detail ko lagi chadai call garnecha."
 
 
 def order_summary(draft: dict, integ: OrderIntegration | None) -> str:
     """The order summary the customer confirms, always in one layout (the model only writes the label). With the
     business's website menu: each line priced from it, the delivery charge and the total, the way the website will
-    charge it; a line or area that doesn't match is shown and asked about, never dropped, and then no total."""
+    charge it; a line that doesn't match is shown and asked about, never dropped, and then no total. A place not in
+    the delivery areas is taken as written: the total is the food only, and staff call about the place and charge."""
     pickup = bool(re.search(r"\bpick ?up\b", draft["address"], re.IGNORECASE))
-    out, problems = ["Tapai ko order:"], []
+    out, problems, unlisted = ["Tapai ko order:"], [], False
     if integ is None:
         out += [t.strip() for t in re.split(r"[,;\n]", draft["items"]) if t.strip()]
         out.append("Pick up" if pickup else "Delivery")
@@ -102,18 +107,19 @@ def order_summary(draft: dict, integ: OrderIntegration | None) -> str:
             loc = next(a for a in integ.locations if a["address"] == p["location"])
             out.append(f"Delivery: {loc['address'].title()} (Rs {loc['rate']})")
         else:
-            areas = ", ".join(f"{a['address'].title()} (Rs {a['rate']})" for a in integ.locations)
-            out.append("Delivery: area thaha bhayena")
-            problems.append(f"Delivery kun area ma garne? {areas}")
+            unlisted = True
+            out.append("Delivery: delivery charge staff le call garera bhannuhunecha")
         if not problems:
-            lines, loc = kitchen.resolve(integ, [(x["product_id"], x["quantity"]) for x in p["lines"]], p["location"])
-            out.append(f"Total: Rs {kitchen.build_body(draft, lines, loc, None)['totalAmount']}")
+            picks = [(x["product_id"], x["quantity"]) for x in p["lines"]]
+            lines, loc = kitchen.resolve(integ, picks, p["location"] or draft["address"], allow_unlisted=True)
+            total = kitchen.build_body(draft, lines, loc, None)["totalAmount"]
+            out.append(f"Total: Rs {total} + delivery charge" if unlisted else f"Total: Rs {total}")
     out += ["", *(f"{label}: {draft[k]}" for k, label in (("name", "Naam"), ("phone", "Phone")) if draft.get(k))]
     if not pickup:
         out.append(f"Address: {draft['address']}")
     if draft.get("requests"):
         out.append(f"Special request: {draft['requests']}")
-    return "\n".join([*out, "", *(problems or [CONFIRM])])
+    return "\n".join([*out, "", *(problems or ([UNLISTED_AREA, CONFIRM] if unlisted else [CONFIRM]))])
 
 
 def plain_summary(funnel: Funnel, draft: dict) -> str:
@@ -147,6 +153,10 @@ async def finish_reply(
         text = THANKS if funnel.label == "order" else THANKS_OTHER
         if collected.get("requests"):
             text += " Tapai ko special request pani team lai pathayau."
+        if funnel.label == "order" and collected.get("address") and "website_post" in funnel.triggers:
+            integ = await db.get(OrderIntegration, tenant_id)
+            if integ is not None and kitchen.unlisted(collected["address"], integ.locations or []):
+                text += " " + UNLISTED_THANKS
     return text, collected
 
 

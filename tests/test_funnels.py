@@ -211,6 +211,8 @@ def test_summary_layout_without_menu_and_with_an_unknown_area():
         "Tapai ko order:\n2 x Momo\n1 x Coke\nDelivery\n\nNaam: Sita\nPhone: 9801234567\nAddress: Lakeside, gate 2\n"
         "Special request: piro kam\n\n" + funnels.CONFIRM)
     menu = OrderIntegration(catalog=MENU, locations=AREAS)
-    got = funnels.order_summary({**draft, "items": "2 x Buff Jhol Momo"}, menu)  # Lakeside is not a delivery area
-    assert "Delivery: area thaha bhayena" in got and "Total" not in got
-    assert got.endswith("Delivery kun area ma garne? Alumaila Chowk (Rs 80)")
+    # Lakeside is not a delivery area: taken anyway, food total only, staff call about the place and the charge
+    assert funnels.order_summary({**draft, "items": "2 x Buff Jhol Momo"}, menu) == (
+        "Tapai ko order:\n2 x Buff Jhol Momo - Rs 250\nDelivery: delivery charge staff le call garera bhannuhunecha\n"
+        "Total: Rs 500 + delivery charge\n\nNaam: Sita\nPhone: 9801234567\nAddress: Lakeside, gate 2\n"
+        "Special request: piro kam\n\n" + funnels.UNLISTED_AREA + "\n" + funnels.CONFIRM)

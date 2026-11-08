@@ -94,7 +94,10 @@ volumes:
   postgres_data:
   rabbitmq_data:
 
-# Named so the frontend compose (next-app) can join it as `external`.
+# Shared with the frontend compose (next-app), which also joins it as `external`. Without this line compose
+# makes its own "<folder>_nepsocial" network and the frontend can no longer resolve nepsocial-api.
+# A fresh server needs it once: docker network create nepsocial
 networks:
   nepsocial:
-  
+    external: true
+
