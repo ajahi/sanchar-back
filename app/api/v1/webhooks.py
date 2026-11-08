@@ -54,6 +54,7 @@ from app.services.meta import CHANNELS, instagram
 from app.services.campaigns import apply_referral, referral_of
 from app.services.leads import capture_lead
 from app.services.notifications import create_notification
+from app.services import reply_queue
 from app.services.reply_pipeline import dispatch_reply
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
