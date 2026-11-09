@@ -4,6 +4,9 @@ Consumes `replies`, runs process_reply_job per message and acks it. A failed job
 count to `replies.retry`, or to `replies.dead` after MAX_TRIES. A crash before the ack makes the broker
 redeliver, and process_reply_job drops a job that was already answered.
 
+It also consumes `webhooks` (raw bodies the API acked unstored: process_webhook_job ingests them, with the same
+retry and dead queues) on its own channel.
+
 It also consumes `tasks` (profile lookups, history sync, inbox backfill: reply_queue.run_later) on its own channel,
 TASK_CONCURRENCY at a time, so a long history sync never takes a reply slot. A task that raises goes to tasks.dead.
 """
@@ -21,7 +24,7 @@ from app.db.session import engine
 from app.services import http_client, reply_queue
 from app.services.reply_pipeline import process_reply_job
 from app.api.v1.social_accounts import _after_login, _backfill
-from app.api.v1.webhooks import fill_customer_profile, run_history_sync
+from app.api.v1.webhooks import fill_customer_profile, process_webhook_job, run_history_sync
 
 log = logging.getLogger("app.worker")
 
@@ -29,6 +32,34 @@ TASK_FNS = {f.__name__: f for f in (fill_customer_profile, run_history_sync, _ba
 # shortcut: fixed; a history sync pages Graph for up to a minute, so 5 at once is plenty. Make it a setting if
 # the tasks queue backs up.
 TASK_CONCURRENCY = 5
+# shortcut: fixed; each ingest holds one pooled DB connection for a few ms, so this stays well under the pool.
+WEBHOOK_CONCURRENCY = 8
+
+
+class _Spawn:
+    """Stands in for FastAPI's BackgroundTasks: the follow-ups of an ingest run as tasks in this process."""
+
+    def __init__(self) -> None:
+        self.tasks: set[asyncio.Task] = set()
+
+    def add_task(self, fn, *args, **kw) -> None:
+        task = asyncio.create_task(fn(*args, **kw))
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+
+_spawn = _Spawn()
+
+
+async def handle_webhook(channel: aio_pika.abc.AbstractChannel, msg: aio_pika.abc.AbstractIncomingMessage) -> None:
+    tries = int(msg.headers.get("attempts", 0)) + 1
+    try:
+        await process_webhook_job(msg.body, _spawn)
+    except Exception:  # noqa: BLE001
+        log_failure(log, "webhook job failed (try %s of %s)", tries, reply_queue.MAX_TRIES)
+        target = reply_queue.WEBHOOKS_RETRY if tries < reply_queue.MAX_TRIES else reply_queue.WEBHOOKS_DEAD
+        await channel.default_exchange.publish(reply_queue.webhook_job(msg.body, tries), routing_key=target)
+    await msg.ack()  # after the republish: a crash in between means a duplicate job (deduped), never a lost one
 
 
 async def handle(channel: aio_pika.abc.AbstractChannel, msg: aio_pika.abc.AbstractIncomingMessage) -> None:
@@ -68,6 +99,8 @@ async def main() -> None:
     await reply_queue.declare(channel)
     task_channel = await conn.channel()  # its own prefetch: tasks never take a reply slot
     await task_channel.set_qos(prefetch_count=TASK_CONCURRENCY)
+    webhook_channel = await conn.channel()  # its own prefetch too: ingest never waits behind a reply
+    await webhook_channel.set_qos(prefetch_count=WEBHOOK_CONCURRENCY)
     tasks: set[asyncio.Task] = set()
 
     def consumer(handler, ch):
@@ -79,6 +112,7 @@ async def main() -> None:
 
     await (await channel.get_queue(reply_queue.QUEUE)).consume(consumer(handle, channel))
     await (await task_channel.get_queue(reply_queue.TASKS)).consume(consumer(handle_task, task_channel))
+    await (await webhook_channel.get_queue(reply_queue.WEBHOOKS)).consume(consumer(handle_webhook, webhook_channel))
     log.info("reply worker up, concurrency %s", settings.reply_concurrency)
     try:
         await asyncio.Future()

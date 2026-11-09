@@ -4,6 +4,9 @@ Queues (all durable, default exchange): `replies` is the work; a failed job goes
 holds it reply_retry_seconds and dead-letters it back to `replies`; after MAX_TRIES it lands in `replies.dead`
 for a person to look at. The message id is the whole payload: the worker reloads everything from the DB.
 
+`webhooks` holds raw webhook bodies that the API verified and acked without storing (the worker runs the ingest);
+it has the same retry and dead queues. Ingest is idempotent (message ids dedupe), so a retry is safe.
+
 `tasks` holds the other background jobs (profile lookups, history sync, inbox backfill): {"task": name, ...ids}.
 They are best-effort and log their own failures, so there is no retry; one that raises goes to `tasks.dead`.
 Ids only, never a token: each task reads and decrypts its account's token itself.
@@ -20,6 +23,8 @@ log = logging.getLogger(__name__)
 
 QUEUE, RETRY, DEAD = "replies", "replies.retry", "replies.dead"
 TASKS, TASKS_DEAD = "tasks", "tasks.dead"
+WEBHOOKS, WEBHOOKS_RETRY, WEBHOOKS_DEAD = "webhooks", "webhooks.retry", "webhooks.dead"
+_WEBHOOK_TIMEOUT = 5  # the API waits this long for the broker before it ingests inline; Meta is waiting on the 200
 MAX_TRIES = 3
 _BACKOFF = 10  # seconds to leave a broker alone after a failed connect, so webhooks don't each wait on it
 # Publishes share one channel lock, so a saturated event loop queues them for minutes with a healthy broker. A
@@ -34,17 +39,18 @@ _down_until = 0.0
 
 async def declare(channel: aio_pika.abc.AbstractChannel) -> None:
     """Idempotent; publisher and worker both call it, so start order does not matter."""
-    for name in (QUEUE, DEAD, TASKS, TASKS_DEAD):
+    for name in (QUEUE, DEAD, TASKS, TASKS_DEAD, WEBHOOKS, WEBHOOKS_DEAD):
         await channel.declare_queue(name, durable=True)
-    await channel.declare_queue(
-        RETRY,
-        durable=True,
-        arguments={
-            "x-message-ttl": settings.reply_retry_seconds * 1000,
-            "x-dead-letter-exchange": "",
-            "x-dead-letter-routing-key": QUEUE,
-        },
-    )
+    for retry, back in ((RETRY, QUEUE), (WEBHOOKS_RETRY, WEBHOOKS)):
+        await channel.declare_queue(
+            retry,
+            durable=True,
+            arguments={
+                "x-message-ttl": settings.reply_retry_seconds * 1000,
+                "x-dead-letter-exchange": "",
+                "x-dead-letter-routing-key": back,
+            },
+        )
 
 
 def job(message_id, attempts: int = 0) -> aio_pika.Message:
@@ -71,12 +77,12 @@ async def _ensure() -> aio_pika.abc.AbstractChannel | None:
     return _channel
 
 
-async def _publish(message: aio_pika.Message, queue: str) -> bool:
+async def _publish(message: aio_pika.Message, queue: str, timeout: float = _PUBLISH_TIMEOUT) -> bool:
     channel = await _ensure()
     if channel is None:
         return False
     try:
-        await channel.default_exchange.publish(message, routing_key=queue, timeout=_PUBLISH_TIMEOUT)
+        await channel.default_exchange.publish(message, routing_key=queue, timeout=timeout)
     except Exception:  # noqa: BLE001
         log.exception("publishing to %s failed: %s", queue, message.body[:200])
         return False
@@ -86,6 +92,15 @@ async def _publish(message: aio_pika.Message, queue: str) -> bool:
 async def publish(message_id) -> bool:
     """True once the broker has confirmed the job; False = nobody has it, run the reply in-process."""
     return await _publish(job(message_id), QUEUE)
+
+
+def webhook_job(raw: bytes, attempts: int = 0) -> aio_pika.Message:
+    return aio_pika.Message(raw, delivery_mode=aio_pika.DeliveryMode.PERSISTENT, headers={"attempts": attempts})
+
+
+async def publish_webhook(raw: bytes) -> bool:
+    """True once the broker has confirmed the body: only then may the API answer 200 without storing it."""
+    return await _publish(webhook_job(raw), WEBHOOKS, _WEBHOOK_TIMEOUT)
 
 
 def task_message(fn, **ids) -> aio_pika.Message:

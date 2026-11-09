@@ -105,7 +105,7 @@ cpu_sampler() {  # $1 = output dir; instantaneous %CPU of the app processes, onc
 
 queue_depth() {  # jobs waiting or in progress; -1 = could not ask, so a failed call never reads as empty
   docker exec $RMQ rabbitmqctl -q list_queues name messages --no-table-headers 2>/dev/null |
-    awk '$1=="replies" || $1=="replies.retry" || $1=="tasks" { s+=$2 } END { print NR ? s+0 : -1 }'
+    awk '$1=="replies" || $1=="replies.retry" || $1=="tasks" || $1=="webhooks" || $1=="webhooks.retry" { s+=$2 } END { print NR ? s+0 : -1 }'
 }
 
 queue_sampler() {  # $1 = output dir; every 10s, a rabbitmqctl call costs about a second of CPU
@@ -143,7 +143,7 @@ for P in $PEAKS; do
   psqlx -c "truncate messages, conversations, customers, notifications, handover_events cascade" >/dev/null 2>&1  # clean slate: counts are per step
   $PY -m loadtest.seed_tenants 20 >/dev/null 2>&1
   curl -s -X POST localhost:$MOCK_PORT/reset >/dev/null; : > loadtest/app.log; : > loadtest/worker.log
-  [ "$OWN_RMQ" = 1 ] && for q in replies replies.retry replies.dead tasks tasks.dead; do
+  [ "$OWN_RMQ" = 1 ] && for q in replies replies.retry replies.dead tasks tasks.dead webhooks webhooks.retry webhooks.dead; do
     docker exec $RMQ rabbitmqctl -q purge_queue $q >/dev/null 2>&1   # counts are per step
   done
   [ "$SAMPLER" = 1 ] && { sampler "$OUT" & SAMPLER_PID=$!; }

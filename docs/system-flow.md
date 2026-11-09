@@ -52,6 +52,7 @@ flowchart TD
 
     WH --> SigCheck --> RefExtract --> LeadExtract --> Dedup --> PG
     WH --> Ack --> Channels
+    WH -.->|raw body, with a broker: worker ingests| Q
     WH -->|publish message id| Q
     WH -.->|no broker / broker down: in-process task| Worker
     Q --> Worker --> Guard
@@ -164,10 +165,9 @@ sequenceDiagram
     WH->>DB: COMMIT transaction
     WH-->>Meta: 200 OK {"status": "ok"} (Delivered in < 100ms)
 
-    par Async Background Jobs
-        WH->>BG: fill_customer_profile (Fetch Graph API display name)
-        WH->>Q: publish reply job = message id (in-process task if no broker)
-    end
+    Note over WH,BG: After the ack, background tasks run in order: replies first, then profile lookups
+    WH->>Q: dispatch_reply: publish reply job = message id (in-process if no broker)
+    WH->>BG: fill_customer_profile (Fetch Graph API display name)
 ```
 
 ### The Ingestion Pipeline Steps:
@@ -301,7 +301,10 @@ flowchart LR
 ```
 
 * **Delivery**: queues are durable, messages persistent, publishes wait for the broker's confirm, and the worker acks only after a failed job has been republished. A crash mid-job redelivers it. This is at-least-once: a crash between sending the DM and storing the reply can still send one duplicate.
-* **Fallback**: with `RABBITMQ_URL` unset, or the broker unreachable (retried at most every 10s so webhooks do not each wait on it), the webhook runs the job in-process as before. That path loses in-flight replies on a restart.
+* **Fallback**: with `RABBITMQ_URL` unset, or the broker unreachable (retried at most every 10s so webhooks do not each wait on it), `dispatch_reply` runs the job in-process as before. That path loses in-flight replies on a restart.
+* **Publish after the ack**: the publish is a background task, so a busy broker channel never holds the `200`. Replies are queued before profile lookups, which can wait on Graph. Publishes share one channel lock, so under overload they can queue for a long time with a healthy broker; the publish timeout therefore follows `REPLY_MAX_AGE_MINUTES` (a reply is not worth sending after that) instead of a few seconds. A short timeout read overload as "broker down" and ran every reply in-process, which starved the DB pool (load test, 200 msgs/s on one API process). A dead connection still fails at once and takes the fallback.
+* **Ingest queue (load shedding)**: with a broker, the webhook only verifies the signature, publishes the raw body to the `webhooks` queue and answers `200` once the broker has confirmed it (within 5s, else it ingests inline). The worker runs the ingest (`process_webhook_job`, `WEBHOOK_CONCURRENCY` = 8 at a time on its own channel), then queues the reply and profile jobs. A failed ingest goes to `webhooks.retry` (waits `REPLY_RETRY_SECONDS`) and after 3 tries to `webhooks.dead`. Ingest dedupes on the message id, so a retry or redelivery is safe. The API never waits on the DB pool, so a pool timeout can no longer lose an event, and Meta always gets its `200`.
+* **Without a broker, or if it is down**: the webhook ingests inline. Any error there is logged and answered `200` (sustained non-200 answers can get the subscription disabled by Meta), so an event that fails to store is lost. Watch the `webhook ingest failed` log line.
 * **Jobs that are dropped, not sent**: older than `REPLY_MAX_AGE_MINUTES` (10), already followed by an AI or agent message in the chat (redelivery), or followed by a newer customer message (that message's job answers, with this one in its history). A late or doubled DM is worse than none.
 * **Retries**: an LLM failure raises, so the job goes to `replies.retry` and returns after `REPLY_RETRY_SECONDS`; after 3 tries it lands in `replies.dead`. A failed Meta send is not retried, because it may already have gone out.
 * **Scaling order**: raise `REPLY_CONCURRENCY` first. A call waiting on the LLM costs no CPU, and it also sets the HTTP connection limit (`max(100, REPLY_CONCURRENCY + 50)`, which would otherwise cap calls in flight at 100). One process measured about 14 ms of CPU per reply (about 70 replies/s). Add worker processes (`docker compose up -d --scale worker=N`) only when a worker's CPU saturates, and keep `N x (pool_size + max_overflow)` under Postgres `max_connections`.

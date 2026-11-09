@@ -53,7 +53,8 @@ async def queue_depths() -> str | None:
     try:
         async with await aio_pika.connect_robust(settings.rabbitmq_url, timeout=3) as conn:
             channel = await conn.channel()
-            names = (reply_queue.QUEUE, reply_queue.RETRY, reply_queue.DEAD, reply_queue.TASKS, reply_queue.TASKS_DEAD)
+            names = (reply_queue.QUEUE, reply_queue.RETRY, reply_queue.DEAD, reply_queue.TASKS, reply_queue.TASKS_DEAD,
+                     reply_queue.WEBHOOKS, reply_queue.WEBHOOKS_RETRY, reply_queue.WEBHOOKS_DEAD)
             depths = [(await channel.declare_queue(n, passive=True)).declaration_result.message_count for n in names]
         return "  ".join(f"{n}={d}" for n, d in zip(names, depths))
     except Exception as exc:  # noqa: BLE001 — a diagnostic line, never fail the run over it

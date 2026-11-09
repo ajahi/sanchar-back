@@ -38,7 +38,6 @@ from fastapi.responses import PlainTextResponse
 from pydantic_core import from_json
 from sqlalchemy import case, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import TimeoutError as PoolTimeout
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -721,57 +720,77 @@ async def receive(
     obj = payload.get("object")
     if obj not in ("instagram", "page", "whatsapp_business_account"):
         return {"status": "ignored"}
-    to_reply: dict = {}  # conversation_id -> its newest new message (one reply per chat per batch)
-    profile_jobs: list = []  # Graph name lookups, run after the ack so no DB connection waits on Graph
-    try:
-        for entry in payload.get("entry", []):
-            if obj in ("instagram", "page"):
-                platform = (
-                    "instagram" if obj == "instagram" else "facebook"
-                )  # entry.id = IG id / Page id
-                if platform == "facebook":
-                    await stamp_webhook_event(db, platform, str(entry.get("id", "")))
-                for event in entry.get("messaging", []):
-                    log.info("%s event for %s: %s", platform, entry.get("id"), _event_kind(event))
-                    if job := await ingest_event(
-                        db, str(entry.get("id", "")), event, profile_jobs, platform
-                    ):
-                        to_reply[job[0]] = job[1]
-                continue
-            # WhatsApp: entry.changes[].value holds messages[] (inbound) and statuses[] (delivery
-            # reports on our sends). ponytail: statuses are only logged; store them on the
-            # message when the UI needs sent/delivered/failed.
-            for change in entry.get("changes", []):
-                value = change.get("value") or {}
-                phone_number_id = (value.get("metadata") or {}).get(
-                    "phone_number_id", ""
-                )
-                await stamp_whatsapp_event(
-                    db, phone_number_id, str(entry.get("id", ""))
-                )
-                for st in value.get("statuses", []):
-                    log.info(
-                        "whatsapp status for %s: %s %s", phone_number_id, st.get("status"),
-                        "; ".join(f"{e.get('code')} {e.get('title')}" for e in st.get("errors") or []),
-                    )
-                for msg in value.get("messages", []):
-                    log.info("whatsapp event for %s: message (%s)", phone_number_id, msg.get("type"))
-                    if job := await ingest_whatsapp_message(
-                        db, phone_number_id, value.get("contacts", []), msg
-                    ):
-                        to_reply[job[0]] = job[1]
+    # Confirmed by the broker = durable: the worker ingests it (and retries), so a busy DB pool can't lose it.
+    if await reply_queue.publish_webhook(raw):
+        return {"status": "ok"}
+    try:  # no broker, or it is down: ingest here
+        to_reply, profile_jobs = await ingest_payload(db, obj, payload)
         await db.commit()
-    except PoolTimeout:  # overload, not a bad event: a 200 would lose the message, Meta redelivers on 5xx (mid dedupes)
-        log_failure(log, "%s webhook ingest failed", obj)
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Busy") from None
     except Exception:  # noqa: BLE001 — log it, never make Meta retry forever
         log_failure(log, "%s webhook ingest failed", obj)
         await db.rollback()
         return {"status": "ok"}
+    schedule_followups(bg, to_reply, profile_jobs)
+    return {"status": "ok"}
+
+
+async def ingest_payload(db: AsyncSession, obj: str, payload: dict) -> tuple[dict, list]:
+    """Store every event in the payload (no commit). Returns (conversation_id -> its newest new message id, the
+    Graph name lookups still to run)."""
+    to_reply: dict = {}  # conversation_id -> its newest new message (one reply per chat per batch)
+    profile_jobs: list = []  # Graph name lookups, run after the ack so no DB connection waits on Graph
+    for entry in payload.get("entry", []):
+        if obj in ("instagram", "page"):
+            platform = (
+                "instagram" if obj == "instagram" else "facebook"
+            )  # entry.id = IG id / Page id
+            if platform == "facebook":
+                await stamp_webhook_event(db, platform, str(entry.get("id", "")))
+            for event in entry.get("messaging", []):
+                log.info("%s event for %s: %s", platform, entry.get("id"), _event_kind(event))
+                if job := await ingest_event(
+                    db, str(entry.get("id", "")), event, profile_jobs, platform
+                ):
+                    to_reply[job[0]] = job[1]
+            continue
+        # WhatsApp: entry.changes[].value holds messages[] (inbound) and statuses[] (delivery
+        # reports on our sends). ponytail: statuses are only logged; store them on the
+        # message when the UI needs sent/delivered/failed.
+        for change in entry.get("changes", []):
+            value = change.get("value") or {}
+            phone_number_id = (value.get("metadata") or {}).get(
+                "phone_number_id", ""
+            )
+            await stamp_whatsapp_event(
+                db, phone_number_id, str(entry.get("id", ""))
+            )
+            for st in value.get("statuses", []):
+                log.info(
+                    "whatsapp status for %s: %s %s", phone_number_id, st.get("status"),
+                    "; ".join(f"{e.get('code')} {e.get('title')}" for e in st.get("errors") or []),
+                )
+            for msg in value.get("messages", []):
+                log.info("whatsapp event for %s: message (%s)", phone_number_id, msg.get("type"))
+                if job := await ingest_whatsapp_message(
+                    db, phone_number_id, value.get("contacts", []), msg
+                ):
+                    to_reply[job[0]] = job[1]
+    return to_reply, profile_jobs
+
+
+async def process_webhook_job(raw: bytes, bg) -> None:
+    """Queue-worker entry: own session; raises on failure so the worker can retry. bg: anything with add_task."""
+    payload = from_json(raw)
+    async with async_session_factory() as db:
+        to_reply, profile_jobs = await ingest_payload(db, payload["object"], payload)
+        await db.commit()
+    schedule_followups(bg, to_reply, profile_jobs)
+
+
+def schedule_followups(bg, to_reply: dict, profile_jobs: list) -> None:
     # After the commit (the job reads the stored rows) and after the ack: a busy broker channel must not hold the
     # 200. Background tasks run in order, so replies go first: profile lookups can wait on Graph and on their slots.
     for message_id in to_reply.values():
         bg.add_task(dispatch_reply, message_id)
     for customer_id, convo_id in profile_jobs:
         bg.add_task(reply_queue.run_later, bg, fill_customer_profile, customer_id=customer_id, convo_id=convo_id)
-    return {"status": "ok"}

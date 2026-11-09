@@ -145,6 +145,47 @@ Not measured: real Groq latency and rate limits, real Meta traffic (echoes, deli
 
 To compare the queue with this baseline: `DRAIN=900 WORKERS=4 LT_QUEUE=1 bash loadtest/run_linux.sh 10 20 30 40 50`. It should show zero silent losses at 40 and 50, ack p95 under 500 ms, and zero chats with no AI reply once the queues are empty.
 
+## Update 2026-11-09: after the publish-timeout fix
+
+Commit `811ac7e` (publish after the ack, publish timeout follows `REPLY_MAX_AGE_MINUTES`, pool timeout answers 503) plus a one-line import fix in `app/api/v1/webhooks.py`. Setup: `LT_QUEUE=1 REPLY_CONCURRENCY=130 DRAIN=600 bash loadtest/run_linux.sh 50 200` on one 16-core Linux box that also ran k6, the app, Postgres, RabbitMQ and the mock (LLM 2s, Graph 0.3s, no Groq rate limit). One uvicorn process, one reply worker with 130 slots. Raw output: `loadtest/out/w1-q1/`.
+
+| Peak msgs/s | Webhook p95 / p99 | Sent / stored | Failed requests (503) | AI replies | Reply latency p50 / p95 | Worker CPU per reply |
+|---|---|---|---|---|---|---|
+| 50 | 8.7 ms / 11.5 ms | 9752 / 9752 | 0 | 8713 | 4.0s / 5.2s | 14.2 ms |
+| 200 | 9.35s / 15.5s | 35911 / 35897 | 16 | 29049 | 175s / 338s | 15.7 ms |
+
+- **50 msgs/s is healthy:** nothing lost, no pool timeouts, no fallback to in-process replies, and the ack targets (p95 < 500 ms, p99 < 1.5s) pass. The queue took 454s to empty after k6 stopped, but that was the `tasks` queue (profile lookups); replies kept up.
+- **200 msgs/s: far less loss, but not none.** This run answered 503 on a pool timeout, and the 14 missing messages were those (Meta would redeliver them). That 503 was then reverted, because sustained non-200 answers risk Meta disabling the webhook; those pool timeouts now answer 200 and the same 14 would be silent losses (about 0.04%). Before the fix the same rate lost 576. No webhook fell back to in-process replies, so the broker path held under overload.
+- **200 msgs/s still fails the ack target:** p95 9.35s, and k6 dropped 2,381 iterations. The API process hit 101% CPU in bursts and the pool was full in 11 of 1,240 samples (28 connections against a limit of 27). This is the ingest ceiling of one API process. Run more API processes (`WORKERS=N`) to move it.
+- **Replies fall behind at 200 msgs/s:** one worker tops out near 64 replies/s (15.7 ms of CPU each) against about 168 messages/s arriving, so the backlog peaked at 57,756 jobs and p50 reply latency reached 175s. Even the p95 of 338s is under the 10-minute `REPLY_MAX_AGE_MINUTES`, so nothing was dropped as stale. Add reply workers to fix it.
+- **Left unfinished at 200:** 25,630 `tasks` jobs (profile lookups) were still queued 600s after k6 stopped. They share the worker with replies, so they wait behind them.
+- **Bug found by this run:** the first attempt at this commit had 0 replies and a flood of 500s. `811ac7e` removed the `reply_queue` import from `webhooks.py` while `reply_queue.run_later` was still called, so every request that needed a profile lookup raised `NameError` after the commit. The import is restored. The existing tests did not catch it.
+- Everything here is still against mocks on one machine. Real Groq latency, its rate limits and real Meta responses are untested.
+
+## Update 2026-11-09 (later): webhook ingest moved to the worker
+
+The API now only verifies the signature, publishes the raw body to the `webhooks` queue and answers 200; the worker stores it (`process_webhook_job`). Same setup as the section above (`LT_QUEUE=1 REPLY_CONCURRENCY=130`, one API process, one worker with 130 reply slots, 8 ingest slots), after the 503 was reverted. Raw output: `loadtest/out/w1-q1/`; the run before this change is in `loadtest/out/w1-q1-before-ingest-queue/`.
+
+| Peak msgs/s | Webhook p95 / p99 | Sent / stored | Failed requests | AI replies | Reply latency p50 / p95 | Max DB connections |
+|---|---|---|---|---|---|---|
+| 50 | 3.6 ms / 9.3 ms | 9754 / 9754 | 0 | 8713 | 4.0s / 5.3s | 15 |
+| 200 | 15.7 ms / 27.8 ms | 39031 / 39031 | 0 | 31430 | 161s / 267s | 16 |
+
+| 200 msgs/s | Ingest inline (before) | Ingest queued (now) |
+|---|---|---|
+| Webhook p95 / p99 | 9.35s / 15.5s | 15.7 ms / 27.8 ms |
+| Messages lost | 14 (pool timeouts, 503 then reverted to 200) | 0 |
+| k6 dropped iterations | 2,381 | 21 |
+| Pool timeouts | 14 | 0 |
+| Pool full (samples) | 11 of 1,240 | 0 of 1,240 |
+
+- **The ack no longer depends on the database.** Both ack targets (p95 < 500 ms, p99 < 1.5s) now pass at 200 msgs/s, with the API process averaging 4% CPU. The offered load also rose (39,031 messages against 35,911), because the API is no longer the bottleneck.
+- **Nothing was lost** at either rate, and no webhook fell back to inline ingest. The `webhooks` queue was empty by the end of both runs.
+- **The bottleneck moved to the worker.** At 200 msgs/s the worker process hit 101% CPU (avg 62%), and the backlog peaked at 54,180 jobs. One worker now does ingest and replies, so reply latency is about 160s at p50, in line with the previous run (175s). A reply still goes out within `REPLY_MAX_AGE_MINUTES` (the p95 of 267s is under 10 minutes), but it is slow. Add reply workers (`LT_QUEUE=N`) to bring it down.
+- **Profile lookups are the first thing to fall behind.** 29,694 `tasks` jobs were still queued 600s after k6 stopped, because they share the worker with replies and ingest.
+- **CPU per reply is not comparable to earlier runs.** The 20.8 ms at 200 msgs/s is all worker CPU divided by replies, and the worker now also does the ingest work, so it no longer measures replies alone.
+- Still against mocks on one machine.
+
 ## Re-run
 
 ```

@@ -47,7 +47,9 @@ A customer message is stored by the webhook, which answers Meta right away. The 
 
 - **Without `RABBITMQ_URL`** the job runs in the API process as a background task. A restart loses in-flight replies.
 - **With `RABBITMQ_URL`** the webhook publishes the id to a durable RabbitMQ queue (`replies`), and a separate
-  worker sends the reply. If the broker is down the webhook falls back to the in-process task, so nothing is lost.
+  worker sends the reply. The webhook itself is also queued: it checks the signature, publishes the raw body to
+  `webhooks` and answers 200, and the worker stores it (retrying on failure), so a busy database can't lose an
+  event. If the broker is down, the API stores the event and runs the reply in-process instead.
 
 ```bash
 docker compose up -d postgres rabbitmq     # broker on localhost:5672, management UI on :15672
