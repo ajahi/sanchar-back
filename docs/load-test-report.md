@@ -147,7 +147,7 @@ To compare the queue with this baseline: `DRAIN=900 WORKERS=4 LT_QUEUE=1 bash lo
 
 ## Update 2026-11-09: after the publish-timeout fix
 
-Commit `811ac7e` (publish after the ack, publish timeout follows `REPLY_MAX_AGE_MINUTES`, pool timeout answers 503) plus a one-line import fix in `app/api/v1/webhooks.py`. Setup: `LT_QUEUE=1 REPLY_CONCURRENCY=130 DRAIN=600 bash loadtest/run_linux.sh 50 200` on one 16-core Linux box that also ran k6, the app, Postgres, RabbitMQ and the mock (LLM 2s, Graph 0.3s, no Groq rate limit). One uvicorn process, one reply worker with 130 slots. Raw output: `loadtest/out/w1-q1/`.
+Commit `811ac7e` (publish after the ack, publish timeout follows `REPLY_MAX_AGE_MINUTES`, pool timeout answers 503) plus a one-line import fix in `app/api/v1/webhooks.py`. Setup: `LT_QUEUE=1 REPLY_CONCURRENCY=130 DRAIN=600 bash loadtest/run_linux.sh 50 200` on one machine (`alphaBeast`: AMD Ryzen 7 5800HS, 16 threads, 15 GB RAM, Linux 6.8, a laptop-class CPU) that also ran k6, the app, Postgres, RabbitMQ and the mock (LLM 2s, Graph 0.3s, no Groq rate limit). One uvicorn process, one reply worker with 130 slots. Raw output: `loadtest/out/w1-q1/`.
 
 | Peak msgs/s | Webhook p95 / p99 | Sent / stored | Failed requests (503) | AI replies | Reply latency p50 / p95 | Worker CPU per reply |
 |---|---|---|---|---|---|---|
@@ -164,7 +164,7 @@ Commit `811ac7e` (publish after the ack, publish timeout follows `REPLY_MAX_AGE_
 
 ## Update 2026-11-09 (later): webhook ingest moved to the worker
 
-The API now only verifies the signature, publishes the raw body to the `webhooks` queue and answers 200; the worker stores it (`process_webhook_job`). Same setup as the section above (`LT_QUEUE=1 REPLY_CONCURRENCY=130`, one API process, one worker with 130 reply slots, 8 ingest slots), after the 503 was reverted. Raw output: `loadtest/out/w1-q1/`; the run before this change is in `loadtest/out/w1-q1-before-ingest-queue/`.
+The API now only verifies the signature, publishes the raw body to the `webhooks` queue and answers 200; the worker stores it (`process_webhook_job`). Same machine and setup as the section above (`alphaBeast`; `LT_QUEUE=1 REPLY_CONCURRENCY=130`, one API process, one worker with 130 reply slots, 8 ingest slots), after the 503 was reverted. Raw output: `loadtest/out/w1-q1/`; the run before this change is in `loadtest/out/w1-q1-before-ingest-queue/`.
 
 | Peak msgs/s | Webhook p95 / p99 | Sent / stored | Failed requests | AI replies | Reply latency p50 / p95 | Max DB connections |
 |---|---|---|---|---|---|---|
