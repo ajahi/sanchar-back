@@ -204,6 +204,24 @@ def test_restaurant_chat_end_to_end(monkeypatch):
     asyncio.run(_chat(monkeypatch))
 
 
+def test_business_type_picks_the_funnel_unless_one_was_chosen():
+    async def go() -> None:
+        async with async_session_factory() as db:
+            key = f"bakery{uuid.uuid4().hex[:6]}"
+            db.add(Funnel(key=key, version=1, name="B", label="order", steps="{label}", fields=RESTAURANT, active=True))
+            await db.flush()
+            try:
+                pick = lambda **kw: funnels.for_tenant(db, Tenant(name="T", **kw))  # noqa: E731
+                assert (await pick(business_type=f"Momo & {key.title()}")).key == key
+                assert await pick(business_type="instagram") is funnels.DEFAULT
+                assert await pick(business_type=None) is funnels.DEFAULT
+                assert await pick(business_type=key, funnel_key="no_such_funnel") is funnels.DEFAULT  # the choice wins
+            finally:
+                await db.rollback()
+
+    asyncio.run(go())
+
+
 def test_summary_layout_without_menu_and_with_an_unknown_area():
     draft = {"name": "Sita", "phone": "9801234567", "address": "Lakeside, gate 2", "items": "2 x Momo, 1 x Coke",
              "requests": "piro kam"}

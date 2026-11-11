@@ -106,6 +106,7 @@ async def list_tenants(db: Annotated[AsyncSession, Depends(get_db)]) -> list[dic
             "status": t.status,
             "ai_auto_reply": t.ai_auto_reply,
             "funnel_key": t.funnel_key,
+            "business_type": t.business_type,  # picks the funnel when funnel_key is null (funnels.for_tenant)
             "has_knowledge": t.id in knowledge,
             "channels": sorted(set(accounts.get(t.id, []))),
             "customers": custs.get(t.id, 0),
@@ -232,7 +233,7 @@ async def activate_funnel(key: str, version: int, db: Annotated[AsyncSession, De
 async def set_tenant_funnel(
     tenant_id: uuid.UUID, body: TenantFunnel, admin: CurrentUser, db: Annotated[AsyncSession, Depends(get_db)]
 ) -> dict:
-    """Which funnel the tenant's bot follows; null = the built-in order steps."""
+    """Which funnel the tenant's bot follows; null = the one named by its business type, else the built-in order steps."""
     tenant = await db.get(Tenant, tenant_id)
     if tenant is None:
         raise HTTPException(status_code=404, detail="Tenant not found")

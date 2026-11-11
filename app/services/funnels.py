@@ -7,7 +7,8 @@ steps. Code only acts on the labels it writes:
   [<label>: ...]  once they confirm: saved as a funnel_submission, then the triggers run
 Its checks run before each reply: opening_hours keeps a restaurant from taking orders while it is closed.
 
-A tenant without a funnel (or whose funnel has no active version) gets DEFAULT, the built-in order steps.
+A tenant gets the funnel super admin chose, else the one named by its business type, else DEFAULT, the built-in
+order steps (for_tenant).
 """
 import logging
 import re
@@ -48,15 +49,20 @@ _SUMMARY = re.compile(r"[ \t]*\[\s*summary\s*:[^\]]*\]", re.IGNORECASE)
 
 
 async def for_tenant(db: AsyncSession, tenant: Tenant) -> Funnel:
-    if not tenant.funnel_key:
+    """The funnel super admin chose for the tenant; else the live funnel whose key is a word of its business type
+    ("Restaurant & Bar" -> restaurant); else DEFAULT.
+    ponytail: whole-word match on the key only ("Cafe" gets DEFAULT); add aliases if owners write other words."""
+    live = select(Funnel).where(Funnel.active.is_(True))
+    if tenant.funnel_key:
+        funnel = (await db.execute(live.where(Funnel.key == tenant.funnel_key))).scalar_one_or_none()
+        if funnel is None:
+            log.warning("tenant %s uses funnel %r, which has no active version: default steps", tenant.id, tenant.funnel_key)
+        return funnel or DEFAULT
+    words = re.findall(r"[a-z0-9_]+", (tenant.business_type or "").lower())
+    if not words:
         return DEFAULT
-    funnel = (
-        await db.execute(select(Funnel).where(Funnel.key == tenant.funnel_key, Funnel.active.is_(True)))
-    ).scalar_one_or_none()
-    if funnel is None:
-        log.warning("tenant %s uses funnel %r, which has no active version: default steps", tenant.id, tenant.funnel_key)
-        return DEFAULT
-    return funnel
+    funnel = (await db.execute(live.where(Funnel.key.in_(words)).order_by(Funnel.key).limit(1))).scalar_one_or_none()
+    return funnel or DEFAULT
 
 
 def prompt_block(funnel: Funnel) -> str:
