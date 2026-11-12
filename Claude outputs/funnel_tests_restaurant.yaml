@@ -1,0 +1,551 @@
+# Funnel test suite — category: restaurant / cafe (R*)
+# Runner: pytest harness drives the real funnel engine with mocked tools, a frozen clock
+# and a mock HTTP server for webhooks. LLM = same model/temperature as production.
+#
+# Two kinds of assertion:
+#   hard  -> state / tool calls / events. Enforced by code guards, so must pass EVERY run.
+#   soft  -> wording / tone, checked by an LLM judge. Must pass >= pass_threshold of runs.
+
+suite: restaurant
+category: restaurant
+runs_per_case: 5
+pass_threshold: 0.8          # soft assertions only
+
+fixtures:
+  tenant: test_momo_house
+  timezone: Asia/Kathmandu
+  clock: "2026-11-12T13:00:00"               # overridden per case where needed
+  hours: {open: "10:00", last_order: "21:30", close: "22:00", closed_days: [Tuesday]}
+  menu: fixtures/menu_momo_house.json        # structured: id, name, aliases, price, available
+  delivery_zones:
+    Baneshwor: {fee: 80}
+    Kupondole: {fee: 100}
+    Koteshwor: {fee: 100}
+  staff_approval_timeout_min: 10
+
+# Applied to EVERY case in this suite (the "don't be annoying" contract)
+global_asserts:
+  hard:
+    - no_reasked_filled_slot              # never asks for a slot already in state
+    - max_confirm_prompts: 1              # +1 allowed only after the cart changes post-confirm
+    - post_order_only_in_state: submit
+    - no_greeting_after_first_bot_message     # real bug: "Namaste! Kasto sahayog chahiyo?" mid-order
+    - open_cart_never_dropped                 # cart persists across every turn until submitted/expired/cancelled
+  soft:
+    - max_lines_per_message: 3
+    - mirrors_customer_language: true         # Nepglish in -> Nepglish out (real bug: English replies)
+    - no_template_example_text: true          # real bug: "e.g., chipledhunga, bagale tole" parroted from prompt
+    - judge: "Would a busy customer find any bot message repetitive or unnecessary?"  # expect: no
+
+cases:
+
+  # ---------------------------------------------------------------- R1
+  - id: R1a
+    name: Closing time — order after last-order cutoff
+    clock: "2026-11-12T21:45:00"
+    turns:
+      - user: "2 plate chicken momo deliver garnu Baneshwor, 98XXXXXXXX"
+    expect:
+      hard:
+        - tool_called: get_business_hours
+        - tool_not_called: post_order
+        - state: {stage: closed_handled}
+      soft:
+        - mentions_any: ["21:30", "9:30", "close", "banda"]
+        - offers_any: ["tomorrow", "bholi", "pre-order", "schedule"]
+
+  - id: R1b
+    name: Closing time — closed day, customer schedules for tomorrow
+    clock: "2026-11-17T12:00:00"          # Tuesday
+    turns:
+      - user: "1 veg thali chahiyo"
+      - user: "bholi 1 baje pickup garchu"
+    expect:
+      hard:
+        - slot: {scheduled_for: "2026-11-18T13:00:00"}
+        - slot: {fulfilment: pickup}
+        - tool_not_called: post_order       # still needs phone + confirm
+
+  - id: R1c
+    name: Ad-hoc closure for today -> no slot questions at all
+    fixtures_override:
+      closures: [{date: "2026-11-12", message: "Aaja kehi karanle banda chau, bholi 10 baje dekhi khulla", allow_preorder: false}]
+    turns:
+      - user: "2 plate chicken momo chahiyo"
+    expect:
+      hard:
+        - tool_called: get_store_status
+        - state: {stage: closed}
+        - tool_not_called: post_order
+        - bot_did_not_ask_slots: [fulfilment, address, phone]   # the reported bug
+      soft:
+        - conveys_closure_message: true
+
+  - id: R1d
+    name: Ad-hoc closure with pre-order allowed -> pre-order for tomorrow, still no delivery/pickup question first
+    fixtures_override:
+      closures: [{date: "2026-11-12", message: "Aaja banda, bholi ko lagi order linchau", allow_preorder: true}]
+    turns:
+      - user: "2 plate chicken momo Baneshwor ma pathaunu"
+    expect:
+      hard:
+        - state: {stage: closed}
+        - bot_did_not_ask_slots: [fulfilment]
+      soft:
+        - offers_preorder_for_next_open_time: true
+
+  - id: R1e
+    name: Closure notice only in the knowledge base (legacy setup) -> still detected
+    fixtures_override:
+      kb_pinned_notices: [{text: "We are closed today.", valid_until: "2026-11-12T23:59:00"}]
+    turns:
+      - user: "1 veg thali"
+    expect:
+      hard:
+        - state: {stage: closed}
+        - bot_did_not_ask_slots: [fulfilment]
+
+  - id: R1f
+    name: Closure beats the generic "open every day" hours (KB conflict)
+    fixtures_override:
+      kb_chunks: ["Hamro timing: 8AM-9:30PM sabai din"]
+      closures: [{date: "2026-11-12", message: "Aaja banda chau", allow_preorder: false}]
+    turns:
+      - user: "Khulla xa ra aja?"
+    expect:
+      hard:
+        - tool_called: get_store_status
+        - state: {stage: closed}
+      soft:
+        - says_closed_today: true
+        - does_not_say_open: true
+
+  # ---------------------------------------------------------------- R2
+  - id: R2a
+    name: Misspelling — single confident match
+    turns:
+      - user: "2 plate chiken mommo"
+    expect:
+      hard:
+        - tool_called: {name: search_menu, fuzzy: true}
+        - cart_pending_confirmation: [{menu_id: chicken_steam_momo, qty: 2}]
+      soft:
+        - asks_did_you_mean: "Chicken Momo"
+    then:
+      - user: "ho"
+    expect_after:
+      hard:
+        - cart: [{menu_id: chicken_steam_momo, qty: 2}]
+
+  - id: R2b
+    name: Misspelling — ambiguous, offers options in one line
+    turns:
+      - user: "chowmin 1"
+    expect:
+      hard:
+        - cart: []                          # nothing added until customer picks
+      soft:
+        - lists_options_from_menu: ["Veg Chowmein", "Chicken Chowmein", "Buff Chowmein"]
+        - single_question: true
+
+  - id: R2c
+    name: Misspelling — Devanagari / Romanized mix
+    turns:
+      - user: "चिकेन मःम २ प्लेट"
+    expect:
+      hard:
+        - cart_pending_confirmation: [{menu_id: chicken_steam_momo, qty: 2}]
+
+  - id: R2d
+    name: Unknown item — never invents a menu item
+    turns:
+      - user: "1 pizza margherita"
+    expect:
+      hard:
+        - cart: []
+        - no_price_outside_menu: true
+      soft:
+        - says_not_on_menu: true
+
+  # ---------------------------------------------------------------- R3
+  # Items come from the tenant's website listing. At confirm, the engine does a LIVE
+  # lookup on the tenant website; the live result always wins over the listed/cached one.
+  - id: R3a
+    name: Listed as available, live lookup at confirm says not available
+    fixtures_override:
+      listing_patch: {buff_jhol_momo: {available: true}}    # what the customer saw
+      live_lookup_patch: {buff_jhol_momo: {available: false}}
+    turns:
+      - user: "1 buff jhol momo ra 1 coke, Kupondole, 98XXXXXXXX"
+      - user: "confirm"
+    expect:
+      hard:
+        - tool_called: lookup_items              # live tenant-website lookup at confirm
+        - cart: [{menu_id: coke, qty: 1}]        # unavailable item removed, rest kept
+        - tool_not_called: post_order            # needs re-confirm with new total
+        - numbers_in_reply_match_quote: true     # re-quoted without the removed item
+      soft:
+        - says_item_unavailable_now: true
+        - offers_alternatives_from_menu: true
+
+  - id: R3b
+    name: Every item unavailable at confirm -> no empty order submitted
+    fixtures_override:
+      live_lookup_patch: {buff_jhol_momo: {available: false}}
+    turns:
+      - user: "1 buff jhol momo, pickup, 98XXXXXXXX"
+      - user: "confirm"
+    expect:
+      hard:
+        - cart: []
+        - tool_not_called: post_order
+        - state: {stage: collect}
+      soft:
+        - offers_alternatives_from_menu: true
+
+  - id: R3c
+    name: Price changed on the website between listing and confirm
+    fixtures_override:
+      listing_patch: {chicken_steam_momo: {price: 220}}
+      live_lookup_patch: {chicken_steam_momo: {price: 240}}
+    turns:
+      - user: "2 chicken momo, pickup, 98XXXXXXXX"
+      - user: "confirm"
+    expect:
+      hard:
+        - quote_uses_live_price: true
+        - numbers_in_reply_match_quote: true
+        - tool_not_called: post_order            # customer must see the new total first
+      soft:
+        - mentions_price_changed: true
+
+  - id: R3d
+    name: Live lookup fails (tenant website down) -> never submits blind
+    mocks:
+      live_lookup: {status: 503}
+    turns:
+      - user: "2 chicken momo, pickup, 98XXXXXXXX"
+      - user: "confirm"
+    expect:
+      hard:
+        - tool_not_called: post_order
+        - event_emitted: {type: notify.owner, reason: lookup_failed}
+      soft:
+        - tells_customer_short_delay_or_call: true
+
+  # ---------------------------------------------------------------- R4
+  # Delivery is checked at confirm: first the tenant website's deliverable list, then the
+  # staff-confirmed locations the tenant added in the dashboard (with their own fee).
+  - id: R4a
+    name: Location not in website list, but in staff-confirmed list
+    fixtures_override:
+      website_delivery_zones: {Baneshwor: 80, Kupondole: 100}
+      staff_confirmed_zones: {Bhaktapur: 250}
+    turns:
+      - user: "2 chicken momo deliver to Bhaktapur, 98XXXXXXXX"
+      - user: "confirm"
+    expect:
+      hard:
+        - tool_called: lookup_delivery
+        - quote_includes: {delivery_fee: 250, zone_source: staff_confirmed}
+        - numbers_in_reply_match_quote: true
+      soft:
+        - no_extra_questions_about_location: true
+
+  - id: R4b
+    name: Location in neither list -> offer pickup, keep cart
+    fixtures_override:
+      website_delivery_zones: {Baneshwor: 80}
+      staff_confirmed_zones: {}
+    turns:
+      - user: "2 chicken momo deliver to Bhaktapur, 98XXXXXXXX"
+    expect:
+      hard:
+        - cart: [{menu_id: chicken_steam_momo, qty: 2}]   # order NOT forgotten
+        - slot_cleared: address
+        - tool_not_called: post_order
+      soft:
+        - offers_pickup: true
+
+  - id: R4d
+    name: Landmark-style address (building + floor) accepted, not re-asked
+    fixtures_override:
+      landmarks: {"Expert": {zone: Chipledhunga}}     # tenant-maintained landmark -> zone map
+    turns:
+      - user: "Expert ma 2nd floor ma 2 ota chicken dry mix lyaidinu na"
+    expect:
+      hard:
+        - slot: {fulfilment: delivery, address: "Expert, 2nd floor", delivery_zone: Chipledhunga}
+        - bot_did_not_ask_slots: [fulfilment, address, delivery_zone]
+
+  - id: R4e
+    name: Unknown landmark -> ask for the area ONCE, specifically
+    fixtures_override:
+      landmarks: {}
+    turns:
+      - user: "Expert ma 2nd floor ma 2 ota chicken dry mix lyaidinu na"
+    expect:
+      hard:
+        - slot: {fulfilment: delivery, address: "Expert, 2nd floor"}
+        - bot_did_not_ask_slots: [fulfilment, address]
+      soft:
+        - asks_only_which_area_the_landmark_is_in: true   # "Expert building kun area ma parcha?"
+
+  - id: R4c
+    name: Spelling / alias of a staff-confirmed location
+    fixtures_override:
+      staff_confirmed_zones: {Bhaktapur: 250}
+    turns:
+      - user: "2 chicken momo, Bhaktpur Durbar Square nera, 98XXXXXXXX"
+    expect:
+      hard:
+        - slot: {delivery_zone: Bhaktapur}
+        - quote_includes: {delivery_fee: 250}
+
+  # ---------------------------------------------------------------- R5
+  - id: R5a
+    name: Calculation — every number in the reply matches the quote tool
+    turns:
+      - user: "3 chicken momo, 2 coke, 1 veg chowmein, Kupondole delivery, 98XXXXXXXX"
+    expect:
+      hard:
+        - tool_called: quote_cart
+        - numbers_in_reply_match_quote: true   # regex-extract Rs amounts, compare to quote_cart output
+        - no_arithmetic_by_model: true          # total must appear verbatim from tool result
+
+  - id: R5b
+    name: Calculation — after quantity change and discount
+    fixtures_override:
+      promotions: [{code: MOMO10, type: percent, value: 10, applies_to: momo}]
+    turns:
+      - user: "4 veg momo, pickup, 98XXXXXXXX"
+      - user: "MOMO10 code cha"
+      - user: "actually 3 plate matra"
+    expect:
+      hard:
+        - cart: [{menu_id: veg_steam_momo, qty: 3}]
+        - numbers_in_reply_match_quote: true
+
+  # ---------------------------------------------------------------- R6
+  - id: R6a
+    name: Post-conversation — order webhook fires exactly once
+    turns:
+      - user: "2 chicken momo, Baneshwor, 98XXXXXXXX"
+      - user: "confirm"
+    expect:
+      hard:
+        - event_emitted: {type: order.confirmed}
+        - webhook_received: {action: restaurant_order_post, count: 1}
+        - webhook_payload_matches: {items: [{menu_id: chicken_steam_momo, qty: 2}], phone: "98XXXXXXXX"}
+        - webhook_signed: true                  # HMAC header present and valid
+      soft:
+        - confirms_to_customer_after_success: true
+
+  - id: R6b
+    name: Post-conversation — receiver returns 500 then 200 (retry, no duplicate)
+    mocks:
+      webhook_responses: [500, 500, 200]
+    turns:
+      - user: "2 chicken momo, Baneshwor, 98XXXXXXXX"
+      - user: "confirm"
+    expect:
+      hard:
+        - webhook_attempts: 3
+        - webhook_accepted: 1                   # same idempotency key on every attempt
+        - delivery_log_status: succeeded
+
+  - id: R6c
+    name: Post-conversation — receiver down for good
+    mocks:
+      webhook_responses: [500, 500, 500, 500, 500]
+    turns:
+      - user: "2 chicken momo, Baneshwor, 98XXXXXXXX"
+      - user: "confirm"
+    expect:
+      hard:
+        - delivery_log_status: dead_lettered
+        - event_emitted: {type: notify.owner, reason: order_delivery_failed}
+      soft:
+        - customer_not_told_success_falsely: true
+
+  - id: R6d
+    name: Abandoned conversation -> owner gets call-back notification
+    turns:
+      - user: "3 veg momo, 98XXXXXXXX"
+    idle_minutes: 30
+    expect:
+      hard:
+        - event_emitted: {type: conversation.ended, outcome: abandoned}
+        - action_fired: {type: notify, template: abandoned_order_callback}
+
+  # ---------------------------------------------------------------- R7
+  - id: R7a
+    name: Order changes — add, change qty, remove, replace
+    turns:
+      - user: "2 chicken momo ra 1 coke"
+      - user: "1 buff chowmein pani"
+      - user: "momo 3 plate banaunu"
+      - user: "coke hataidinu"
+      - user: "chowmein ko satta veg thukpa"
+    expect:
+      hard:
+        - cart: [{menu_id: chicken_steam_momo, qty: 3}, {menu_id: veg_thukpa, qty: 1}]
+
+  - id: R7b
+    name: Order changes — edit after confirm triggers ONE re-confirm
+    turns:
+      - user: "2 chicken momo, Baneshwor, 98XXXXXXXX"
+      - user: "ok confirm"
+      - user: "ah 1 coke thapnu"
+    expect:
+      hard:
+        - tool_not_called_before_reconfirm: post_order
+        - confirm_prompts_total: 2
+        - cart: [{menu_id: chicken_steam_momo, qty: 2}, {menu_id: coke, qty: 1}]
+
+  - id: R7d
+    name: "Variant clarification keeps quantity and other slots (real bug: 2 -> 1)"
+    turns:
+      - user: "Expert ma 2nd floor ma 2 ota dry mix lyaidinu na"
+      - user: "chicken"
+    expect:
+      hard:
+        - cart: [{menu_id: chicken_dry_mix, qty: 2}]
+        - slot: {fulfilment: delivery, address: "Expert, 2nd floor"}
+        - bot_did_not_ask_slots: [fulfilment, address]
+        - numbers_in_reply_match_quote: true          # 2 x 190 = 380 from quote_cart, not "Rs 190"
+
+  - id: R7c
+    name: Order changes — digression in the middle, cart survives
+    turns:
+      - user: "1 chicken thali"
+      - user: "parking cha?"
+      - user: "ani 1 lassi"
+    expect:
+      hard:
+        - cart: [{menu_id: chicken_thali, qty: 1}, {menu_id: lassi, qty: 1}]
+      soft:
+        - answers_digression: true
+        - nudges_back_to_order: true
+
+  # ---------------------------------------------------------------- R8
+  # Fulfilment inference: never ask "delivery or pickup?" when the customer already said it.
+  - id: R8a
+    name: Location given -> delivery inferred
+    turns:
+      - user: "2 chicken momo Kupondole ma pathaidinu na"
+    expect:
+      hard:
+        - slot: {fulfilment: delivery, address: "Kupondole"}
+        - bot_did_not_ask_slots: [fulfilment, address]
+
+  - id: R8b
+    name: English "deliver to" phrasing
+    turns:
+      - user: "can you deliver 1 veg thali to Baneshwor? 98XXXXXXXX"
+    expect:
+      hard:
+        - slot: {fulfilment: delivery, address: "Baneshwor", phone: "98XXXXXXXX"}
+        - bot_did_not_ask_slots: [fulfilment, address, phone]
+
+  - id: R8c
+    name: Location given in a later message
+    turns:
+      - user: "3 veg momo"
+      - user: "Koteshwor"
+    expect:
+      hard:
+        - slot: {fulfilment: delivery, address: "Koteshwor"}
+        - bot_did_not_ask_slots: [fulfilment]
+
+  - id: R8d
+    name: Pickup phrasing -> pickup inferred
+    turns:
+      - user: "2 chicken momo, 7 baje aaera lanchu"
+    expect:
+      hard:
+        - slot: {fulfilment: pickup}
+        - bot_did_not_ask_slots: [fulfilment]
+
+  - id: R8e
+    name: Branch name + pickup verb is pickup, not delivery
+    fixtures_override:
+      branches: [Baneshwor]
+    turns:
+      - user: "Baneshwor branch ma lina aauchu, 2 chicken momo"
+    expect:
+      hard:
+        - slot: {fulfilment: pickup, branch: "Baneshwor"}
+        - slot_empty: address
+
+  - id: R8g
+    name: Nepali "bring" verbs mean delivery (lyaidinu / lyaidena / lyaunu)
+    cases:
+      - "2 ota dry mix Expert ma lyaidinu na"
+      - "Chicken steam momo mathi Munal store ma lyaidena milxa?"
+      - "1 thali office ma lyaunu paryo"
+    expect:
+      hard:
+        - slot: {fulfilment: delivery}
+        - bot_did_not_ask_slots: [fulfilment]
+
+  - id: R8f
+    name: Customer changes their mind -> slot updated, not re-asked
+    turns:
+      - user: "2 chicken momo Kupondole ma pathaunu"
+      - user: "na, ma aafai lina aauchu"
+    expect:
+      hard:
+        - slot: {fulfilment: pickup}
+        - slot_cleared: address
+
+  # ---------------------------------------------------------------- R9
+  # Staff unreachable / customer wants a human. Real bug: "phone ta uthyna ta" -> bot reset to a greeting.
+  - id: R9a
+    name: Customer says the shop phone isn't answered, mid-order
+    turns:
+      - user: "2 ota chicken dry mix Expert 2nd floor ma lyaidinu na"
+      - user: "hajur ko number dinus ta"
+      - user: "phone ta uthyna ta"
+    expect:
+      hard:
+        - cart: [{menu_id: chicken_dry_mix, qty: 2}]          # order kept
+        - event_emitted: {type: notify.owner, reason: customer_cannot_reach_phone}
+        - notify_payload_includes: [cart, slots, customer_handle]
+        - no_greeting_after_first_bot_message: true
+      soft:
+        - offers_to_take_order_here: true                     # "Yahi bata order linchu"
+        - restates_open_order_in_one_line: true
+
+  - id: R9b
+    name: Customer insists on a human -> handoff with full summary
+    turns:
+      - user: "2 ota chicken dry mix Expert 2nd floor ma lyaidinu na"
+      - user: "phone uthaunus na"
+    expect:
+      hard:
+        - event_emitted: {type: handoff.requested}
+        - handoff_payload_includes: [cart, slots, missing_slots, last_customer_message]
+        - bot_paused_until_operator_or_timeout: true
+      soft:
+        - tells_customer_staff_informed: true
+
+  - id: R9c
+    name: "Operator gets everything captured -> never needs to re-ask (real bug: operator asked for number)"
+    turns:
+      - user: "2 ota chicken dry mix Expert 2nd floor ma lyaidinu na, 98XXXXXXXX"
+      - user: "phone uthaunus na"
+    expect:
+      hard:
+        - handoff_payload_matches: {phone: "98XXXXXXXX", address: "Expert, 2nd floor", cart: [{menu_id: chicken_dry_mix, qty: 2}]}
+
+# ------------------------------------------------------------------------------
+# Real-transcript replay (N+1). Exported from production, anonymised.
+# For each failed conversation, replay up to the turn where it went wrong and judge
+# only the NEXT bot reply produced by the new funnel.
+replay:
+  source: fixtures/transcripts/restaurant_failed/*.json   # includes cafe_2026-11-12_case1/case2 (real)
+  use_replay_points: true      # each fixture lists the turn to replay from + expected behaviour
+  judge: "Compared with the original bot reply, is the new reply shorter, does it avoid
+          re-asking, and does it move the order closer to completion?"
+  pass_threshold: 0.8

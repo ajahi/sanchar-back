@@ -1,0 +1,19 @@
+{
+  "id": "cafe_2026-11-12_case1",
+  "tenant_category": "restaurant",
+  "channel": "instagram",
+  "date": "2026-11-12",
+  "context": {"store_status": "closed_today (closure note in KB)", "outcome": "no_order"},
+  "turns": [
+    {"role": "bot", "text": "Hello! How can I assist you today?"},
+    {"role": "customer", "time": "11:35", "text": "Chicken steam momo mathi <LANDMARK> store ma lyaidena milxa?"},
+    {"role": "bot", "time": "11:35", "text": "Sure! Delivery ki pickup? If delivery, please tell me which delivery area you are in (e.g., chipledhunga, bagale tole, etc.) and your address, plus your name and phone number. If pickup, just let me know.",
+     "failures": ["F1_closure_not_checked_before_slots", "F2_fulfilment_reasked_despite_location_and_bring_verb", "F5_interrogation_4_fields_in_one_message", "F6_language_mismatch", "F7_prompt_example_text_parroted"]},
+    {"role": "customer", "time": "11:37", "text": "Aja banda haina ra?"},
+    {"role": "bot", "time": "11:37", "text": "Ho, aaja haami band chaun. Bholi, Kartik 27, subha bela khulne cha. Dhanyabaad!",
+     "failures": ["F1_closure_only_revealed_when_customer_asked"]}
+  ],
+  "replay_points": [
+    {"after_turn": 1, "expected": "State the closure message immediately; no slot questions; offer pre-order only if allowed."}
+  ]
+}

@@ -1,0 +1,88 @@
+"""The owner's "we are closed" switch (tenants.closure): on, off, ending by itself, its message, the endpoints, and
+replies asking for order details while closed. Endpoint parts run against Postgres, rolled back.
+
+    python -m pytest tests/test_closure.py
+"""
+import asyncio
+from datetime import datetime, timedelta
+
+import pytest
+from fastapi import HTTPException
+
+from app.api.v1.tenants import close_shop, get_closure, reopen_shop
+from app.db.session import async_session_factory
+from app.models.tenant import Tenant
+from app.models.user import User
+from app.schemas.tenant import ClosureIn
+from app.services import hours
+from app.services.funnels import asks_order_details
+from app.services.hours import NEPAL
+
+NOON = datetime(2026, 11, 12, 12, 0, tzinfo=NEPAL)
+
+
+def test_closure_message():
+    assert hours.closure_message(None) is None and hours.closure_message({}) is None
+    assert hours.closure_message({"message": "Aaja banda chau, bholi aaunus.", "until": None}, NOON) == "Aaja banda chau, bholi aaunus."
+    assert hours.closure_message({"message": "  ", "until": None}, NOON) == hours.DEFAULT_CLOSURE  # no message written
+    tonight = hours.end_of_today(NOON)
+    assert tonight == datetime(2026, 11, 13, 0, 0, tzinfo=NEPAL)
+    on = {"message": "Banda", "until": tonight.isoformat()}
+    assert hours.closure_message(on, NOON) == "Banda"
+    assert hours.closure_message(on, tonight) is None  # ended by itself at midnight
+    assert hours.closure_message(on, NOON + timedelta(days=1)) is None
+
+
+def test_order_detail_questions_are_caught():
+    for asking in (
+        "Sure! Delivery ki pickup?",
+        "Dry Mix ko kun type chahanu huncha? Delivery ki pickup?",
+        "Please tell me your address and phone number.",
+        "Tapai ko naam ra phone number dinus na.",
+        "Kati plate chahiyo?",
+    ):
+        assert asks_order_details(asking), asking
+    for answering in (
+        "Hamro phone number: 061-417004. Aru kehi chahinchha bhane bhannus.",
+        "Buff Jhol Momo Rs 250.",
+        "Ho, hami Pokhara bhitra delivery garchau.",
+        "Aru kehi sahayog chahiyo?",
+    ):
+        assert not asks_order_details(answering), answering
+
+
+async def _endpoints() -> None:
+    async with async_session_factory() as db:
+        db.commit = db.flush  # stay inside the rolled-back transaction
+        try:
+            tenant = Tenant(name="Cube Cafe")
+            owner = User(name="Owner", email="owner@closure.test")
+            db.add_all([tenant, owner])
+            await db.flush()
+
+            assert (await get_closure(tenant)).closed is False
+
+            out = await close_shop(ClosureIn(message="Aaja kehi karanle banda chau, bholi 8 baje khulcha.", for_today=True),
+                                   tenant, owner, db)
+            assert out.closed and out.message == "Aaja kehi karanle banda chau, bholi 8 baje khulcha."
+            assert out.until == hours.end_of_today()
+
+            out = await close_shop(ClosureIn(), tenant, owner, db)  # until reopened, default message
+            assert out.closed and out.until is None and out.message == hours.DEFAULT_CLOSURE
+
+            out = await close_shop(ClosureIn(message="Banda", until=datetime.now(NEPAL).replace(tzinfo=None) + timedelta(hours=3)), tenant, owner, db)
+            assert out.closed and out.until.tzinfo is not None  # a time without zone is Nepal time
+
+            with pytest.raises(HTTPException) as e:
+                await close_shop(ClosureIn(until=datetime.now(NEPAL) - timedelta(minutes=1)), tenant, owner, db)
+            assert e.value.status_code == 422
+
+            out = await reopen_shop(tenant, owner, db)
+            assert out.closed is False and out.message is None and out.custom_message == "Banda"  # kept for next time
+            assert hours.closure_message(tenant.closure) is None
+        finally:
+            await db.rollback()
+
+
+def test_closure_endpoints():
+    asyncio.run(_endpoints())

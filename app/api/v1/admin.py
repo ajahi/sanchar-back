@@ -1,6 +1,7 @@
 """Platform super-admin — cross-tenant overview and the per-tenant AI auto-reply switch."""
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -58,6 +59,7 @@ class TryIn(BaseModel):
     history: list[tuple[str, str]] = []  # [("customer" | "assistant", text)], oldest first
     funnel_key: str | None = None  # None = the tenant's own funnel
     version: int | None = None  # None = that funnel's active version
+    draft: FunnelIn | None = None  # an unsaved funnel, tried before saving (saving makes it live)
 
 
 async def _per_tenant(db: AsyncSession, stmt) -> dict:
@@ -253,7 +255,9 @@ async def try_funnel(body: TryIn, db: Annotated[AsyncSession, Depends(get_db)]) 
     if tenant is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
     funnel = None
-    if body.funnel_key:
+    if body.draft:
+        funnel = SimpleNamespace(**body.draft.model_dump(), version=0, active=False)  # funnels.DEFAULT's shape
+    elif body.funnel_key:
         q = select(Funnel).where(Funnel.key == body.funnel_key)
         q = q.where(Funnel.version == body.version) if body.version else q.where(Funnel.active.is_(True))
         funnel = await db.scalar(q)

@@ -5,7 +5,10 @@ runs once the customer confirms. The bot keeps no step counter: each reply, the 
 steps. Code only acts on the labels it writes:
   [summary: ...]  with the summary: replaced by the order total, worked out here from the website menu
   [<label>: ...]  once they confirm: saved as a funnel_submission, then the triggers run
-Its checks run before each reply: opening_hours keeps a restaurant from taking orders while it is closed.
+Its checks run before each reply: opening_hours keeps a restaurant from taking orders while it is closed. Before
+them, for every funnel, the owner's own "we are closed" switch (tenants.closure) with the owner's message.
+While closed, a reply that asks for order details anyway (delivery or pickup? address? phone?) becomes the closed
+message: the model was told, but a note in the prompt is not a guarantee.
 
 A tenant gets the funnel super admin chose, else the one named by its business type, else DEFAULT, the built-in
 order steps (for_tenant).
@@ -46,6 +49,23 @@ DEFAULT = SimpleNamespace(  # a Funnel's shape, never stored
 )
 
 _SUMMARY = re.compile(r"[ \t]*\[\s*summary\s*:[^\]]*\]", re.IGNORECASE)
+# A sentence of the reply asking the customer for an order detail: one of these words in a question, or with a
+# "give / send / tell" verb. Used only while closed.
+# ponytail: word lists, English and Romanized Nepali; Devanagari replies are not caught.
+_ORDER_WORD = re.compile(
+    r"delivery\s*(ki|or|wa|va)\s*pick|pick\s*-?\s*up|address|thegana|phone|number|\bnaam|\bname\b|kun area|which area"
+    r"|kati\s*(ota|wata|plate|piece)|how many",
+    re.IGNORECASE,
+)
+_ASK_VERB = re.compile(r"dinus|dinuhos|pathaunus|pathaidinus|bhannus|share|tell me|let me know|send", re.IGNORECASE)
+
+
+def asks_order_details(reply: str) -> bool:
+    """True when the reply asks the customer for something only an order needs."""
+    return any(
+        _ORDER_WORD.search(s) and ("?" in s or _ASK_VERB.search(s))
+        for s in re.split(r"(?<=[.!?\n])", reply)
+    )
 
 
 async def for_tenant(db: AsyncSession, tenant: Tenant) -> Funnel:
@@ -70,7 +90,11 @@ def prompt_block(funnel: Funnel) -> str:
 
 
 async def closed_message(db: AsyncSession, tenant: Tenant, funnel: Funnel, knowledge: str) -> str | None:
-    """Run the funnel's checks: what to tell a customer who wants to order now (the business is closed), or None."""
+    """What to tell a customer who wants to order now (the business is closed), or None. The owner's closed
+    switch first (every funnel, the owner's message), then the funnel's own checks."""
+    manual = hours.closure_message(tenant.closure)
+    if manual:
+        return manual
     for check in funnel.checks:
         if check.get("type") == "opening_hours":
             table = await hours.for_tenant(db, tenant, knowledge)
@@ -140,10 +164,10 @@ async def finish_reply(
     """The model's reply -> (text for the customer, the fields it collected or None). A complete summary label
     becomes the whole reply, written here (order_summary / plain_summary) so it reads the same every time; an
     incomplete one is just removed. The confirmed label is taken out.
-    closed: a check failed (closed_message): a summary or an order the model wrote anyway becomes that message,
-    and nothing is collected."""
+    closed: a check failed (closed_message): a summary, an order or a question for order details the model wrote
+    anyway becomes that message, and nothing is collected."""
     m = _SUMMARY.search(reply)
-    if closed and (m or split_label(reply, funnel.label, funnel.fields)[1]):
+    if closed and (m or split_label(reply, funnel.label, funnel.fields)[1] or asks_order_details(reply)):
         return closed, None
     if m:
         _, draft = split_label(m.group(0).strip(), "summary", funnel.fields)

@@ -1,0 +1,40 @@
+{
+  "id": "cafe_2026-11-12_case2",
+  "tenant_category": "restaurant",
+  "channel": "instagram",
+  "date": "2026-11-12",
+  "context": {"store_hours_kb": "8AM-9:30PM sabai din", "outcome": "no_order; operator took over after 23 min and had to ask for the customer's number"},
+  "turns": [
+    {"role": "customer", "time": "10:41", "text": "Hello"},
+    {"role": "bot", "time": "10:41", "text": "Hi! How can I help you today?"},
+    {"role": "customer", "time": "10:41", "text": "Khulla xa ra aja?"},
+    {"role": "bot", "time": "10:41", "text": "Ho, hamro cafe khulla cha. Hamro timing: 8 AM–9:30 PM sabai din. Kehi arko sahayog chahiyo bhane sodhnus.",
+     "failures": ["F1_store_status_from_generic_hours_chunk (verify: was a closure active?)"]},
+    {"role": "customer", "time": "10:42", "text": "<LANDMARK> ma k 2nd floor ma 2 ota dry mix lyaidinu na"},
+    {"role": "bot", "time": "10:42", "text": "Dry Mix Combo ko kun type chahanu huncha? Veg Dry Mix (Rs 160), Chicken Dry Mix (Rs 190) or Buff Dry Mix (Rs 190) — kunai ek ya sabai? Delivery ki pickup?",
+     "failures": ["F2_fulfilment_reasked_despite_location_and_bring_verb"],
+     "ok": ["variant clarification with options in one line is correct"]},
+    {"role": "customer", "time": "10:42", "text": "chicken"},
+    {"role": "bot", "time": "10:42", "text": "Chicken Dry Mix - Rs 190. Delivery ki pickup? If delivery, please tell which area (e.g., chipledhunga, bagale tole, etc.) and your name & phone number. If pickup, just confirm.",
+     "failures": ["F3_quantity_lost_2_to_1", "F2_fulfilment_reasked_again", "F4_address_reasked_landmark_address_ignored", "F5_interrogation", "F6_language_mismatch", "F7_prompt_example_text_parroted"]},
+    {"role": "customer", "time": "10:42", "text": "hajur ko number dinus ta 😂"},
+    {"role": "bot", "time": "10:42", "text": "Hamro phone number: <SHOP_PHONE>."},
+    {"role": "customer", "time": "10:43", "text": "phone ta uthyna ta"},
+    {"role": "bot", "time": "10:43", "text": "Namaste! Kasto sahayog chahiyo? 🙏",
+     "failures": ["F8_context_reset_to_greeting", "F9_staff_unreachable_complaint_not_handled", "F10_open_order_dropped"]},
+    {"role": "customer", "time": "10:44", "text": "phone uthaunus na 😂"},
+    {"role": "bot", "time": "10:44", "text": "Phone number ho: <SHOP_PHONE>. Aru kehi chahinchha bhane bhannus.",
+     "failures": ["F9_no_handoff_or_owner_notification", "F10_open_order_dropped"]},
+    {"role": "customer", "time": "10:44", "text": "Banda xa ho aja?"},
+    {"role": "bot", "time": "10:44", "text": "Namaste! Hamro cafe aaja khula cha, 8AM-9:30PM samma. Kehi order ya sahayog chahiyo bhane bhannus.",
+     "failures": ["F10_open_order_never_resumed", "F11_greeting_repeated_mid_conversation"]},
+    {"role": "operator", "time": "11:07", "text": "hajur ko number kati hola?",
+     "failures": ["F12_handoff_without_order_summary_operator_reasks"]}
+  ],
+  "replay_points": [
+    {"after_turn": 4, "expected": "Ask only which dry mix variant (one line). Keep qty=2, fulfilment=delivery, address='<LANDMARK>, 2nd floor'. Nepglish."},
+    {"after_turn": 6, "expected": "2x Chicken Dry Mix, delivery to <LANDMARK> 2nd floor; ask only phone number (and area only if the landmark can't be matched to a delivery zone). Nepglish, max 2 lines."},
+    {"after_turn": 10, "expected": "Apologise briefly, say the order can be taken right here, restate the open order in one line; emit handoff.requested + notify.owner('customer cannot reach your phone')."},
+    {"after_turn": 14, "expected": "Answer open/closed from store status, then nudge back to the open order in one line."}
+  ]
+}
