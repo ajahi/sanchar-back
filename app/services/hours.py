@@ -26,7 +26,7 @@ NEPAL = timezone(timedelta(hours=5, minutes=45))  # no daylight saving
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")  # datetime.weekday() order
 _NEPALI_DAYS = ("Sombar", "Mangalbar", "Budhabar", "Bihibar", "Shukrabar", "Shanibar", "Aaitabar")
 DEFAULT_MESSAGE = "Hami ahile banda chau, {opens} dekhi order lina sakchau."
-DEFAULT_CLOSURE = "Hami aaja banda chau. Asuvidha ko lagi maaf garnus."  # the owner closed without writing a message
+DEFAULT_CLOSED_MESSAGE = "Hami aaja banda chau. Asuvidha ko lagi maaf garnus."  # the owner closed without writing a message
 
 EXTRACT = """Below is a business's own information. Find its opening hours and reply with only a JSON object, no other text:
 {"mon": ["HH:MM", "HH:MM"], "tue": ..., "wed": ..., "thu": ..., "fri": ..., "sat": ..., "sun": ...}
@@ -100,15 +100,15 @@ def end_of_today(now: datetime | None = None) -> datetime:
     return datetime.combine(now.date() + timedelta(days=1), time(0), NEPAL)
 
 
-def closure_message(closure: dict | None, now: datetime | None = None) -> str | None:
-    """The owner's "we are closed" switch (tenants.closure): what the bot tells a customer who wants to order while
-    it is on, or None (off, or past its "until")."""
-    if not closure:
+def close_conditions_message(conditions: dict | None, now: datetime | None = None) -> str | None:
+    """The owner's "we are closed" switch (tenants.close_conditions): what the bot tells a customer who wants to
+    order while it is on, or None (off, or past its "until")."""
+    if not conditions:
         return None
-    until = closure.get("until")
+    until = conditions.get("until")
     if until and (now or datetime.now(NEPAL)) >= datetime.fromisoformat(until):
         return None
-    return (closure.get("message") or "").strip() or DEFAULT_CLOSURE
+    return (conditions.get("message") or "").strip() or DEFAULT_CLOSED_MESSAGE
 
 
 def closed_note(message: str) -> str:

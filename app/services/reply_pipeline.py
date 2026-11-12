@@ -77,19 +77,29 @@ async def human_active(db: AsyncSession, conversation_id) -> bool:
     return found.first() is not None
 
 
-_KNOWLEDGE: dict = {}  # tenant_id -> (expires_at, text); per process, so an edit shows up within the TTL
+_KNOWLEDGE: dict = {}  # tenant_id -> (expires_at, text, spellings); per process, so an edit shows up within the TTL
 
 
 async def build_knowledge(db: AsyncSession, tenant_id) -> str:
-    """The tenant's whole shop context as one text block (the CAG context). Tenant-scoped, always.
-    Cached KNOWLEDGE_CACHE_SECONDS per process (0 = off): it is the same for every reply of a tenant."""
+    """The tenant's whole shop context as one text block (the CAG context), without the owner's {spellings}.
+    Tenant-scoped, always. Cached KNOWLEDGE_CACHE_SECONDS per process (0 = off): the same for every reply."""
+    return (await _knowledge(db, tenant_id))[0]
+
+
+async def shop_spellings(db: AsyncSession, tenant_id) -> dict[str, str]:
+    """The spellings the owner wrote in braces in Shop Info, {spelling: name} (kitchen.spellings)."""
+    return (await _knowledge(db, tenant_id))[1]
+
+
+async def _knowledge(db: AsyncSession, tenant_id) -> tuple[str, dict[str, str]]:
     hit = _KNOWLEDGE.get(tenant_id)
     if hit and hit[0] > time.monotonic():
-        return hit[1]
-    text = await _load_knowledge(db, tenant_id)
+        return hit[1], hit[2]
+    raw = await _load_knowledge(db, tenant_id)
+    text, spelled = kitchen.strip_spellings(raw), kitchen.spellings(raw)
     if settings.knowledge_cache_seconds:
-        _KNOWLEDGE[tenant_id] = (time.monotonic() + settings.knowledge_cache_seconds, text)
-    return text
+        _KNOWLEDGE[tenant_id] = (time.monotonic() + settings.knowledge_cache_seconds, text, spelled)
+    return text, spelled
 
 
 async def _load_knowledge(db: AsyncSession, tenant_id) -> str:
@@ -350,6 +360,7 @@ async def auto_reply(db: AsyncSession, message_id, *, queued: bool = False) -> N
     funnel = await funnels.for_tenant(db, tenant)
     closed = await funnels.closed_message(db, tenant, funnel, knowledge)  # may re-read the hours: saved by the commit below
     areas = await delivery_areas(db, tenant.id)
+    menu = (await menu_catalog(db, tenant.id), await shop_spellings(db, tenant.id))
 
     prior = (
         await db.execute(
@@ -370,13 +381,14 @@ async def auto_reply(db: AsyncSession, message_id, *, queued: bool = False) -> N
     # rows stay usable: expire_on_commit=False) so the 1-3s LLM call below does not hold one.
     await db.commit()
     listed = [(p.title, p.tags) for p in photos]
+    said = kitchen.fulfilment([t for who, t in history if who == "customer"] + [msg.content], areas)
     try:
         reply = await _generate(
             build_system_prompt(knowledge, campaigns.campaign_context(campaign) if campaign else "", listed,
                                 funnels.prompt_block(funnel)),
             history,
             msg.content,
-            _hint(msg.content, listed, closed, areas),
+            _hint(msg.content, listed, closed, areas, menu, said),
         )
     except Exception:  # noqa: BLE001 — stay quiet rather than send something wrong; a person can answer
         log.exception("LLM failed for conversation %s", convo.id)
@@ -384,6 +396,7 @@ async def auto_reply(db: AsyncSession, message_id, *, queued: bool = False) -> N
             raise
         return
     reply, collected = await funnels.finish_reply(db, tenant.id, funnel, reply or "", closed)
+    reply = kitchen.drop_fulfilment_question(reply) if said else reply
     reply, picks = split_photos(reply, len(photos))
     kitchen_job = None
     if collected:  # kept even if the reply is dropped below: the customer did give (and confirm) these details
@@ -439,6 +452,13 @@ async def _send_reply(db, convo, account, customer, msg, reply: str, picks: list
             break  # the rest would most likely fail the same way (expired url, window closed)
 
 
+async def menu_catalog(db: AsyncSession, tenant_id) -> list[dict]:
+    """The menu synced from the business's own order system ([] without one)."""
+    return (
+        await db.execute(select(OrderIntegration.catalog).where(OrderIntegration.tenant_id == tenant_id))
+    ).scalar() or []
+
+
 async def delivery_areas(db: AsyncSession, tenant_id) -> list[dict]:
     """The delivery areas synced from the business's own order system ([] without one)."""
     return (
@@ -446,9 +466,14 @@ async def delivery_areas(db: AsyncSession, tenant_id) -> list[dict]:
     ).scalar() or []
 
 
-def _hint(text: str, listed: list[tuple[str | None, list[str]]], closed: str | None, areas: list[dict]) -> str:
-    """The per-message note for the model: matching photos, the delivery area named, and that the business is closed."""
-    notes = [photo_hint(text, listed), kitchen.area_hint(text, areas), hours.closed_note(closed) if closed else ""]
+def _hint(
+    text: str, listed: list[tuple[str | None, list[str]]], closed: str | None, areas: list[dict],
+    menu: tuple[list[dict], dict[str, str]] = ([], {}), said: tuple[str, str] | None = None,
+) -> str:
+    """The per-message note for the model: matching photos, the menu items their words name (however spelled), the
+    delivery area named, delivery or pick up as they already said it, and that the business is closed."""
+    notes = [photo_hint(text, listed), kitchen.item_hint(text, *menu), kitchen.area_hint(text, areas),
+             kitchen.fulfilment_hint(said), hours.closed_note(closed) if closed else ""]
     return "\n\n".join(x for x in notes if x)
 
 
@@ -465,12 +490,15 @@ async def preview_reply(
     funnel = funnel or await funnels.for_tenant(db, tenant)
     closed = await funnels.closed_message(db, tenant, funnel, knowledge)
     areas = await delivery_areas(db, tenant.id)
+    menu = (await menu_catalog(db, tenant.id), await shop_spellings(db, tenant.id))
     listed = [(p.title, p.tags) for p in photos]
+    said = kitchen.fulfilment([t for who, t in history or [] if who == "customer"] + [message], areas)
     reply = await generate_reply(
         build_system_prompt(knowledge, photos=listed, funnel=funnels.prompt_block(funnel)),
-        history or [], message, _hint(message, listed, closed, areas),
+        history or [], message, _hint(message, listed, closed, areas, menu, said),
     )
     reply, collected = await funnels.finish_reply(db, tenant.id, funnel, reply, closed)
+    reply = kitchen.drop_fulfilment_question(reply) if said else reply
     reply, picks = split_photos(reply, len(photos))
     shown = [f"[would send photo: {photos[i].title or 'untitled'}]" for i in expand_picks(message, listed, picks)]
     if collected:

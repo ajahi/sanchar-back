@@ -32,5 +32,5 @@ class Tenant(UUIDPKMixin, TimestampMixin, Base):
     opening_hours: Mapped[Optional[dict]] = mapped_column(JSONB)
     # The owner's "we are closed" switch (Shop Info screen): {"message": str | None, "until": ISO time | None,
     # "set_at": ISO time, "set_by": user id}. On while set and before "until" (None = until reopened); applies to
-    # every funnel, before the opening hours. services/hours.closure_message reads it.
-    closure: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # every funnel, before the opening hours. services/hours.close_conditions_message reads it.
+    close_conditions: Mapped[Optional[dict]] = mapped_column(JSONB)

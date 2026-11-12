@@ -200,7 +200,7 @@ async def _chat(monkeypatch) -> None:
             # 7. the owner's closed switch, on a funnel with no hours check: the owner's message is what the customer
             # gets for an order, also when the model asks for order details anyway; other questions are answered
             funnel.checks = []
-            tenant.closure = {"message": "Aaja kehi karanle banda chau, bholi aaunus.", "until": None}
+            tenant.close_conditions = {"message": "Aaja kehi karanle banda chau, bholi aaunus.", "until": None}
             await db.flush()
             await say("2 chicken momo Kupondole ma pathaidinu", "Sure! Delivery ki pickup? Address ra phone number dinus.")
             assert "CLOSED" in seen["hint"] and "bholi aaunus" in seen["hint"]

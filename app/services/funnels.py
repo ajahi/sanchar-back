@@ -6,7 +6,7 @@ steps. Code only acts on the labels it writes:
   [summary: ...]  with the summary: replaced by the order total, worked out here from the website menu
   [<label>: ...]  once they confirm: saved as a funnel_submission, then the triggers run
 Its checks run before each reply: opening_hours keeps a restaurant from taking orders while it is closed. Before
-them, for every funnel, the owner's own "we are closed" switch (tenants.closure) with the owner's message.
+them, for every funnel, the owner's own "we are closed" switch (tenants.close_conditions) with the owner's message.
 While closed, a reply that asks for order details anyway (delivery or pickup? address? phone?) becomes the closed
 message: the model was told, but a note in the prompt is not a guarantee.
 
@@ -92,7 +92,7 @@ def prompt_block(funnel: Funnel) -> str:
 async def closed_message(db: AsyncSession, tenant: Tenant, funnel: Funnel, knowledge: str) -> str | None:
     """What to tell a customer who wants to order now (the business is closed), or None. The owner's closed
     switch first (every funnel, the owner's message), then the funnel's own checks."""
-    manual = hours.closure_message(tenant.closure)
+    manual = hours.close_conditions_message(tenant.close_conditions)
     if manual:
         return manual
     for check in funnel.checks:

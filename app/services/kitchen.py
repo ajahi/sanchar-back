@@ -181,6 +181,183 @@ def area_hint(text: str, locations: list[dict]) -> str:
     )
 
 
+# Delivery or pick up, as the customer already said it: "Expert ma 2nd floor ma 2 ota dry mix lyaidinu na" is a
+# delivery, "7 baje aaera lanchu" a pick up. The model asked "Delivery ki pickup?" anyway, twice in one real chat,
+# and the customer phoned the shop. Code reads it (fulfilment), tells the model (fulfilment_hint) and takes the
+# question out of a reply that still asks it (drop_fulfilment_question).
+# ponytail: word lists, English and Romanized Nepali; the latest message that says one wins (they changed their mind).
+_PICKUP_SAID = re.compile(
+    r"\bpick\s*-?\s*up\b|\btake\s*-?\s*away\b|\blina\s+(aau|au|aaun|aaunchu|auchu|aauchu|aaucha|aunchu)|"
+    r"\b(aaera|aayera|ayera|aera)\s+lan|\baafai\s+lin|\baafai\s+aau|\bparcel\s+lin",
+    re.IGNORECASE,
+)
+_DELIVERY_SAID = re.compile(
+    r"\bdeliver(y|ed)?\b|\bbring\b|\blyai?d[ie]n|\blyau(nu|nus|na)\b|\bpathai?d[ie]n|"
+    r"\bpathau(nu|nus|na)\b|\bghar\s+(samma|ma)\b|ल्याइदि|पठाइदि",
+    re.IGNORECASE,
+)
+
+
+def fulfilment(customer_texts: list[str], locations: list[dict]) -> tuple[str, str] | None:
+    """("delivery" | "pickup", the customer's words that said it) from their messages, oldest first; None if they
+    have not said. Naming one of our delivery areas counts as delivery."""
+    found = None
+    for text in customer_texts:
+        if _PICKUP_SAID.search(text):
+            found = ("pickup", text)
+        elif _DELIVERY_SAID.search(text) or ((loc := match_location(text, locations)) and loc["address"] != PICKUP):
+            found = ("delivery", text)
+    return found
+
+
+def fulfilment_hint(said: tuple[str, str] | None) -> str:
+    if said is None:
+        return ""
+    how, text = said
+    quote = text.strip().replace('"', "'")[:120]
+    if how == "pickup":
+        return (f'Note from the business, not the customer: they already said they will PICK UP ("{quote}"). Never '
+                "ask delivery or pick up, and don't ask for a delivery area or address: write \"Pick up\".")
+    return (f'Note from the business, not the customer: they already said they want DELIVERY ("{quote}"). Never ask '
+            "delivery or pick up. If they named a place, that is their address: don't ask for it again. Ask only "
+            "for what is still missing (the delivery area only if their place is not one of our areas).")
+
+
+_CHOICE = re.compile(
+    r"[^.!?\n]*\b(delivery\b[^.!?\n]*\bpick\s*-?\s*up|pick\s*-?\s*up\b[^.!?\n]*\bdelivery)\b[^.!?\n]*\?[ \t]*",
+    re.IGNORECASE,
+)
+_IF_PICKUP = re.compile(r"[ \t]*\b(if\s+(you\s+want\s+)?pick\s*-?\s*up|pick\s*-?\s*up\s+ho\s+bhane)\b[^.!?\n]*[.!?]?",
+                        re.IGNORECASE)
+_IF_DELIVERY = re.compile(r"\b(if\s+(it'?s\s+)?delivery|delivery\s+ho\s+bhane)\s*,?\s*", re.IGNORECASE)
+
+
+def drop_fulfilment_question(reply: str) -> str:
+    """A reply without "Delivery ki pickup?" and its "If pickup, ..." for a customer who already said which.
+    "If delivery, please tell ..." keeps its ask without the "If delivery, "."""
+    out = _IF_DELIVERY.sub("", _IF_PICKUP.sub(" ", _CHOICE.sub(" ", reply)))
+    if out == reply:
+        return reply
+    out = re.sub(r"[ \t]+\n", "\n", re.sub(r"[ \t]{2,}", " ", out))
+    out = re.sub(r"(^|[.!?][ \t]+|\n)([a-z])", lambda m: m.group(1) + m.group(2).upper(), out)  # sentence starts
+    return re.sub(r"\n{3,}", "\n\n", out).strip() or reply
+
+
+# Customers write menu words the way they say them: "sorma", "sworma", "shwarma" (Shawarma), "chaumin" (Chowmein),
+# "lafing" (Laphing). The model can't hear that (it sees other word pieces: it took "sorma" for shorba, soup), and in
+# a 300-item menu it names one match, not all of them. So code finds the items (item_hint) and the model only words
+# the reply. A word is matched by its consonants: vowels, y, w and h dropped, ph = f, a double letter once:
+# shawarma, sworma, suorma -> "srm". Spellings that misses (sandheko, kothe, hookah) the owner writes into Shop
+# Info after the name, in braces: "Chicken Shawarma {sorma, sworma}". Code reads them (spellings) and takes them
+# out of the text the model sees (strip_spellings), so the model never repeats them to a customer.
+# ponytail: consonant match on single words; a menu word of 3+ consonants only, so short ones (momo) need braces.
+_SPELLING = re.compile(r"[ \t]*\{([^{}\n]{1,200})\}")
+MAX_LISTED = 6  # more items than this for one word: name the menu's word, not every item
+# Chat words that sound like a menu word ("garnu" ~ green). Only checked for words that are not on the menu.
+_CHAT_WORDS = set(
+    "garnu garne garna garnus garera garchu gardinu gardinus gardiu painxa paincha paucha pauxa milcha milxa "
+    "chahiyo chainxa chaincha chahincha pathaunu pathaunus pathaidinu pathaidinus lyaidinu lyaidinus lyaidena "
+    "lyaunu dinus dinuhos sakincha sakinxa hunxa huncha bhayo bhaye bhanda bhannu bhannus kasto kasari kahile "
+    "tapai hajur malai hamro ahile bholi khulla banda dhanyabad namaste please thanks thank order price rate menu "
+    "delivery deliver pickup address location number phone available sasto mitho dherai thorai ramro sanga samma "
+    "lagi wala wata plate plates khana".split()
+)
+# Words that describe a dish rather than name it: on the menu, but "spicy kam garnus" is not asking for Spicy Tuna
+# Rice. A word written right is listed only when it is not one of these (sound matches are always dish words).
+_DESCRIBING = set(
+    "spicy cold hot iced fresh special classic extra plain simple crispy crunchy grilled fried boiled steam big small "
+    "double dbl sweet sour green healthy creamy cheesy mixed mix chilly masala hakka keema".split()
+)
+
+
+def sound(word: str) -> str:
+    """A word by its consonants: "shawarma", "sworma", "suorma" -> "srm"; "chaumin", "chowmein" -> "cmn"."""
+    w = re.sub(r"[^a-z]", "", word.lower()).replace("ph", "f").replace("h", "")
+    return re.sub(r"(.)\1+", r"\1", re.sub(r"[aeiouyw]", "", w))
+
+
+def spellings(text: str) -> dict[str, str]:
+    """The owner's spellings in Shop Info, {spelling: name}: "Chicken Shawarma {sorma, sworma} - Rs 350" ->
+    {"sorma": "Chicken Shawarma", "sworma": "Chicken Shawarma"}. The name is what stands before the braces on
+    that line, after the last ";" or ":"."""
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        for m in _SPELLING.finditer(line):
+            name = re.sub(r"rs\.?\s*[\d,]+", " ", re.split(r"[;:]", line[: m.start()])[-1], flags=re.IGNORECASE)
+            name = name.strip(" -,")
+            for alias in m.group(1).split(","):
+                if name and (a := _norm(alias)):
+                    out[a] = name
+    return out
+
+
+def strip_spellings(text: str) -> str:
+    """Shop Info as the model sees it: the {spellings} taken out."""
+    return _SPELLING.sub("", text)
+
+
+def _shown(p: dict) -> str:
+    cat = str(p.get("category") or "").strip()
+    return f"{p['name'].strip()} (Rs {p['price']}{', ' + cat if cat else ''})"
+
+
+def item_hint(text: str, catalog: list[dict], spelled: dict[str, str] | None = None) -> str:
+    """A note for the model naming, by the menu's own names, every item a word of the customer's message points
+    to: "sorma painxa?" -> Chicken Shawarma (Rs 350, Wrap) and Shawarma Chicken Rice (Rs 450, Rice). Another word
+    of theirs narrows it ("sorma rice" -> the rice). A word written right that is in 2-6 item names gets them
+    listed too (the model names one); in one item or in many, it gets nothing (the menu text is enough)."""
+    words = _norm(text).split()
+    spelled = spelled or {}
+    if not words or not (catalog or spelled):
+        return ""
+    names = [(p, _norm(p["name"]).split()) for p in catalog]
+    menu_words = {w for _, ns in names for w in ns}
+    by_sound: dict[str, set[str]] = {}
+    for w in menu_words:
+        if len(w) >= 4 and len(s := sound(w)) >= 3:
+            by_sound.setdefault(s, set()).add(w)
+    notes, listed = [], set()
+    for w in dict.fromkeys(words):
+        if w in spelled:
+            want = _norm(spelled[w]).split()
+            items = [p for p, ns in names if all(x in ns for x in want)]
+            label, how = spelled[w], "spelled"
+        elif w in menu_words and w.isalpha() and len(w) >= 3 and w not in _CHAT_WORDS | _DESCRIBING:
+            items, label, how = [p for p, ns in names if w in ns], w, "exact"
+        elif w not in menu_words and len(w) >= 4 and w not in _CHAT_WORDS and len(s := sound(w)) >= 3 and s in by_sound:
+            keys = by_sound[s]
+            items, label, how = [p for p, ns in names if keys & set(ns)], sorted(keys)[0], "sound"
+        else:
+            continue
+        # their other words that are in some of these names or categories narrow it down ("sorma rice", "sorma
+        # wrap": the wrap is "Chicken Shawarma" under Wrap; "chicken dry mix")
+        ns_of = {id(p): ns + _norm(str(p.get("category") or "")).split() for p, ns in names}
+        others = [x for x in words if x != w and any(x in ns_of[id(p)] for p in items)]
+        narrowed = [p for p in items if all(x in ns_of[id(p)] for x in others)]
+        items = [p for p in (narrowed or items) if p["_id"] not in listed]
+        if how == "exact" and not 2 <= len(items) <= MAX_LISTED:
+            continue
+        menu_word = next((t for p in items for t in re.findall(r"[\w:']+", p["name"]) if _norm(t) == label), label)
+        if not items:  # a spelling of something that is not on the website menu
+            notes.append(f"the customer's '{w}' means '{spelled.get(w, menu_word)}'.")
+        elif len(items) > MAX_LISTED:
+            notes.append(f"the customer's '{w}' is what our menu writes '{menu_word}' ({len(items)} items).")
+        else:
+            listed |= {p["_id"] for p in items}
+            what = "matches" if how != "exact" else "is in the name of"
+            notes.append(f"the customer's '{w}' {what} " + ("this menu item: " if len(items) == 1 else
+                         f"these {len(items)} menu items: ") + "; ".join(_shown(p) for p in items) + ".")
+        if len(notes) == 3:
+            break
+    if not notes:
+        return ""
+    return (
+        "Note from the business, not the customer: " + " ".join(notes) + " If they are asking about these, use "
+        "exactly these menu names, never the customer's spelling, and name EVERY item listed with its price; if "
+        "more than one is listed and their message doesn't say which, ask which one they want."
+    )
+
+
 def plan(order: dict, integ: OrderIntegration) -> dict:
     """The lines and area Sanchar would send for this order, before anyone edits them."""
     lines = []
