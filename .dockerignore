@@ -3,6 +3,7 @@
 *
 !app
 !scripts
+!funnels
 !alembic.ini
 !requirements.txt
 **/__pycache__

@@ -41,6 +41,12 @@ jobs:
           cd "$APP_DIR"
           docker compose run --rm --no-deps api alembic upgrade head
 
+      # funnels/*.md -> the live funnel versions (a changed file becomes a new version; a bad one stops the deploy).
+      - name: Make the funnel .md files live
+        run: |
+          cd "$APP_DIR"
+          docker compose run --rm --no-deps api python -m scripts.sync_funnels
+
       - name: Restart the api and worker containers
         run: |
           cd "$APP_DIR"

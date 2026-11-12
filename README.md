@@ -251,7 +251,7 @@ Migrations: `app/db/migrations/versions/0001 … 0011`.
 | DB / auth | `DATABASE_URL`, `JWT_SECRET`, `TOKEN_ENCRYPTION_KEY` (never rotate without a migration) |
 | Meta | `META_APP_SECRET`, `INSTAGRAM_APP_ID/SECRET/REDIRECT_URI/SCOPES`, `FACEBOOK_APP_ID/REDIRECT_URI`, `*_WEBHOOK_VERIFY_TOKEN`, `WABA_TOKEN`, `WABA_PHONE_NUMBER_ID`, `WHATSAPP_CONFIG_ID` |
 | AI | `GROQ_API_KEY`, `LLM_MODEL`, `VISION_MODEL`, `HUMAN_PAUSE_MINUTES` |
-| Storage | `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_PUBLIC_BASE_URL` (MinIO on the VPS, shared server; it still uses default credentials, so change them) |
+| Storage | `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_PUBLIC_BASE_URL` (MinIO on the VPS, shared server; it still uses default credentials, so change them). Two different addresses, see [Deploying](#deploying) |
 | Kitchen | `KITCHEN_HOSTS` (allowlist, default `admin.thecubeventure.com`) |
 | Mail | `MAIL_*` (email verification) |
 
@@ -283,7 +283,26 @@ history), repeated 4–8 times, counting correct behaviour.
   and runs `docker compose up -d --build api` (container `nepsocial-api`, port 8005, DB container `nepsocial-postgres`).
 - **Migrations are NOT run by the deploy.** After a push with a new migration:
   `docker exec nepsocial-api alembic upgrade head`. Forgetting this caused a "relation does not exist" crash once.
-- Image is slim (~364 MB): allowlist `.dockerignore`, pip removed in the image.
+- **Funnel `.md` files go live on deploy.** After the migrations, the deploy runs `python -m scripts.sync_funnels`.
+  Each `funnels/*.md` that differs from its live version is checked the way the super admin's Load .md and Save
+  check it, then saved as a new live version (older versions stay, for a rollback). A file that fails the check
+  stops the deploy. The repo is the source: a version saved in the super admin is replaced on the next deploy if
+  its file differs. To keep it, download its .md and commit it.
+- Image is slim (~364 MB): allowlist `.dockerignore` (`app`, `scripts`, `funnels`, …), pip removed in the image.
+- **MinIO (photo storage) has two addresses, and they are not interchangeable:**
+  - `S3_ENDPOINT=http://minio:9000` is where the backend **uploads**. It goes over the Docker network, container to container.
+  - `S3_PUBLIC_BASE_URL=https://minio.utsavupahar.com/sanchar` is the link **Meta fetches** photos from. It is public, behind Cloudflare.
+
+  Don't set `S3_ENDPOINT` to the public domain. Inside the containers that name resolves to `127.0.0.1`, so every
+  upload fails with `Connection refused` (`POST /shop-media` → 502, and the bot has no photos to send).
+- **The `minio` container (from the utsav compose project) must be on the `nepsocial` network**, or uploads fail
+  with `Failed to resolve 'minio'`:
+  ```sh
+  docker network connect nepsocial minio
+  docker exec nepsocial-api python -c "import urllib.request; print(urllib.request.urlopen('http://minio:9000/minio/health/live').status)"  # 200
+  ```
+  The connection is lost whenever utsav's compose recreates `minio`. To make it permanent, add `nepsocial` (as an
+  `external: true` network) to the `minio` service's `networks` in utsav's compose file.
 
 ---
 
