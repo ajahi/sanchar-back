@@ -9,6 +9,7 @@ from typing import Annotated
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -79,6 +80,22 @@ async def sync_now(tenant: CurrentTenant, db: Annotated[AsyncSession, Depends(ge
     await _sync(db, integ)
     await db.commit()
     return _out(integ)
+
+
+class QuoteIn(BaseModel):
+    items: str = Field(min_length=1, max_length=1000)  # as a customer or staff write it: "2 x Buff Jhol Momo, 1 coke"
+    address: str = Field("Pick up", max_length=300)  # "Pick up", or a delivery area and address
+
+
+@router.post("/quote")
+async def quote(body: QuoteIn, tenant: CurrentTenant, db: Annotated[AsyncSession, Depends(get_db)]) -> dict:
+    """What an order costs, from the synced menu and delivery areas (kitchen.quote_order): items with price and
+    amount, delivery charge, total, and the lines that matched nothing. The same sums the bot's order summary and
+    every sent order use."""
+    integ = await db.get(OrderIntegration, tenant.id)
+    if integ is None or not integ.catalog:
+        raise HTTPException(status_code=409, detail="Connect and sync your order system first: there is no menu to price from.")
+    return kitchen.quote_order({"items": body.items, "address": body.address}, integ)
 
 
 @router.get("/catalog", response_model=CatalogOut)

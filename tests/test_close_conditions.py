@@ -15,7 +15,7 @@ from app.models.tenant import Tenant
 from app.models.user import User
 from app.schemas.tenant import CloseConditionsIn
 from app.services import hours
-from app.services.funnels import asks_order_details
+from app.services.rules import asks_order_details
 from app.services.hours import NEPAL
 
 NOON = datetime(2026, 11, 12, 12, 0, tzinfo=NEPAL)

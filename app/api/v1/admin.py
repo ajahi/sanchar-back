@@ -6,7 +6,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import distinct, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,7 +19,7 @@ from app.models.knowledge import KnowledgeDocument
 from app.models.message import Message
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
-from app.services import funnels
+from app.services import funnel_md, funnels, rules
 from app.services.audit import record_audit
 from app.services.reply_pipeline import preview_reply
 
@@ -200,6 +200,8 @@ async def save_funnel(body: FunnelIn, admin: CurrentUser, db: Annotated[AsyncSes
         raise HTTPException(status_code=422, detail=f"Unknown trigger(s): {', '.join(sorted(unknown))}.")
     if unknown := {str(c.get("type")) for c in body.checks} - set(funnels.CHECKS):
         raise HTTPException(status_code=422, detail=f"Unknown check(s): {', '.join(sorted(unknown))}.")
+    if errs := _rule_problems(body.checks):
+        raise HTTPException(status_code=422, detail=" ".join(errs))
     keys = [f.key for f in body.fields]
     if len(set(keys)) != len(keys):
         raise HTTPException(status_code=422, detail="Two fields have the same key.")
@@ -217,6 +219,38 @@ async def save_funnel(body: FunnelIn, admin: CurrentUser, db: Annotated[AsyncSes
                        entity_type="funnel", entity_id=funnel.id, meta={"key": funnel.key, "version": funnel.version})
     await db.commit()
     return _funnel_out(funnel)
+
+
+def _rule_problems(checks: list[dict]) -> list[str]:
+    """Each behaviour rule checked, its examples run (services/rules.problems); at most 5 problems."""
+    return [e for c in checks if c.get("type") == "rule" for e in rules.problems(c)][:5]
+
+
+class FunnelFile(BaseModel):
+    markdown: str = Field(min_length=10, max_length=60_000)
+
+
+@router.post("/funnels/from-md")
+async def funnel_from_md(body: FunnelFile) -> dict:
+    """A funnel .md file (services/funnel_md.py) read into the editor, checked the way saving checks it, its rules'
+    examples run. Nothing is saved: the super admin saves it from the editor."""
+    try:
+        draft = funnel_md.from_md(body.markdown)
+        FunnelIn.model_validate(draft)
+    except funnel_md.FunnelFileError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except ValidationError as exc:
+        where = lambda e: ".".join(str(x) for x in e["loc"])  # noqa: E731
+        raise HTTPException(status_code=422, detail="; ".join(f"{where(e)}: {e['msg']}" for e in exc.errors()[:5]))
+    if errs := _rule_problems(draft.get("checks") or []):
+        raise HTTPException(status_code=422, detail=" ".join(errs))
+    return draft
+
+
+@router.post("/funnels/to-md")
+async def funnel_to_md(body: FunnelIn) -> dict:
+    """The .md file for a funnel (or the editor's draft), to download and keep with the code."""
+    return {"markdown": funnel_md.to_md({**body.model_dump(), "fields": [f.model_dump() for f in body.fields]})}
 
 
 @router.post("/funnels/{key}/activate/{version}")

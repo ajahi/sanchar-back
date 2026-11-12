@@ -198,8 +198,10 @@ async def _chat(monkeypatch) -> None:
             assert sent[-1] == "Buff Jhol Momo Rs 250." and len(hours_read) == 1  # read once, kept while Shop Info is unchanged
 
             # 7. the owner's closed switch, on a funnel with no hours check: the owner's message is what the customer
-            # gets for an order, also when the model asks for order details anyway; other questions are answered
-            funnel.checks = []
+            # gets for an order; with the funnel's shop_closed rule, also when the model asks for order details anyway;
+            # other questions are answered
+            funnel.checks = [{"type": "rule", "name": "No order questions while closed", "when": "shop_closed",
+                              "replace_reply_if_it_asks": ["order_details"]}]
             tenant.close_conditions = {"message": "Aaja kehi karanle banda chau, bholi aaunus.", "until": None}
             await db.flush()
             await say("2 chicken momo Kupondole ma pathaidinu", "Sure! Delivery ki pickup? Address ra phone number dinus.")

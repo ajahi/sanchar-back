@@ -7,8 +7,8 @@ steps. Code only acts on the labels it writes:
   [<label>: ...]  once they confirm: saved as a funnel_submission, then the triggers run
 Its checks run before each reply: opening_hours keeps a restaurant from taking orders while it is closed. Before
 them, for every funnel, the owner's own "we are closed" switch (tenants.close_conditions) with the owner's message.
-While closed, a reply that asks for order details anyway (delivery or pickup? address? phone?) becomes the closed
-message: the model was told, but a note in the prompt is not a guarantee.
+Its rules (checks of type "rule", services/rules.py) are its behaviour: what the bot must not ask again, what a
+reply asking it anyway loses, what to tell the model; they come from the funnel's .md file (services/funnel_md.py).
 
 A tenant gets the funnel super admin chose, else the one named by its business type, else DEFAULT, the built-in
 order steps (for_tenant).
@@ -27,7 +27,7 @@ from app.models.funnel import Funnel, FunnelSubmission
 from app.models.order_integration import OrderIntegration
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
-from app.services import hours, kitchen
+from app.services import hours, kitchen, rules
 from app.services.auto_reply import ORDER_FIELDS, ORDER_STEPS, funnel_block, split_label
 from app.services.leads import save_order
 from app.services.notifications import create_notification
@@ -38,34 +38,18 @@ log = logging.getLogger(__name__)
 # website_post: into the business's own order system (kitchen.py), when it has one set to auto-send.
 TRIGGERS = ("save_order", "notify", "website_post")
 # opening_hours: closed (hours read from Shop Info, services/hours.py) -> no orders; its "message" says when it opens.
-CHECKS = ("opening_hours",)
+# rule: a behaviour rule (services/rules.py).
+CHECKS = ("opening_hours", "rule")
 # The same fields confirmed again in the same chat within this window is the bot re-stating the order, not a
 # new one. ponytail: time-based; an identical second order inside 3 hours of the first is not sent again.
 REPEAT_WINDOW = timedelta(hours=3)
 
 DEFAULT = SimpleNamespace(  # a Funnel's shape, never stored
     key="general", version=0, name="General (orders and bookings)", label="order", steps=ORDER_STEPS,
-    fields=list(ORDER_FIELDS), triggers=["save_order", "website_post"], checks=[], active=True,
+    fields=list(ORDER_FIELDS), triggers=["save_order", "website_post"], checks=list(rules.DEFAULT_RULES), active=True,
 )
 
 _SUMMARY = re.compile(r"[ \t]*\[\s*summary\s*:[^\]]*\]", re.IGNORECASE)
-# A sentence of the reply asking the customer for an order detail: one of these words in a question, or with a
-# "give / send / tell" verb. Used only while closed.
-# ponytail: word lists, English and Romanized Nepali; Devanagari replies are not caught.
-_ORDER_WORD = re.compile(
-    r"delivery\s*(ki|or|wa|va)\s*pick|pick\s*-?\s*up|address|thegana|phone|number|\bnaam|\bname\b|kun area|which area"
-    r"|kati\s*(ota|wata|plate|piece)|how many",
-    re.IGNORECASE,
-)
-_ASK_VERB = re.compile(r"dinus|dinuhos|pathaunus|pathaidinus|bhannus|share|tell me|let me know|send", re.IGNORECASE)
-
-
-def asks_order_details(reply: str) -> bool:
-    """True when the reply asks the customer for something only an order needs."""
-    return any(
-        _ORDER_WORD.search(s) and ("?" in s or _ASK_VERB.search(s))
-        for s in re.split(r"(?<=[.!?\n])", reply)
-    )
 
 
 async def for_tenant(db: AsyncSession, tenant: Tenant) -> Funnel:
@@ -142,7 +126,7 @@ def order_summary(draft: dict, integ: OrderIntegration | None) -> str:
         if not problems:
             picks = [(x["product_id"], x["quantity"]) for x in p["lines"]]
             lines, loc = kitchen.resolve(integ, picks, p["location"] or draft["address"], allow_unlisted=True)
-            total = kitchen.build_body(draft, lines, loc, None)["totalAmount"]
+            total = kitchen.quote(lines, loc)["total"]
             out.append(f"Total: Rs {total} + delivery charge" if unlisted else f"Total: Rs {total}")
     out += ["", *(f"{label}: {draft[k]}" for k, label in (("name", "Naam"), ("phone", "Phone")) if draft.get(k))]
     if not pickup:
@@ -164,10 +148,10 @@ async def finish_reply(
     """The model's reply -> (text for the customer, the fields it collected or None). A complete summary label
     becomes the whole reply, written here (order_summary / plain_summary) so it reads the same every time; an
     incomplete one is just removed. The confirmed label is taken out.
-    closed: a check failed (closed_message): a summary, an order or a question for order details the model wrote
-    anyway becomes that message, and nothing is collected."""
+    closed: a check failed (closed_message): a summary or an order the model wrote anyway becomes that message, and
+    nothing is collected (a question for order details is the funnel's shop_closed rule: rules.finish)."""
     m = _SUMMARY.search(reply)
-    if closed and (m or split_label(reply, funnel.label, funnel.fields)[1] or asks_order_details(reply)):
+    if closed and (m or split_label(reply, funnel.label, funnel.fields)[1]):
         return closed, None
     if m:
         _, draft = split_label(m.group(0).strip(), "summary", funnel.fields)

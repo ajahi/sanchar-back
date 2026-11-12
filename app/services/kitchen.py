@@ -181,68 +181,6 @@ def area_hint(text: str, locations: list[dict]) -> str:
     )
 
 
-# Delivery or pick up, as the customer already said it: "Expert ma 2nd floor ma 2 ota dry mix lyaidinu na" is a
-# delivery, "7 baje aaera lanchu" a pick up. The model asked "Delivery ki pickup?" anyway, twice in one real chat,
-# and the customer phoned the shop. Code reads it (fulfilment), tells the model (fulfilment_hint) and takes the
-# question out of a reply that still asks it (drop_fulfilment_question).
-# ponytail: word lists, English and Romanized Nepali; the latest message that says one wins (they changed their mind).
-_PICKUP_SAID = re.compile(
-    r"\bpick\s*-?\s*up\b|\btake\s*-?\s*away\b|\blina\s+(aau|au|aaun|aaunchu|auchu|aauchu|aaucha|aunchu)|"
-    r"\b(aaera|aayera|ayera|aera)\s+lan|\baafai\s+lin|\baafai\s+aau|\bparcel\s+lin",
-    re.IGNORECASE,
-)
-_DELIVERY_SAID = re.compile(
-    r"\bdeliver(y|ed)?\b|\bbring\b|\blyai?d[ie]n|\blyau(nu|nus|na)\b|\bpathai?d[ie]n|"
-    r"\bpathau(nu|nus|na)\b|\bghar\s+(samma|ma)\b|ल्याइदि|पठाइदि",
-    re.IGNORECASE,
-)
-
-
-def fulfilment(customer_texts: list[str], locations: list[dict]) -> tuple[str, str] | None:
-    """("delivery" | "pickup", the customer's words that said it) from their messages, oldest first; None if they
-    have not said. Naming one of our delivery areas counts as delivery."""
-    found = None
-    for text in customer_texts:
-        if _PICKUP_SAID.search(text):
-            found = ("pickup", text)
-        elif _DELIVERY_SAID.search(text) or ((loc := match_location(text, locations)) and loc["address"] != PICKUP):
-            found = ("delivery", text)
-    return found
-
-
-def fulfilment_hint(said: tuple[str, str] | None) -> str:
-    if said is None:
-        return ""
-    how, text = said
-    quote = text.strip().replace('"', "'")[:120]
-    if how == "pickup":
-        return (f'Note from the business, not the customer: they already said they will PICK UP ("{quote}"). Never '
-                "ask delivery or pick up, and don't ask for a delivery area or address: write \"Pick up\".")
-    return (f'Note from the business, not the customer: they already said they want DELIVERY ("{quote}"). Never ask '
-            "delivery or pick up. If they named a place, that is their address: don't ask for it again. Ask only "
-            "for what is still missing (the delivery area only if their place is not one of our areas).")
-
-
-_CHOICE = re.compile(
-    r"[^.!?\n]*\b(delivery\b[^.!?\n]*\bpick\s*-?\s*up|pick\s*-?\s*up\b[^.!?\n]*\bdelivery)\b[^.!?\n]*\?[ \t]*",
-    re.IGNORECASE,
-)
-_IF_PICKUP = re.compile(r"[ \t]*\b(if\s+(you\s+want\s+)?pick\s*-?\s*up|pick\s*-?\s*up\s+ho\s+bhane)\b[^.!?\n]*[.!?]?",
-                        re.IGNORECASE)
-_IF_DELIVERY = re.compile(r"\b(if\s+(it'?s\s+)?delivery|delivery\s+ho\s+bhane)\s*,?\s*", re.IGNORECASE)
-
-
-def drop_fulfilment_question(reply: str) -> str:
-    """A reply without "Delivery ki pickup?" and its "If pickup, ..." for a customer who already said which.
-    "If delivery, please tell ..." keeps its ask without the "If delivery, "."""
-    out = _IF_DELIVERY.sub("", _IF_PICKUP.sub(" ", _CHOICE.sub(" ", reply)))
-    if out == reply:
-        return reply
-    out = re.sub(r"[ \t]+\n", "\n", re.sub(r"[ \t]{2,}", " ", out))
-    out = re.sub(r"(^|[.!?][ \t]+|\n)([a-z])", lambda m: m.group(1) + m.group(2).upper(), out)  # sentence starts
-    return re.sub(r"\n{3,}", "\n\n", out).strip() or reply
-
-
 # Customers write menu words the way they say them: "sorma", "sworma", "shwarma" (Shawarma), "chaumin" (Chowmein),
 # "lafing" (Laphing). The model can't hear that (it sees other word pieces: it took "sorma" for shorba, soup), and in
 # a 300-item menu it names one match, not all of them. So code finds the items (item_hint) and the model only words
@@ -301,11 +239,17 @@ def _shown(p: dict) -> str:
     return f"{p['name'].strip()} (Rs {p['price']}{', ' + cat if cat else ''})"
 
 
-def item_hint(text: str, catalog: list[dict], spelled: dict[str, str] | None = None) -> str:
+def item_hint(
+    text: str, catalog: list[dict], spelled: dict[str, str] | None = None,
+    describing: set[str] | None = None, chat: set[str] | None = None,
+) -> str:
     """A note for the model naming, by the menu's own names, every item a word of the customer's message points
     to: "sorma painxa?" -> Chicken Shawarma (Rs 350, Wrap) and Shawarma Chicken Rice (Rs 450, Rice). Another word
     of theirs narrows it ("sorma rice" -> the rice). A word written right that is in 2-6 item names gets them
-    listed too (the model names one); in one item or in many, it gets nothing (the menu text is enough)."""
+    listed too (the model names one); in one item or in many, it gets nothing (the menu text is enough).
+    describing / chat: a funnel's own word lists (its menu_item_named rule), else _DESCRIBING / _CHAT_WORDS."""
+    describing = _DESCRIBING if describing is None else describing
+    chat = _CHAT_WORDS if chat is None else chat
     words = _norm(text).split()
     spelled = spelled or {}
     if not words or not (catalog or spelled):
@@ -322,9 +266,9 @@ def item_hint(text: str, catalog: list[dict], spelled: dict[str, str] | None = N
             want = _norm(spelled[w]).split()
             items = [p for p, ns in names if all(x in ns for x in want)]
             label, how = spelled[w], "spelled"
-        elif w in menu_words and w.isalpha() and len(w) >= 3 and w not in _CHAT_WORDS | _DESCRIBING:
+        elif w in menu_words and w.isalpha() and len(w) >= 3 and w not in chat | describing:
             items, label, how = [p for p, ns in names if w in ns], w, "exact"
-        elif w not in menu_words and len(w) >= 4 and w not in _CHAT_WORDS and len(s := sound(w)) >= 3 and s in by_sound:
+        elif w not in menu_words and len(w) >= 4 and w not in chat and len(s := sound(w)) >= 3 and s in by_sound:
             keys = by_sound[s]
             items, label, how = [p for p, ns in names if keys & set(ns)], sorted(keys)[0], "sound"
         else:
@@ -368,6 +312,39 @@ def plan(order: dict, integ: OrderIntegration) -> dict:
     return {"lines": lines, "location": loc["address"] if loc else None}
 
 
+def quote(lines: list[tuple[dict, int]], location: dict | None) -> dict:
+    """The price of an order, the way the website charges it: each item's price x quantity, the delivery charge of
+    its area (0 for pick up, and for a place not in our areas: staff confirm that charge on a call), the total.
+    Every amount the customer is shown and every order sent anywhere is worked out here: the model never adds up.
+    location: {"address", "rate"} (match_location / resolve), None or PICKUP for pick up."""
+    items = [{"menu_id": p["_id"], "name": p["name"].strip(), "quantity": q, "price": int(p["price"]),
+              "amount": int(p["price"]) * q} for p, q in lines]
+    pickup = location is None or location["address"] == PICKUP
+    charge = 0 if pickup else int(location.get("rate") or 0)
+    subtotal = sum(i["amount"] for i in items)
+    return {
+        "items": items,
+        "subtotal": subtotal,
+        "delivery": {"type": "pickup" if pickup else "delivery", "area": None if pickup else location["address"],
+                     "charge": charge, "listed": pickup or not location.get("unlisted")},
+        "total": subtotal + charge,
+    }
+
+
+def quote_order(order: dict, integ: OrderIntegration) -> dict:
+    """quote() for an order as the customer wrote it ({"items": "2 x Buff Jhol Momo, 1 coke", "address": ...}): each
+    line matched to the menu (plan); a line that matches nothing is in "unmatched" and not in the total."""
+    p, by_id = plan(order, integ), {x["_id"]: x for x in integ.catalog}
+    matched = [(by_id[line["product_id"]], line["quantity"]) for line in p["lines"] if line["product_id"]]
+    if p["location"] == PICKUP:
+        loc = None
+    elif p["location"] is not None:
+        loc = next(a for a in integ.locations if a["address"] == p["location"])
+    else:
+        loc = {"address": (order.get("address") or "").strip()[:200], "rate": 0, "unlisted": True}
+    return {**quote(matched, loc), "unmatched": [line["text"] for line in p["lines"] if not line["product_id"]]}
+
+
 def build_body(order: dict, lines: list[tuple[dict, int]], location: dict, email: str | None) -> dict:
     """What the website's guest checkout posts (its Billing page), for these menu items and delivery area."""
     pickup = location["address"] == PICKUP
@@ -387,7 +364,7 @@ def build_body(order: dict, lines: list[tuple[dict, int]], location: dict, email
                  for p, q in lines],
         "product": [p["_id"] for p, _ in lines],
         "deliveryOption": PICKUP if pickup else location["address"],
-        "totalAmount": sum(int(p["price"]) * q for p, q in lines) + charge,
+        "totalAmount": quote(lines, location)["total"],
         "deliveryCharge": charge,
     }
 

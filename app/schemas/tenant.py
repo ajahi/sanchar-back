@@ -44,3 +44,15 @@ class CloseConditionsOut(BaseModel):
     custom_message: Optional[str] = None  # the owner's own message, kept after reopening to reuse next time
     until: Optional[datetime] = None  # None while closed = until reopened
     set_at: Optional[datetime] = None
+
+
+class JsonPostIn(BaseModel):
+    """Where confirmed orders are also sent as JSON (services/json_post.py)."""
+    url: Optional[str] = Field(None, max_length=500)  # https://your-api.example.com/orders
+    enabled: bool = False
+
+
+class JsonPostOut(BaseModel):
+    url: Optional[str] = None
+    enabled: bool = False
+    secret: Optional[str] = None  # checks the X-Sanchar-Signature header on your side

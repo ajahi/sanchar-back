@@ -34,3 +34,6 @@ class Tenant(UUIDPKMixin, TimestampMixin, Base):
     # "set_at": ISO time, "set_by": user id}. On while set and before "until" (None = until reopened); applies to
     # every funnel, before the opening hours. services/hours.close_conditions_message reads it.
     close_conditions: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # Where confirmed orders are also sent as JSON, set by the business: {"url": "https://...", "secret": ...,
+    # "enabled": bool} (services/json_post.py). Separate from the website checkout post (order_integrations).
+    json_post: Mapped[Optional[dict]] = mapped_column(JSONB)
