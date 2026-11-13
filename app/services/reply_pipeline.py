@@ -48,7 +48,7 @@ from app.services.notifications import create_notification
 
 log = logging.getLogger(__name__)
 
-HISTORY = 6  # previous messages given to the model
+HISTORY = 20  # previous messages given to the model
 MAX_PROMPT_PHOTOS = 40  # shop photos listed to the model (~20 tokens each)
 PHOTO_REASON = "customer_sent_image"
 PHOTO_HOLDING_REPLY = (
