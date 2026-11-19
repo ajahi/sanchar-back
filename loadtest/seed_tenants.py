@@ -8,6 +8,7 @@ Run it against a throwaway database (override DATABASE_URL), not your dev data.
 """
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -31,7 +32,7 @@ async def seed(n: int) -> None:
             ids.append(ig_id)
             if (await db.execute(select(Tenant.id).where(Tenant.name == name))).first():
                 continue
-            t = Tenant(name=name, business_type="loadtest", ai_auto_reply=True)
+            t = Tenant(name=name, business_type="loadtest", ai_auto_reply=os.environ.get("LT_AI", "1") != "0")  # LT_AI=0: ingest-only runs
             db.add(t)
             await db.flush()
             db.add_all(

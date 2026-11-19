@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 venv/
 env/
+.env-server
 .env
 .env.local
 *.log
@@ -13,6 +14,10 @@ env/
 .DS_Store
 *.swp
 postgres_data/
-
+out
+*.tar.gz
 # codegraph index (local, rebuildable)
 .codegraph/
+
+# load-test raw samples (cpu.txt alone is 10MB+); the numbers worth keeping go in docs/load-test-report.md
+loadtest/out/

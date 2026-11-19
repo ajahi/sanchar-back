@@ -38,7 +38,7 @@ def test_subscribe_to_messages(monkeypatch) -> None:
     )
     asyncio.run(instagram.subscribe_to_messages("TOK"))
     (req,) = seen
-    assert req.method == "POST" and req.url.path == "/v23.0/me/subscribed_apps"
+    assert req.method == "POST" and req.url.path == f"/{instagram.API_VERSION}/me/subscribed_apps"
     assert req.url.params["subscribed_fields"] == "messages"
     assert req.headers["authorization"] == "Bearer TOK" and "TOK" not in str(req.url)
 

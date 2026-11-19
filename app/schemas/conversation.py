@@ -17,6 +17,8 @@ class ConversationOut(BaseModel):
     customer_name: Optional[str] = None
     customer_username: Optional[str] = None
     lead_phone: Optional[str] = None  # the number the customer gave in chat (a sales lead exists)
+    lead_order: Optional[dict] = None  # {name, phone, address, items}: the order the bot collected, if any
+    lead_status: Optional[str] = None  # new | confirmed | cancelled
     campaign_name: Optional[str] = None  # the campaign their ad is mapped to
     ad_title: Optional[str] = None  # the ad / ref they came from, mapped or not
     ad_kind: Optional[str] = None  # "ad" or "ref": how they reached us

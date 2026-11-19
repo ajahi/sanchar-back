@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, text
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import ARRAY, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPKMixin
@@ -30,6 +30,8 @@ class ShopMedia(UUIDPKMixin, TimestampMixin, Base):
     media_type: Mapped[str] = mapped_column(String(20), server_default="IMAGE", nullable=False)
 
     title: Mapped[Optional[str]] = mapped_column(String(255))
+    # Lowercase words the admin confirmed (product type, colour, finish, brand); the vision model suggests them.
+    tags: Mapped[list[str]] = mapped_column(ARRAY(String(30)), default=list, server_default="{}", nullable=False)
     caption: Mapped[Optional[str]] = mapped_column(Text)
     permalink: Mapped[Optional[str]] = mapped_column(Text)
     posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))

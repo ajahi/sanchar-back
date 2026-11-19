@@ -12,6 +12,7 @@ Incoming traffic is tracked two ways (kept simple): the source/referrer uri is s
 social_accounts.metadata, and every attempt is logged to audit_logs (uri, ip, user-agent).
 """
 import logging
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
@@ -35,7 +36,7 @@ from app.core.security import (
     encrypt_token,
     set_session_cookie,
 )
-from app.core.tenant import CurrentTenant, CurrentUser
+from app.core.tenant import CurrentTenant, CurrentUser, require_role
 from app.db.session import async_session_factory, get_db
 from app.models.role import Role
 from app.models.social_account import SocialAccount
@@ -47,11 +48,13 @@ from app.schemas.social_account import (
     InstagramProfileOut,
     WhatsAppAccountOut,
     WhatsAppLinkIn,
+    WhatsAppSignupIn,
 )
 from app.services.audit import record_audit
 from app.api.v1.webhooks import backfill_recent_conversations
 from app.services.meta import facebook, instagram, whatsapp
 from app.services.rbac import get_roles_by_names
+from app.services import reply_queue
 
 router = APIRouter(prefix="/social-accounts", tags=["social-accounts"])
 
@@ -341,20 +344,6 @@ async def link_whatsapp(
             detail=f"Phone number ID {body.phone_number_id} is not on WhatsApp account {body.waba_id}.",
         )
 
-    account = (
-        await db.execute(
-            select(SocialAccount).where(
-                SocialAccount.platform == "whatsapp",
-                SocialAccount.external_account_id == body.phone_number_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if account is not None and account.tenant_id != tenant.id:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This WhatsApp number is already linked to another workspace.",
-        )
-
     try:
         await whatsapp.subscribe_app(token, body.waba_id)
     except httpx.HTTPError as exc:
@@ -365,38 +354,137 @@ async def link_whatsapp(
             detail="Couldn't subscribe the account to Sanchar's webhooks; try again.",
         )
 
+    account = await _save_whatsapp(db, tenant.id, user.id, token, body.waba_id, number)
     if account is None:
-        account = SocialAccount(
-            tenant_id=tenant.id, platform="whatsapp", external_account_id=body.phone_number_id
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This WhatsApp number is already linked to another workspace.",
         )
+    await db.commit()
+    await db.refresh(account)
+    return _whatsapp_out(account, number)
+
+
+async def _save_whatsapp(
+    db: AsyncSession, tenant_id, actor_id, token: str, waba_id: str, number: dict
+) -> Optional[SocialAccount]:
+    """Store one number of `waba_id` for this tenant (with the token that reaches it) and audit it.
+    None if another workspace already has it: a linked number is never moved."""
+    account = (
+        await db.execute(
+            select(SocialAccount).where(
+                SocialAccount.platform == "whatsapp", SocialAccount.external_account_id == number["id"]
+            )
+        )
+    ).scalar_one_or_none()
+    if account is not None and account.tenant_id != tenant_id:
+        return None
+    if account is None:
+        account = SocialAccount(tenant_id=tenant_id, platform="whatsapp", external_account_id=number["id"])
         db.add(account)
     account.access_token_encrypted = encrypt_token(token)
     account.account_name = number.get("verified_name") or number.get("display_phone_number")
     account.meta = {
         **(account.meta or {}),
-        "waba_id": body.waba_id,
+        "waba_id": waba_id,
         "display_phone_number": number.get("display_phone_number"),
     }
     await db.flush()
     await record_audit(
         db,
-        tenant_id=tenant.id,
-        actor_id=user.id,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
         action="whatsapp_account_connected",
         entity_type="social_account",
         entity_id=account.id,
-        meta={"phone_number_id": body.phone_number_id, "waba_id": body.waba_id},
+        meta={"phone_number_id": number["id"], "waba_id": waba_id},
     )
-    await db.commit()
-    await db.refresh(account)
+    return account
+
+
+def _whatsapp_out(account: SocialAccount, number: dict) -> WhatsAppAccountOut:
     return WhatsAppAccountOut(
         phone_number_id=account.external_account_id,
         display_phone_number=number.get("display_phone_number"),
         verified_name=number.get("verified_name"),
-        waba_id=body.waba_id,
+        status=number.get("status"),
+        waba_id=(account.meta or {}).get("waba_id"),
         connected_at=account.created_at,
         live=True,
     )
+
+
+@router.get("/whatsapp/signup-config")
+async def whatsapp_signup_config(tenant: CurrentTenant) -> dict:
+    """What the Connect WhatsApp button needs to open Meta's Embedded Signup popup."""
+    if not (settings.whatsapp_config_id and settings.facebook_app_id and settings.meta_app_secret):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="WhatsApp sign-up is not configured (WHATSAPP_CONFIG_ID / FACEBOOK_APP_ID / META_APP_SECRET).",
+        )
+    return {
+        "app_id": settings.facebook_app_id,
+        "config_id": settings.whatsapp_config_id,
+        "api_version": instagram.API_VERSION,
+    }
+
+
+@router.post(
+    "/whatsapp/signup",
+    response_model=list[WhatsAppAccountOut],
+    dependencies=[Depends(require_role("owner", "admin"))],
+)
+async def whatsapp_signup(
+    body: WhatsAppSignupIn,
+    tenant: CurrentTenant,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[WhatsAppAccountOut]:
+    """Connect WhatsApp button: Meta's Embedded Signup popup gives the browser a one-time code. It becomes
+    the business's own token, and every number on the WhatsApp accounts they granted is linked to this
+    tenant (link_whatsapp's steps, once per number), like Facebook Pages in facebook_callback."""
+    log = logging.getLogger(__name__)
+    try:
+        token = await facebook.exchange_popup_code(body.code)
+        wabas = await whatsapp.fetch_granted_wabas(token)
+    except (httpx.HTTPError, KeyError) as exc:
+        detail = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
+        log.error("whatsapp signup: code exchange failed: %r %s", exc, detail)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="Meta didn't accept the sign-up. Click Connect WhatsApp again."
+        )
+
+    out = []
+    for waba_id in wabas:
+        try:
+            numbers = await whatsapp.fetch_waba_phone_numbers(token, waba_id)
+            await whatsapp.subscribe_app(token, waba_id)
+        except httpx.HTTPError as exc:
+            detail = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
+            log.error("whatsapp signup: account %s skipped: %r %s", waba_id, exc, detail)
+            continue
+        for number in numbers:
+            account = await _save_whatsapp(db, tenant.id, user.id, token, waba_id, number)
+            if account is None:
+                log.warning("whatsapp number %s already linked to another tenant; skipped", number["id"])
+                continue
+            if number.get("status") != "CONNECTED":  # new to Cloud API: switch it on (the PIN is kept for re-registering)
+                pin = f"{secrets.randbelow(10**6):06d}"
+                try:
+                    await whatsapp.register_number(token, number["id"], pin)
+                    account.meta = {**account.meta, "pin_encrypted": encrypt_token(pin)}
+                except httpx.HTTPError as exc:  # e.g. the business already set its own PIN; Channels shows the status
+                    detail = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
+                    log.warning("whatsapp number %s not registered: %r %s", number["id"], exc, detail)
+            out.append((account, number))
+    await db.commit()
+    if not out:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No WhatsApp number could be linked. Pick a WhatsApp account with a phone number in the "
+            "sign-up window, or check it isn't connected to another Sanchar workspace.",
+        )
+    return [_whatsapp_out(account, number) for account, number in out]
 
 
 @router.get("/facebook", response_model=list[FacebookPageOut])
@@ -409,7 +497,11 @@ async def facebook_pages(
     accounts = (
         await db.execute(
             select(SocialAccount)
-            .where(SocialAccount.tenant_id == tenant.id, SocialAccount.platform == "facebook")
+            .where(
+                SocialAccount.tenant_id == tenant.id,
+                SocialAccount.platform == "facebook",
+                SocialAccount.access_token_encrypted.isnot(None),  # no token = disconnected
+            )
             .order_by(SocialAccount.created_at)
         )
     ).scalars()
@@ -479,6 +571,67 @@ async def _audit_facebook(db: AsyncSession, tenant_id, actor_id, account_id, pag
     )
 
 
+async def _page_row(db: AsyncSession, page_id: str, tenant_id) -> Optional[SocialAccount]:
+    """This Page's row for (re)linking to `tenant_id`, None if it was never linked. Reusing the row keeps
+    the Page's old chats attached. A Page another workspace has disconnected is released to this one (its
+    chats there stay, read-only); one still connected elsewhere raises PermissionError."""
+    account = (
+        await db.execute(
+            select(SocialAccount).where(
+                SocialAccount.platform == "facebook", SocialAccount.external_account_id == page_id
+            )
+        )
+    ).scalar_one_or_none()
+    if account is None or account.tenant_id == tenant_id:
+        return account
+    if account.access_token_encrypted:
+        raise PermissionError(page_id)
+    await db.delete(account)
+    await db.flush()
+    return None
+
+
+@router.delete(
+    "/facebook/{page_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_role("owner", "admin"))],
+)
+async def unlink_facebook(
+    page_id: str, tenant: CurrentTenant, user: CurrentUser, db: Annotated[AsyncSession, Depends(get_db)]
+) -> None:
+    """Channels → Disconnect: Meta stops sending this Page's messages and its token is dropped. The row
+    and its chats stay (read-only), so connecting the same Page again brings its history back."""
+    account = (
+        await db.execute(
+            select(SocialAccount).where(
+                SocialAccount.tenant_id == tenant.id,
+                SocialAccount.platform == "facebook",
+                SocialAccount.external_account_id == page_id,
+                SocialAccount.access_token_encrypted.isnot(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if account is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This Page is not connected.")
+    try:
+        await facebook.unsubscribe_page(decrypt_token(account.access_token_encrypted), page_id)
+    except httpx.HTTPError as exc:  # e.g. token already revoked; the webhook drops events for a tokenless Page anyway
+        body = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
+        logging.getLogger(__name__).warning("facebook unsubscribe failed for %s: %r %s", page_id, exc, body)
+    account.access_token_encrypted = None
+    account.status = "disconnected"
+    await record_audit(
+        db,
+        tenant_id=tenant.id,
+        actor_id=user.id,
+        action="facebook_account_disconnected",
+        entity_type="social_account",
+        entity_id=account.id,
+        meta={"page_id": page_id},
+    )
+    await db.commit()
+
+
 @router.get("/facebook/login")
 async def facebook_login(request: Request) -> RedirectResponse:
     """Connect Facebook button: send the logged-in admin to Facebook's consent screen, where they
@@ -517,6 +670,8 @@ async def facebook_callback(
         return _redirect_to_frontend(fb_error="invalid_state")
     user = await db.get(User, user_id) if user_id else None
     if user is None or user.status != "active" or user.tenant_id is None:
+        log.warning("facebook connect refused for user %s: %s", user_id,
+                    "no such user" if user is None else f"status {user.status}, workspace {user.tenant_id}")
         return _redirect_to_frontend(fb_error="invalid_session")
 
     try:
@@ -525,20 +680,20 @@ async def facebook_callback(
         body = exc.response.text[:300] if isinstance(exc, httpx.HTTPStatusError) else ""
         log.error("facebook token exchange failed: %r %s", exc, body)
         return _redirect_to_frontend(fb_error="token_exchange_failed")
+    # Empty: no Page was ticked in the popup, or the Pages are reached only through a Business portfolio
+    # (that needs business_management, which we don't ask for)
+    log.info("facebook connect for user %s (workspace %s): Facebook granted %d page(s): %s", user.id,
+             user.tenant_id, len(pages), [(p.get("id"), p.get("name"), bool(p.get("access_token"))) for p in pages])
 
-    linked = 0
+    linked = []
     for page in pages:
         page_id, token = page.get("id"), page.get("access_token")
         if not page_id or not token:
+            log.warning("facebook page %s skipped: no page token (the person has no full control of it)", page_id)
             continue
-        account = (
-            await db.execute(
-                select(SocialAccount).where(
-                    SocialAccount.platform == "facebook", SocialAccount.external_account_id == page_id
-                )
-            )
-        ).scalar_one_or_none()
-        if account is not None and account.tenant_id != user.tenant_id:
+        try:
+            account = await _page_row(db, page_id, user.tenant_id)
+        except PermissionError:
             log.warning("facebook page %s already linked to another tenant; skipped", page_id)
             continue
         try:
@@ -555,15 +710,16 @@ async def facebook_callback(
         if account is None:
             account = SocialAccount(tenant_id=user.tenant_id, platform="facebook", external_account_id=page_id)
             db.add(account)
-        account.access_token_encrypted = encrypt_token(token)
+        account.access_token_encrypted, account.status = encrypt_token(token), "active"
         account.account_name = page.get("name")
         account.meta = {**(account.meta or {}), "linked_instagram_id": ig_id}
         await db.flush()
         await _audit_facebook(db, user.tenant_id, user.id, account.id, page_id)
-        background_tasks.add_task(_backfill, account.id, token)
-        linked += 1
-    await db.commit()
-    return _redirect_to_frontend(**({"fb_connected": str(linked)} if linked else {"fb_error": "no_pages_linked"}))
+        linked.append(account.id)
+    await db.commit()  # before the backfill: on the worker it can start at once, and reads the stored token
+    for account_id in linked:
+        await reply_queue.run_later(background_tasks, _backfill, account_id=account_id)
+    return _redirect_to_frontend(**({"fb_connected": str(len(linked))} if linked else {"fb_error": "no_pages_linked"}))
 
 
 @router.post("/facebook", response_model=FacebookPageOut, status_code=status.HTTP_201_CREATED)
@@ -597,15 +753,9 @@ async def link_facebook(
             detail=f"That token is not a Page access token for Page {body.page_id}.",
         )
 
-    account = (
-        await db.execute(
-            select(SocialAccount).where(
-                SocialAccount.platform == "facebook",
-                SocialAccount.external_account_id == body.page_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if account is not None and account.tenant_id != tenant.id:
+    try:
+        account = await _page_row(db, body.page_id, tenant.id)
+    except PermissionError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This Facebook Page is already linked to another workspace.",
@@ -632,14 +782,14 @@ async def link_facebook(
     if account is None:
         account = SocialAccount(tenant_id=tenant.id, platform="facebook", external_account_id=body.page_id)
         db.add(account)
-    account.access_token_encrypted = encrypt_token(token)
+    account.access_token_encrypted, account.status = encrypt_token(token), "active"
     account.account_name = page.get("name")
     account.meta = {**(account.meta or {}), "linked_instagram_id": ig_id}
     await db.flush()
     await _audit_facebook(db, tenant.id, user.id, account.id, body.page_id)
     await db.commit()
     await db.refresh(account)
-    background_tasks.add_task(_backfill, account.id, token)
+    await reply_queue.run_later(background_tasks, _backfill, account_id=account.id)
     return FacebookPageOut(
         page_id=account.external_account_id,
         name=account.account_name,
@@ -652,27 +802,31 @@ async def link_facebook(
     )
 
 
-async def _backfill(account_id: uuid.UUID, token: str) -> None:
-    """Seed the inbox from Graph. Best-effort; own DB session since the request's is closed."""
+async def _backfill(account_id: uuid.UUID) -> None:
+    """Seed the inbox from Graph. Best-effort (queue task); own DB session since the request's is closed."""
     try:
         async with async_session_factory() as db:
             account = await db.get(SocialAccount, account_id)
-            if account is not None:
-                await backfill_recent_conversations(db, account, token)
+            if account is not None and account.access_token_encrypted:
+                await backfill_recent_conversations(db, account, decrypt_token(account.access_token_encrypted))
                 await db.commit()
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).exception("conversation backfill failed for account %s", account_id)
 
 
-async def _after_login(account_id: uuid.UUID, token: str) -> None:
-    """Runs after the redirect is sent: webhook subscription, then inbox seed. Each step is
-    best-effort and independent."""
+async def _after_login(account_id: uuid.UUID) -> None:
+    """Runs after the redirect is sent (queue task): webhook subscription, then inbox seed. Each step is
+    best-effort and independent. Reads the token the login stored, so none sits in the queue."""
+    async with async_session_factory() as db:
+        encrypted = await db.scalar(select(SocialAccount.access_token_encrypted).where(SocialAccount.id == account_id))
+    if not encrypted:  # disconnected since
+        return
     try:
-        await instagram.subscribe_to_messages(token)
+        await instagram.subscribe_to_messages(decrypt_token(encrypted))
     except httpx.HTTPError as exc:
         body = exc.response.text if isinstance(exc, httpx.HTTPStatusError) else ""
         logging.getLogger(__name__).error("instagram webhook subscription failed: %r %s", exc, body)
-    await _backfill(account_id, token)
+    await _backfill(account_id)
 
 
 # Same look as the frontend's Loader. The browser keeps this page painted while /finish works.
@@ -773,7 +927,7 @@ async def instagram_finish(
 
     # After the redirect is sent: subscribe the account to DM webhooks (without it, new DMs never
     # arrive), then seed the inbox (Graph's conversations call takes ~5s; the 5s poll picks it up).
-    background_tasks.add_task(_after_login, account.id, long_lived["access_token"])
+    await reply_queue.run_later(background_tasks, _after_login, account_id=account.id)
 
     # Mint our own session and hand it to the dashboard via an httpOnly cookie.
     token = create_access_token(

@@ -7,6 +7,7 @@ from typing import Annotated
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import exists, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decrypt_token
@@ -25,6 +26,7 @@ from app.api.v1.webhooks import SYNC_LOCK_MINUTES, run_history_sync
 from app.schemas.conversation import ConversationOut, MessageOut, ReplyIn
 from app.schemas.shop_media import SendMediaIn
 from app.services.meta import CHANNELS
+from app.services import reply_queue
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -66,7 +68,7 @@ async def list_conversations(
     rows = await db.execute(
         select(
             Conversation, Customer, needs_attention.label("needs_attention"), SalesLead.phone,
-            Campaign.name, func.coalesce(CampaignLink.ad_title, CampaignLink.external_id),
+            SalesLead.meta["order"], SalesLead.status, Campaign.name, func.coalesce(CampaignLink.ad_title, CampaignLink.external_id),
             CampaignLink.kind, CampaignLink.external_id,
         )
         .join(Customer, Customer.id == Conversation.customer_id)
@@ -88,12 +90,15 @@ async def list_conversations(
             customer_name=cu.name,
             customer_username=cu.external_username,
             lead_phone=lead_phone,
+            lead_order=lead_order,
+            lead_status=lead_status,
             campaign_name=campaign_name,
             ad_title=ad_title,
             ad_kind=ad_kind,
             ad_code=ad_code,
         )
-        for c, cu, attention, lead_phone, campaign_name, ad_title, ad_kind, ad_code in rows.all()
+        for c, cu, attention, lead_phone, lead_order, lead_status, campaign_name, ad_title, ad_kind, ad_code
+        in rows.all()
     ]
 
 
@@ -114,17 +119,18 @@ async def sync_history(
         )
     ).scalars().all()
     now = datetime.now(timezone.utc)
-    started = running = 0
+    started, running = [], 0
     for acc in accounts:
         since = (acc.meta or {}).get("history_syncing_at")
         if since and now - datetime.fromisoformat(since) < timedelta(minutes=SYNC_LOCK_MINUTES):
             running += 1
             continue
         acc.meta = {**(acc.meta or {}), "history_syncing_at": now.isoformat()}
-        bg.add_task(run_history_sync, acc.id)
-        started += 1
-    await db.commit()  # the lock is saved before the background task starts
-    return {"started": started, "already_running": running}
+        started.append(acc.id)
+    await db.commit()  # the lock is saved before the sync starts (on the worker it can start at once)
+    for account_id in started:
+        await reply_queue.run_later(bg, run_history_sync, account_id=account_id)
+    return {"started": len(started), "already_running": running}
 
 
 @router.get("/{conversation_id}/messages", response_model=list[MessageOut])
@@ -145,6 +151,30 @@ async def list_messages(
         msg.sender_name = name  # transient attr read by MessageOut
         out.append(msg)
     return out
+
+
+async def _store_sent(db: AsyncSession, convo: Conversation, user, sent: dict, **values) -> Message:
+    """Store what a person sent from the dashboard under Meta's message id. Instagram / Messenger echo it back as a
+    webhook, often before the send call returns (always for a photo), so that echo may already be stored under this
+    id as an unattributed 'agent' message: take that row over (who sent it, our media url) instead of inserting a
+    second one, which would fail on the unique id."""
+    stmt = pg_insert(Message).values(
+        conversation_id=convo.id, external_message_id=sent.get("message_id"), sender_type="agent",
+        sender_agent_id=user.id, **values,
+    )
+    msg = (
+        await db.scalars(
+            stmt.on_conflict_do_update(
+                index_elements=["external_message_id"],
+                index_where=Message.external_message_id.isnot(None),
+                set_={"sender_agent_id": user.id, **({"media_url": values["media_url"]} if "media_url" in values else {})},
+            ).returning(Message),
+            execution_options={"populate_existing": True},
+        )
+    ).one()
+    convo.last_message_at = datetime.now(timezone.utc)
+    await db.commit()
+    return msg
 
 
 @router.post(
@@ -183,17 +213,7 @@ async def reply(
             status_code=status.HTTP_502_BAD_GATEWAY, detail=f"{account.platform} unreachable"
         )
 
-    msg = Message(
-        conversation_id=convo.id,
-        external_message_id=sent.get("message_id"),
-        sender_type="agent",
-        sender_agent_id=user.id,
-        content=body.text,
-    )
-    db.add(msg)
-    convo.last_message_at = datetime.now(timezone.utc)
-    await db.commit()
-    await db.refresh(msg)
+    msg = await _store_sent(db, convo, user, sent, content=body.text)
     msg.sender_name = user.name
     return msg
 
@@ -236,17 +256,6 @@ async def send_media(
     except httpx.HTTPError:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"{account.platform} unreachable")
 
-    msg = Message(
-        conversation_id=convo.id,
-        external_message_id=sent.get("message_id"),
-        sender_type="agent",
-        sender_agent_id=user.id,
-        message_type="image",
-        media_url=media.url,
-    )
-    db.add(msg)
-    convo.last_message_at = datetime.now(timezone.utc)
-    await db.commit()
-    await db.refresh(msg)
+    msg = await _store_sent(db, convo, user, sent, message_type="image", media_url=media.url)
     msg.sender_name = user.name
     return msg

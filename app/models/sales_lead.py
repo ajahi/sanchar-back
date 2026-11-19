@@ -1,4 +1,5 @@
-"""sales_leads — a customer who gave their phone number in a chat (one row per customer per business)."""
+"""sales_leads — a customer who gave their phone number in a chat (one row per customer per business).
+metadata.order = {name, phone, address, items} once the bot has collected an order (services/leads.save_order)."""
 import uuid
 from typing import Optional
 
@@ -33,7 +34,7 @@ class SalesLead(UUIDPKMixin, TimestampMixin, Base):
 
     channel: Mapped[str] = mapped_column(String(30), nullable=False)
     phone: Mapped[str] = mapped_column(String(50), nullable=False)  # normalised, e.g. +9779812345678
-    # new | contacted | won | lost. The sales team moves it along; nothing in the bot reads it.
+    # new | confirmed | cancelled. Staff confirm orders in the Orders view; a new or changed order resets it to new.
     status: Mapped[str] = mapped_column(String(30), server_default="new", nullable=False)
     meta: Mapped[dict] = mapped_column(
         "metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb")

@@ -14,14 +14,15 @@ from app.models.knowledge import KnowledgeDocument
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.schemas.knowledge import TestIn, TopicIn
+from app.services import reply_pipeline
 
 
 async def _run(monkeypatch) -> None:
-    async def fake_generate(system, history, text):
+    async def fake_generate(system, history, text, hint=""):
         assert "## Courses\nMBA - 2 years" in system  # the owner's own topic title and answers reach the bot
         return "MBA is 2 years."
 
-    monkeypatch.setattr(knowledge, "generate_reply", fake_generate)
+    monkeypatch.setattr(reply_pipeline, "generate_reply", fake_generate)
 
     async with async_session_factory() as db:
         db.commit = db.flush  # the endpoints commit; in a test that must stay inside the rolled-back transaction

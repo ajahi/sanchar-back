@@ -1,0 +1,34 @@
+name: test
+
+# On every pull request, and before each deploy (deploy.yml calls this workflow and waits for it).
+on:
+  pull_request:
+  workflow_call:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16  # same as docker-compose.yml
+        env:
+          POSTGRES_USER: nepsocial
+          POSTGRES_PASSWORD: nepsocial
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-retries 10
+    env:
+      # The tests copy this into their own databases (nepsocial_test*); see tests/conftest.py.
+      DATABASE_URL: postgresql+asyncpg://nepsocial:nepsocial@localhost:5432/nepsocial
+      JWT_SECRET: ci-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"  # same as the Dockerfile
+          cache: pip
+      - run: pip install -r requirements.txt pytest==9.2.0
+      - name: pytest
+        run: |
+          export TOKEN_ENCRYPTION_KEY=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+          python -m pytest -q tests

@@ -5,10 +5,12 @@ from app.models.campaign import Campaign, CampaignLink
 from app.models.audit_log import AuditLog
 from app.models.conversation import Conversation
 from app.models.customer import Customer
+from app.models.funnel import Funnel, FunnelSubmission
 from app.models.handover import HandoverEvent
 from app.models.knowledge import KnowledgeDocument
 from app.models.message import Message
 from app.models.notification import Notification
+from app.models.order_integration import OrderIntegration
 from app.models.permission import Permission, role_permissions
 from app.models.role import Role, user_roles
 from app.models.sales_lead import SalesLead
@@ -38,4 +40,7 @@ __all__ = [
     "CampaignLink",
     "AuditLog",
     "Notification",
+    "OrderIntegration",
+    "Funnel",
+    "FunnelSubmission",
 ]

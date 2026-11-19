@@ -40,13 +40,16 @@ class Settings(BaseSettings):
     # registered under Facebook Login -> Settings, e.g. https://<host>/api/v1/social-accounts/facebook/callback
     facebook_app_id: str = ""
     facebook_redirect_uri: str = ""
-    facebook_scopes: str = "pages_show_list,pages_messaging,pages_manage_metadata"
+    facebook_scopes: str = "pages_show_list,pages_messaging,pages_manage_metadata,pages_read_engagement"
     meta_app_secret: str=""
 
     # WhatsApp Cloud API — read only by scripts/connect_whatsapp.py, which stores the token
     # (encrypted) on the tenant's social_accounts row. System User token, doesn't expire.
     waba_token: str = ""
     waba_phone_number_id: str = ""
+    # Connect WhatsApp button (Embedded Signup): App → Facebook Login for Business → Configurations →
+    # the "WhatsApp Embedded Signup" one's id. Empty = only the link-by-id form.
+    whatsapp_config_id: str = ""
 
     # Where the callback sends the browser after a successful connect/login
     frontend_url: str = "http://localhost:3000"
@@ -60,8 +63,35 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     llm_model: str = "openai/gpt-oss-120b"
     groq_url: str = "https://api.groq.com/openai/v1/chat/completions"  # overridable for load tests
+    # Suggests a name + tags for uploaded shop photos (same Groq key). Any Groq model that takes images.
+    vision_model: str = "qwen/qwen3.8-27b"
+    # Hosts a business's own online-order system may live on (services/kitchen.py): the server calls that
+    # URL, so it is never a free-text field. Comma-separated.
+    kitchen_hosts: str = "admin.thecubeventure.com"
     # After a person replies in a chat, the bot stays quiet this long (refreshed by every reply of theirs).
     human_pause_minutes: int = 10
+
+    # Test each pooled connection with a round trip before use. The reply worker turns it off (DB_POOL_PRE_PING=false):
+    # it costs ~2ms of CPU per reply, and a dead connection there just fails one job, which the queue retries.
+    db_pool_pre_ping: bool = True
+    # Connections each process keeps open, and how many more it may open at a peak. Every uvicorn process and every
+    # reply worker has its own pool: keep the sum of (size + overflow) under Postgres max_connections (100), with room
+    # for migrations and a psql session. The defaults suit one process; docker-compose and manifest/ set smaller ones.
+    db_pool_size: int = 15
+    db_max_overflow: int = 5
+
+    # RabbitMQ for the reply queue (e.g. amqp://guest:guest@localhost:5672/). Empty = replies run in-process.
+    rabbitmq_url: str = ""
+    reply_max_age_minutes: int = 10  # a queued reply older than this is dropped, not sent late
+    reply_concurrency: int = 20  # model calls in flight per process, and jobs a reply worker takes at once
+    reply_retry_seconds: int = 30  # wait before a failed job is tried again (3 tries, then replies.dead)
+
+    # How long a process reuses a tenant's shop-knowledge text before re-reading it (0 = never). An edit or a
+    # sold-out toggle reaches the bot within this long.
+    knowledge_cache_seconds: int = 30
+
+    # How long a webhook handler may reuse a looked-up social account before re-reading it (seconds, 0 = never).
+    account_cache_seconds: int = 30
 
     # Object storage (MinIO / any S3) for admin-uploaded shop images. Empty keys = uploads disabled.
     s3_endpoint: str = ""

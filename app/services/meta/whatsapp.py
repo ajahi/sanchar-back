@@ -7,6 +7,8 @@ Inbound messages arrive on the shared Meta webhook (webhooks.py).
 """
 import httpx
 
+from app.core.config import settings
+from app.services import http_client
 from app.services.http_client import SSL_CTX
 from app.services.meta.instagram import API_VERSION
 
@@ -39,11 +41,39 @@ async def fetch_waba_phone_numbers(access_token: str, waba_id: str) -> list[dict
     async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
         resp = await client.get(
             f"{GRAPH_BASE}/{API_VERSION}/{waba_id}/phone_numbers",
-            params={"fields": "id,display_phone_number,verified_name"},
+            params={"fields": "id,display_phone_number,verified_name,status"},
             headers={"Authorization": f"Bearer {access_token}"},
         )
         resp.raise_for_status()
         return resp.json().get("data", [])
+
+
+async def fetch_granted_wabas(access_token: str) -> list[str]:
+    """Ids of the WhatsApp Business Accounts the business granted this token (Embedded Signup), from
+    Meta's own record of the grant, so a browser can't name someone else's account."""
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
+        resp = await client.get(
+            f"{GRAPH_BASE}/{API_VERSION}/debug_token",
+            params={
+                "input_token": access_token,
+                "access_token": f"{settings.facebook_app_id}|{settings.meta_app_secret}",
+            },
+        )
+        resp.raise_for_status()
+        scopes = resp.json().get("data", {}).get("granular_scopes", [])
+    return next((s.get("target_ids", []) for s in scopes if s.get("scope") == "whatsapp_business_management"), [])
+
+
+async def register_number(access_token: str, phone_number_id: str, pin: str) -> None:
+    """Turn on Cloud API for a number new to it (added in Embedded Signup); `pin` becomes its
+    two-step verification PIN."""
+    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
+        resp = await client.post(
+            f"{GRAPH_BASE}/{API_VERSION}/{phone_number_id}/register",
+            json={"messaging_product": "whatsapp", "pin": pin},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        resp.raise_for_status()
 
 
 async def subscribe_app(access_token: str, waba_id: str) -> None:
@@ -75,14 +105,13 @@ async def fetch_subscribed_apps(access_token: str, waba_id: str) -> list[str]:
 async def send_image(access_token: str, phone_number_id: str, to_wa_id: str, image_url: str) -> dict:
     """Send an image by public link (Meta fetches it). Returns {message_id}. Same 24h window as text."""
     body = {"messaging_product": "whatsapp", "to": to_wa_id, "type": "image", "image": {"link": image_url}}
-    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
-        resp = await client.post(
-            f"{GRAPH_BASE}/{API_VERSION}/{phone_number_id}/messages",
-            json=body,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        resp.raise_for_status()
-        return {"message_id": resp.json()["messages"][0]["id"]}
+    sent = await http_client.request_json(
+        "POST",
+        f"{GRAPH_BASE}/{API_VERSION}/{phone_number_id}/messages",
+        json=body,
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    return {"message_id": sent["messages"][0]["id"]}
 
 
 async def send_text(access_token: str, phone_number_id: str, to_wa_id: str, text: str) -> dict:
@@ -92,11 +121,10 @@ async def send_text(access_token: str, phone_number_id: str, to_wa_id: str, text
     answers 200; the failure (code 131047) arrives later as a `statuses` webhook.
     """
     body = {"messaging_product": "whatsapp", "to": to_wa_id, "type": "text", "text": {"body": text}}
-    async with httpx.AsyncClient(timeout=_TIMEOUT, verify=SSL_CTX) as client:
-        resp = await client.post(
-            f"{GRAPH_BASE}/{API_VERSION}/{phone_number_id}/messages",
-            json=body,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        resp.raise_for_status()
-        return {"message_id": resp.json()["messages"][0]["id"]}
+    sent = await http_client.request_json(
+        "POST",
+        f"{GRAPH_BASE}/{API_VERSION}/{phone_number_id}/messages",
+        json=body,
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    return {"message_id": sent["messages"][0]["id"]}

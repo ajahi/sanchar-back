@@ -9,18 +9,23 @@ stays quiet; every human reply refreshes the window, and once they go idle the b
 "Human replied recently" is read from the stored messages (sender_type = 'agent'), so there is no
 mode to flip back and nothing to lose on a restart.
 
-ponytail: FastAPI BackgroundTasks, so a server restart loses in-flight replies; move to a jobs table
-+ worker if that ever matters.
+With RABBITMQ_URL set, the webhook publishes the message id to RabbitMQ (reply_queue) and the worker
+(app/worker.py) runs process_reply_job; without it, or if the broker is down, dispatch_reply falls back to
+running the reply in-process, which loses in-flight replies on a restart.
 """
 import logging
+import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.log import log_failure
 from app.core.security import decrypt_token
 from app.db.session import async_session_factory
 from app.models.conversation import Conversation
@@ -28,17 +33,23 @@ from app.models.customer import Customer
 from app.models.handover import HandoverEvent
 from app.models.knowledge import KnowledgeDocument
 from app.models.message import Message
+from app.models.order_integration import OrderIntegration
+from app.models.sales_lead import SalesLead
 from app.models.shop_media import ShopMedia
 from app.models.social_account import SocialAccount
 from app.models.tenant import Tenant
-from app.services.auto_reply import build_system_prompt, generate_reply
-from app.services import campaigns
+from app.models.funnel import FunnelSubmission
+from app.services.auto_reply import (
+    build_system_prompt, expand_picks, generate_reply, photo_hint, sent_photos_note, split_long, split_photos,
+)
+from app.services import campaigns, funnels, hours, json_post, kitchen, reply_queue, rules
 from app.services.meta import CHANNELS
 from app.services.notifications import create_notification
 
 log = logging.getLogger(__name__)
 
-HISTORY = 6  # previous messages given to the model
+HISTORY = 20  # previous messages given to the model
+MAX_PROMPT_PHOTOS = 40  # shop photos listed to the model (~20 tokens each)
 PHOTO_REASON = "customer_sent_image"
 PHOTO_HOLDING_REPLY = (
     "Tapai ko photo pauna payo. Hamro team le herera chadai reply garnu hunchha. "
@@ -66,8 +77,32 @@ async def human_active(db: AsyncSession, conversation_id) -> bool:
     return found.first() is not None
 
 
+_KNOWLEDGE: dict = {}  # tenant_id -> (expires_at, text, spellings); per process, so an edit shows up within the TTL
+
+
 async def build_knowledge(db: AsyncSession, tenant_id) -> str:
-    """The tenant's whole shop context as one text block (the CAG context). Tenant-scoped, always."""
+    """The tenant's whole shop context as one text block (the CAG context), without the owner's {spellings}.
+    Tenant-scoped, always. Cached KNOWLEDGE_CACHE_SECONDS per process (0 = off): the same for every reply."""
+    return (await _knowledge(db, tenant_id))[0]
+
+
+async def shop_spellings(db: AsyncSession, tenant_id) -> dict[str, str]:
+    """The spellings the owner wrote in braces in Shop Info, {spelling: name} (kitchen.spellings)."""
+    return (await _knowledge(db, tenant_id))[1]
+
+
+async def _knowledge(db: AsyncSession, tenant_id) -> tuple[str, dict[str, str]]:
+    hit = _KNOWLEDGE.get(tenant_id)
+    if hit and hit[0] > time.monotonic():
+        return hit[1], hit[2]
+    raw = await _load_knowledge(db, tenant_id)
+    text, spelled = kitchen.strip_spellings(raw), kitchen.spellings(raw)
+    if settings.knowledge_cache_seconds:
+        _KNOWLEDGE[tenant_id] = (time.monotonic() + settings.knowledge_cache_seconds, text, spelled)
+    return text, spelled
+
+
+async def _load_knowledge(db: AsyncSession, tenant_id) -> str:
     docs = (
         await db.execute(
             select(KnowledgeDocument)
@@ -91,55 +126,88 @@ async def build_knowledge(db: AsyncSession, tenant_id) -> str:
     return text
 
 
-async def _generate(system: str, history: list[tuple[str, str]], text: str) -> str:
+async def sendable_photos(db: AsyncSession, tenant_id) -> list[ShopMedia]:
+    """In-stock photos an admin described, newest first: the list the model may pick photos from. An uploaded
+    photo counts once it has a name or tags; an imported Instagram post only once it is tagged, because its
+    automatic name is just the caption's first line ("Blue me away.") and most posts are not products.
+    ponytail: newest MAX_PROMPT_PHOTOS only; a bigger catalogue needs a pre-filter on the customer's words."""
+    rows = await db.execute(
+        select(ShopMedia)
+        .where(
+            ShopMedia.tenant_id == tenant_id,
+            ShopMedia.in_stock.is_(True),
+            or_(
+                func.cardinality(ShopMedia.tags) > 0,
+                and_(ShopMedia.source == "upload", ShopMedia.title.isnot(None)),
+            ),
+        )
+        .order_by(ShopMedia.created_at.desc())
+        .limit(MAX_PROMPT_PHOTOS)
+    )
+    return list(rows.scalars())
+
+
+async def _generate(system: str, history: list[tuple[str, str]], text: str, hint: str = "") -> str:
     """One retry: the API occasionally answers 400/5xx/timeouts, and the customer is waiting."""
     try:
-        return await generate_reply(system, history, text)
+        return await generate_reply(system, history, text, hint)
     except httpx.HTTPError:
-        return await generate_reply(system, history, text)
+        return await generate_reply(system, history, text, hint)
 
 
-async def _store_ai_message(db: AsyncSession, convo: Conversation, sent: dict, text: str) -> None:
-    """Stored under Meta's message id so our own echo (Instagram sends one back) hits the unique index
-    and is not mistaken for a person replying. If the echo won the race, relabel its row as ours."""
-    stmt = pg_insert(Message).values(
-        conversation_id=convo.id,
-        external_message_id=sent.get("message_id"),
-        sender_type="ai",
-        message_type="text",
-        content=text,
-        ai_generated=True,
-        meta={"model": settings.llm_model},
+async def _send_as_ai(
+    db: AsyncSession,
+    convo: Conversation,
+    send: Callable[[], Awaitable[dict]],
+    *,
+    message_type: str = "text",
+    content: str | None = None,
+    media_url: str | None = None,
+    meta: dict | None = None,
+) -> None:
+    """Store the bot's message, then send it, then give the row Meta's message id.
+
+    Instagram / Messenger echo every message the page sends back as a webhook, often BEFORE the send call
+    returns (always for a photo: Meta fetches it first). The row is committed before sending so that echo finds
+    it (webhooks.claim_own_echo) instead of being stored as a person replying, which would pause the bot.
+    If the echo was stored anyway (it beat the commit, or did not match), that row is relabelled as ours.
+    For a photo, meta.campaign_id lets campaigns skip resending its photos for a while, and content
+    ("[sent photo: name]") puts it in the model's history. Raises httpx.HTTPError if the send fails (row removed)."""
+    row = Message(
+        conversation_id=convo.id, sender_type="ai", message_type=message_type, content=content,
+        media_url=media_url, ai_generated=True, meta=meta or {},
     )
-    await db.execute(
-        stmt.on_conflict_do_update(
-            index_elements=["external_message_id"],
-            index_where=Message.external_message_id.isnot(None),
-            set_={"sender_type": "ai", "ai_generated": True},
-        )
-    )
+    db.add(row)
+    await db.commit()  # visible to the echo's transaction; also releases the connection for the Graph call
+    try:
+        sent = await send()
+    except httpx.HTTPError:
+        await db.delete(row)
+        await db.commit()
+        raise
+    mid = sent.get("message_id")
+    if mid:
+        try:
+            async with db.begin_nested():  # fails if the echo was stored under this id: adopted just below
+                await db.execute(
+                    update(Message)
+                    .where(Message.id == row.id, Message.external_message_id.is_(None))
+                    .values(external_message_id=mid)
+                )
+        except IntegrityError:
+            pass
+        echo = (
+            await db.execute(
+                update(Message)
+                .where(Message.external_message_id == mid, Message.id != row.id)
+                .values(sender_type="ai", ai_generated=True)
+                .returning(Message.id)
+            )
+        ).first()
+        if echo:
+            await db.delete(row)
     convo.last_message_at = datetime.now(timezone.utc)
-
-
-async def _store_ai_image(db: AsyncSession, convo: Conversation, sent: dict, url: str, campaign_id) -> None:
-    """Like _store_ai_message, for a photo we sent. meta.campaign_id lets us skip resending it for a while."""
-    stmt = pg_insert(Message).values(
-        conversation_id=convo.id,
-        external_message_id=sent.get("message_id"),
-        sender_type="ai",
-        message_type="image",
-        media_url=url,
-        ai_generated=True,
-        meta={"campaign_id": str(campaign_id)},
-    )
-    await db.execute(
-        stmt.on_conflict_do_update(
-            index_elements=["external_message_id"],
-            index_where=Message.external_message_id.isnot(None),
-            set_={"sender_type": "ai", "ai_generated": True},
-        )
-    )
-    convo.last_message_at = datetime.now(timezone.utc)
+    await db.commit()
 
 
 async def share_campaign(db: AsyncSession, convo, campaign, account, customer) -> None:
@@ -153,23 +221,23 @@ async def share_campaign(db: AsyncSession, convo, campaign, account, customer) -
         else await campaigns.photos_for(db, campaign)
     )
     token, acct, to = decrypt_token(account.access_token_encrypted), account.external_account_id, customer.external_user_id
-    await db.commit()  # release the connection for the Graph calls
     try:
-        sent = await channel.send_text(token, acct, to, text)
+        await _send_as_ai(
+            db, convo, lambda: channel.send_text(token, acct, to, text), content=text, meta={"model": settings.llm_model}
+        )
     except httpx.HTTPError as exc:
         log.exception("sending campaign reply failed for conversation %s: %s", convo.id, _meta_error(exc))
         return
-    await _store_ai_message(db, convo, sent, text)
-    await db.commit()
     send_image = getattr(channel, "send_image", None)
     for media in photos if send_image else []:
         try:
-            sent = await send_image(token, acct, to, media.url)
+            await _send_as_ai(
+                db, convo, lambda: send_image(token, acct, to, media.url),
+                message_type="image", media_url=media.url, meta={"campaign_id": str(campaign.id)},
+            )
         except httpx.HTTPError as exc:
             log.warning("sending campaign photo %s failed for conversation %s: %s", media.id, convo.id, _meta_error(exc))
             break  # the rest would most likely fail the same way (expired url, window closed)
-        await _store_ai_image(db, convo, sent, media.url, campaign.id)
-        await db.commit()
 
 
 async def hand_over_photo(db: AsyncSession, convo, tenant, account, customer) -> None:
@@ -211,34 +279,60 @@ async def hand_over_photo(db: AsyncSession, convo, tenant, account, customer) ->
         return
     await db.commit()  # keep the handover even if sending the holding reply blows up below
     send_text = CHANNELS[account.platform].send_text
+    token, acct, to = decrypt_token(account.access_token_encrypted), account.external_account_id, customer.external_user_id
     try:
-        sent = await send_text(
-            decrypt_token(account.access_token_encrypted),
-            account.external_account_id,
-            customer.external_user_id,
-            PHOTO_HOLDING_REPLY,
+        await _send_as_ai(
+            db, convo, lambda: send_text(token, acct, to, PHOTO_HOLDING_REPLY),
+            content=PHOTO_HOLDING_REPLY, meta={"model": settings.llm_model},
         )
     except httpx.HTTPError as exc:
         log.exception("sending photo holding reply failed for conversation %s: %s", convo.id, _meta_error(exc))
+
+
+async def auto_reply(db: AsyncSession, message_id, *, queued: bool = False) -> None:
+    """queued=True is the RabbitMQ worker: also drop a job that is too old or no longer needed, and let an
+    LLM failure raise so the broker retries (nothing has been sent at that point)."""
+    # One joined query, not five db.get round-trips (each costs ~0.5ms of CPU, and this runs per message).
+    # The "is a person handling this chat" check rides along, and so do the queue's drop checks.
+    later = aliased(Message)
+    after = (later.conversation_id == Message.conversation_id, later.created_at > Message.created_at)
+    pause = datetime.now(timezone.utc) - timedelta(minutes=settings.human_pause_minutes)
+    human = exists().where(
+        later.conversation_id == Message.conversation_id, later.sender_type == "agent", later.created_at > pause
+    )
+    extra = (
+        [
+            exists().where(*after, later.sender_type.in_(("ai", "agent"))),
+            exists().where(*after, later.sender_type == "customer"),
+        ]
+        if queued
+        else []
+    )
+    row = (
+        await db.execute(
+            select(Message, Conversation, Tenant, SocialAccount, Customer, human, *extra)
+            .join(Conversation, Conversation.id == Message.conversation_id)
+            .join(Tenant, Tenant.id == Conversation.tenant_id)
+            .outerjoin(SocialAccount, SocialAccount.id == Conversation.social_account_id)
+            .outerjoin(Customer, Customer.id == Conversation.customer_id)
+            .where(Message.id == message_id)
+        )
+    ).first()
+    if row is None:
         return
-    await _store_ai_message(db, convo, sent, PHOTO_HOLDING_REPLY)
-
-
-async def auto_reply(db: AsyncSession, message_id) -> None:
-    msg = await db.get(Message, message_id)
-    if msg is None or msg.sender_type != "customer":
+    msg, convo, tenant, account, customer, person_handling, *flags = row
+    if queued and (why := stale_reason(msg.created_at, *flags)):
+        log.info("reply job for message %s dropped: %s", message_id, why)
+        return
+    if msg.sender_type != "customer":
         return
     is_photo = msg.message_type == "image"
     if not is_photo and not (msg.content or "").strip():
         return
-    convo = await db.get(Conversation, msg.conversation_id)
-    tenant = await db.get(Tenant, convo.tenant_id)
-    account = await db.get(SocialAccount, convo.social_account_id) if convo.social_account_id else None
-    customer = await db.get(Customer, convo.customer_id)
 
     # A photo is flagged for a person even when AI replies are off (nobody else will mark it).
     if is_photo:
-        if customer is None or await human_active(db, convo.id):
+        if customer is None or person_handling:
             return
         await hand_over_photo(db, convo, tenant, account, customer)
         return
@@ -246,7 +340,7 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     if not tenant.ai_auto_reply:
         log.info("auto-reply skipped: AI is off for tenant %s", tenant.id)
         return
-    if await human_active(db, convo.id):
+    if person_handling:
         log.info("auto-reply skipped: a person is handling conversation %s", convo.id)
         return
     if account is None or not account.access_token_encrypted or customer is None:
@@ -262,10 +356,15 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
     if not knowledge:
         log.info("auto-reply skipped: tenant %s has no shop context yet", tenant.id)
         return
+    photos = await sendable_photos(db, tenant.id)
+    funnel = await funnels.for_tenant(db, tenant)
+    closed = await funnels.closed_message(db, tenant, funnel, knowledge)  # may re-read the hours: saved by the commit below
+    areas = await delivery_areas(db, tenant.id)
+    catalog, spelled = await menu_catalog(db, tenant.id), await shop_spellings(db, tenant.id)
 
     prior = (
         await db.execute(
-            select(Message)
+            select(Message.sender_type, Message.content)  # two columns, not six whole rows
             .where(
                 Message.conversation_id == convo.id,
                 Message.id != msg.id,
@@ -275,41 +374,161 @@ async def auto_reply(db: AsyncSession, message_id) -> None:
             .order_by(Message.created_at.desc())
             .limit(HISTORY)
         )
-    ).scalars()
-    history = [("customer" if m.sender_type == "customer" else "assistant", m.content) for m in reversed(list(prior))]
+    ).all()
+    history = [("customer" if sender == "customer" else "assistant", text) for sender, text in reversed(prior)]
 
     # Everything needed is in memory now. Commit hands the DB connection back to the pool (the loaded
     # rows stay usable: expire_on_commit=False) so the 1-3s LLM call below does not hold one.
     await db.commit()
+    listed = [(p.title, p.tags) for p in photos]
+    ruled = rules.run(funnel, rules.Context(
+        texts=[t for who, t in history if who == "customer"] + [msg.content], areas=areas, catalog=catalog,
+        spelled=spelled, closed=closed,
+    ))
     try:
         reply = await _generate(
-            build_system_prompt(knowledge, campaigns.campaign_context(campaign) if campaign else ""), history, msg.content
+            build_system_prompt(knowledge, campaigns.campaign_context(campaign) if campaign else "", listed,
+                                funnels.prompt_block(funnel)),
+            history,
+            msg.content,
+            _hint(msg.content, listed, closed, areas, ruled.notes),
         )
     except Exception:  # noqa: BLE001 — stay quiet rather than send something wrong; a person can answer
         log.exception("LLM failed for conversation %s", convo.id)
+        if queued:  # nothing was sent yet, so the queue can safely redeliver
+            raise
         return
-    if not reply:
+    reply, collected = await funnels.finish_reply(db, tenant.id, funnel, reply or "", closed)
+    reply = rules.finish(reply, ruled, closed)
+    reply, picks = split_photos(reply, len(photos))
+    kitchen_job = post_job = None
+    if collected:  # kept even if the reply is dropped below: the customer did give (and confirm) these details
+        sub = await funnels.record(db, funnel=funnel, account=account, convo=convo, customer=customer, fields=collected)
+        log.info("%s confirmed in conversation %s (tenant %s, funnel %s v%s): %s", funnel.label, convo.id, tenant.id,
+                 funnel.key, funnel.version, "saved" if sub else "same as just before, not saved again")
+        if sub is not None:
+            await db.commit()  # kept whatever happens to the website send
+            post_job = sub.id  # to the business's own API too, if it set one up (json_post)
+            if "website_post" in funnel.triggers and sub.lead_id:  # into the business's own order system
+                kitchen_job = (sub.lead_id, sub.id)
+    try:
+        await _send_reply(db, convo, account, customer, msg, reply, picks, photos, listed)
+    finally:  # after the reply: the customer isn't kept waiting on the order system (5 s and more)
+        if kitchen_job:
+            await _send_to_kitchen(*kitchen_job)
+        if post_job:
+            await json_post.post_submission(post_job, funnel.label)
+
+
+async def _send_reply(db, convo, account, customer, msg, reply: str, picks: list[int], photos, listed) -> None:
+    """The reply text (split if long), then the photos the model picked."""
+    if not reply and not picks:
         return
 
     # A person usually jumps in DURING the second or two of generation: re-check right before sending.
     if await human_active(db, convo.id):
         log.info("auto-reply dropped: a person took over conversation %s while generating", convo.id)
         return
-    await db.commit()  # release the connection again for the Graph send; _store_ai_message takes a fresh one
-
-    send_text = CHANNELS[account.platform].send_text
-    try:
-        sent = await send_text(
-            decrypt_token(account.access_token_encrypted),
-            account.external_account_id,
-            customer.external_user_id,
-            reply,
-        )
+    channel = CHANNELS[account.platform]
+    token, acct, to = decrypt_token(account.access_token_encrypted), account.external_account_id, customer.external_user_id
+    try:  # the model may answer with only a photo label (no text); a long answer goes as several messages
+        for part in split_long(reply):
+            await _send_as_ai(
+                db, convo, lambda part=part: channel.send_text(token, acct, to, part), content=part,
+                meta={"model": settings.llm_model},
+            )
     except httpx.HTTPError as exc:
         log.exception("sending AI reply failed for conversation %s: %s", convo.id, _meta_error(exc))
         return
 
-    await _store_ai_message(db, convo, sent, reply)
+    # The photos the model picked (each grown into its set, e.g. every page of a menu), after the text: if one
+    # fails the customer still has the answer. Only the first row carries the history note: the history holds
+    # the last HISTORY rows with content, and ten photo rows would push the conversation out of it.
+    send_image = getattr(channel, "send_image", None)
+    chosen = [photos[i] for i in expand_picks(msg.content, listed, picks)] if send_image else []
+    note = sent_photos_note([m.title or "photo" for m in chosen])
+    for n, media in enumerate(chosen):
+        try:
+            await _send_as_ai(
+                db, convo, lambda: send_image(token, acct, to, media.url), message_type="image", media_url=media.url,
+                content=None if n else note, meta={"media_id": str(media.id)},
+            )
+        except httpx.HTTPError as exc:
+            log.warning("sending photo %s failed for conversation %s: %s", media.id, convo.id, _meta_error(exc))
+            break  # the rest would most likely fail the same way (expired url, window closed)
+
+
+async def menu_catalog(db: AsyncSession, tenant_id) -> list[dict]:
+    """The menu synced from the business's own order system ([] without one)."""
+    return (
+        await db.execute(select(OrderIntegration.catalog).where(OrderIntegration.tenant_id == tenant_id))
+    ).scalar() or []
+
+
+async def delivery_areas(db: AsyncSession, tenant_id) -> list[dict]:
+    """The delivery areas synced from the business's own order system ([] without one)."""
+    return (
+        await db.execute(select(OrderIntegration.locations).where(OrderIntegration.tenant_id == tenant_id))
+    ).scalar() or []
+
+
+def _hint(
+    text: str, listed: list[tuple[str | None, list[str]]], closed: str | None, areas: list[dict],
+    ruled: list[str] | None = None,
+) -> str:
+    """The per-message note for the model: matching photos, the delivery area named, what the funnel's rules say
+    (rules.run: menu items however spelled, delivery or pick up already said, ...), and that it is closed."""
+    notes = [photo_hint(text, listed), kitchen.area_hint(text, areas), *(ruled or []),
+             hours.closed_note(closed) if closed else ""]
+    return "\n\n".join(x for x in notes if x)
+
+
+async def preview_reply(
+    db: AsyncSession, tenant: Tenant, message: str, history: list[tuple[str, str]] | None = None, funnel=None
+) -> str | None:
+    """What the bot would answer `message` after `history` right now, with the photos it would attach and what it
+    would save written out after it. Nothing is sent or stored. funnel: try one other than the tenant's.
+    None when the tenant has no shop context. Raises httpx.HTTPError when the model is down."""
+    knowledge = await build_knowledge(db, tenant.id)
+    if not knowledge:
+        return None
+    photos = await sendable_photos(db, tenant.id)
+    funnel = funnel or await funnels.for_tenant(db, tenant)
+    closed = await funnels.closed_message(db, tenant, funnel, knowledge)
+    areas = await delivery_areas(db, tenant.id)
+    listed = [(p.title, p.tags) for p in photos]
+    ruled = rules.run(funnel, rules.Context(
+        texts=[t for who, t in history or [] if who == "customer"] + [message], areas=areas,
+        catalog=await menu_catalog(db, tenant.id), spelled=await shop_spellings(db, tenant.id), closed=closed,
+    ))
+    reply = await generate_reply(
+        build_system_prompt(knowledge, photos=listed, funnel=funnels.prompt_block(funnel)),
+        history or [], message, _hint(message, listed, closed, areas, ruled.notes),
+    )
+    reply, collected = await funnels.finish_reply(db, tenant.id, funnel, reply, closed)
+    reply = rules.finish(reply, ruled, closed)
+    reply, picks = split_photos(reply, len(photos))
+    shown = [f"[would send photo: {photos[i].title or 'untitled'}]" for i in expand_picks(message, listed, picks)]
+    if collected:
+        shown.append(f"[would save {funnel.label}: " + " | ".join(collected.values()) + "]")
+    return "\n".join(x for x in [reply, *shown] if x)
+
+
+async def _send_to_kitchen(lead_id, submission_id) -> None:
+    """kitchen.auto_send in its own session: whatever fails there (the order system down, a table missing after
+    a deploy) never costs the customer their reply or the saved order. The outcome goes on the submission."""
+    try:
+        async with async_session_factory() as s:
+            lead = await s.get(SalesLead, lead_id)
+            if lead is not None:
+                outcome = await kitchen.auto_send(s, lead)
+                sub = await s.get(FunnelSubmission, submission_id)
+                if sub is not None and outcome != "off":
+                    sub.status = outcome
+                    sub.result = {k: lead.meta[k] for k in ("kitchen", "kitchen_error") if k in (lead.meta or {})}
+                await s.commit()
+    except Exception:  # noqa: BLE001
+        log_failure(log, "kitchen send failed for lead %s", lead_id)
 
 
 async def run_auto_reply(message_id) -> None:
@@ -319,4 +538,29 @@ async def run_auto_reply(message_id) -> None:
             await auto_reply(db, message_id)
             await db.commit()
     except Exception:  # noqa: BLE001
-        log.exception("auto-reply failed for message %s", message_id)
+        log_failure(log, "auto-reply failed for message %s", message_id)
+
+
+async def dispatch_reply(message_id) -> None:
+    """Background-task entry: hand the reply to the queue; run it here only when the broker can't take it."""
+    if not await reply_queue.publish(message_id):
+        await run_auto_reply(message_id)
+
+
+def stale_reason(created_at: datetime, answered: bool, superseded: bool) -> str | None:
+    """Why a queued job should not reply any more (None = go ahead). A job can wait out an outage or be
+    redelivered after the reply was sent, and a late or doubled DM is worse than none."""
+    if created_at < datetime.now(timezone.utc) - timedelta(minutes=settings.reply_max_age_minutes):
+        return "older than the reply cutoff"
+    if answered:
+        return "already answered"
+    if superseded:
+        return "a newer message in the chat will be answered instead"  # its history includes this one
+    return None
+
+
+async def process_reply_job(message_id) -> None:
+    """Queue-worker entry: own session; raises on failure so the worker can retry."""
+    async with async_session_factory() as db:
+        await auto_reply(db, message_id, queued=True)
+        await db.commit()

@@ -55,7 +55,8 @@ async def get_current_tenant(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> Tenant:
     """Resolve the tenant the current user belongs to; every query filters on this."""
-    tenant = await db.get(Tenant, user.tenant_id)
+    # A platform admin has no tenant: no lookup (db.get with None warns "fully NULL primary key").
+    tenant = await db.get(Tenant, user.tenant_id) if user.tenant_id else None
     if tenant is None or tenant.status != "active":
         raise _CREDENTIALS_EXC
     return tenant
